@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <atomic>
+#include <new>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,16 +48,16 @@ typedef struct _qcap2_av_packet_priv_t {
 typedef struct _qcap2_rcbuffer_priv_t {
     PVOID pData;
     qcap2_on_free_resource_t pOnFreeResource;
-    int use_count;
-    int weak_count;
-    int res_count;
+    std::atomic<int> use_count;
+    std::atomic<int> weak_count;
+    std::atomic<int> res_count;
 } qcap2_rcbuffer_priv_t;
 
 
 // --- qcap2_rcbuffer_t ---
 
 qcap2_rcbuffer_t* qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFreeResource) {
-    qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)malloc(sizeof(qcap2_rcbuffer_priv_t));
+    qcap2_rcbuffer_priv_t* p = new (std::nothrow) qcap2_rcbuffer_priv_t();
     if (p) {
         p->pData = pData;
         p->pOnFreeResource = pOnFreeResource;
@@ -92,12 +94,11 @@ void qcap2_rcbuffer_add_ref(qcap2_rcbuffer_t* pRCBuffer) {
 void qcap2_rcbuffer_release(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
         qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)pRCBuffer;
-        p->use_count--;
-        if (p->use_count <= 0) {
+        if (--p->use_count <= 0) {
             if (p->pOnFreeResource) {
                 p->pOnFreeResource(p->pData);
             }
-            free(p);
+            delete p;
         }
     }
 }

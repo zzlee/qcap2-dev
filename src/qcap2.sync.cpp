@@ -13,6 +13,12 @@ typedef void* HWND;
 #include <vector>
 #include <atomic>
 
+#ifdef __linux__
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <poll.h>
+#endif
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,24 +66,36 @@ extern "C" {
 
 // --- qcap2_event_t ---
 typedef struct qcap2_event_priv_t {
+#ifdef __linux__
+    int efd;
+#else
     std::mutex* mtx;
     std::condition_variable* cv;
     bool signaled;
+#endif
 } qcap2_event_priv_t;
 
 qcap2_event_t* qcap2_event_new() {
     qcap2_event_priv_t* pThis = new qcap2_event_priv_t;
+#ifdef __linux__
+    pThis->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+#else
     pThis->mtx = new std::mutex();
     pThis->cv = new std::condition_variable();
     pThis->signaled = false;
+#endif
     return (qcap2_event_t*)pThis;
 }
 
 void qcap2_event_delete(qcap2_event_t* pThis) {
     if (pThis) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        if (p->efd >= 0) close(p->efd);
+#else
         delete p->cv;
         delete p->mtx;
+#endif
         delete p;
     }
 }
@@ -85,8 +103,18 @@ void qcap2_event_delete(qcap2_event_t* pThis) {
 void qcap2_event_set_initial(qcap2_event_t* pThis, int nInitial) {
     if (pThis) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        if (nInitial != 0) {
+            uint64_t u = 1;
+            write(p->efd, &u, sizeof(uint64_t));
+        } else {
+            uint64_t u;
+            while (read(p->efd, &u, sizeof(uint64_t)) > 0);
+        }
+#else
         std::lock_guard<std::mutex> lock(*(p->mtx));
         p->signaled = (nInitial != 0);
+#endif
     }
 }
 
@@ -97,8 +125,13 @@ QRESULT qcap2_event_start(qcap2_event_t* pThis) {
 QRESULT qcap2_event_stop(qcap2_event_t* pThis) {
     if (pThis) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        uint64_t u;
+        while (read(p->efd, &u, sizeof(uint64_t)) > 0);
+#else
         std::lock_guard<std::mutex> lock(*(p->mtx));
         p->signaled = false; // Reset on stop?
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -106,7 +139,11 @@ QRESULT qcap2_event_stop(qcap2_event_t* pThis) {
 
 QRESULT qcap2_event_get_native_handle(qcap2_event_t* pThis, uintptr_t* pHandle) {
     if (pThis && pHandle) {
+#ifdef __linux__
+        *pHandle = (uintptr_t)((qcap2_event_priv_t*)pThis)->efd;
+#else
         *pHandle = (uintptr_t)pThis;
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -115,11 +152,16 @@ QRESULT qcap2_event_get_native_handle(qcap2_event_t* pThis, uintptr_t* pHandle) 
 QRESULT qcap2_event_notify(qcap2_event_t* pThis) {
     if (pThis) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        uint64_t u = 1;
+        write(p->efd, &u, sizeof(uint64_t));
+#else
         {
             std::lock_guard<std::mutex> lock(*(p->mtx));
             p->signaled = true;
         }
         p->cv->notify_all();
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -128,10 +170,29 @@ QRESULT qcap2_event_notify(qcap2_event_t* pThis) {
 QRESULT qcap2_event_wait(qcap2_event_t* pThis) {
     if (pThis) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        struct pollfd pfd = { p->efd, POLLIN, 0 };
+        while (true) {
+            int ret = poll(&pfd, 1, -1);
+            if (ret > 0) {
+                uint64_t u;
+                if (read(p->efd, &u, sizeof(uint64_t)) > 0) {
+                    return QCAP_RS_SUCCESSFUL;
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue; // Another thread might have read it, wait again
+                } else if (errno != EINTR) {
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+            } else if (ret < 0 && errno != EINTR) {
+                return QCAP_RS_ERROR_GENERAL;
+            }
+        }
+#else
         std::unique_lock<std::mutex> lock(*(p->mtx));
         p->cv->wait(lock, [p]{ return p->signaled; });
         p->signaled = false; // Auto-reset for simple implementation
         return QCAP_RS_SUCCESSFUL;
+#endif
     }
     return QCAP_RS_ERROR_GENERAL;
 }

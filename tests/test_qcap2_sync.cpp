@@ -57,9 +57,19 @@ QRETURN dummy_event_handler(PVOID data) {
     return QCAP_RT_OK;
 }
 
+#ifdef __linux__
+#include <poll.h>
+#endif
+
 void test_qcap2_event_t() {
     qcap2_event_t* ev = qcap2_event_new();
     assert(ev != NULL);
+
+    uintptr_t handle;
+    assert(qcap2_event_get_native_handle(ev, &handle) == QCAP_RS_SUCCESSFUL);
+#ifdef __linux__
+    assert(handle > 0);
+#endif
 
     assert(qcap2_event_start(ev) == QCAP_RS_SUCCESSFUL);
 
@@ -75,6 +85,16 @@ void test_qcap2_event_t() {
     assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
     t1.join();
     assert(notified.load());
+
+#ifdef __linux__
+    // Test poll functionality
+    qcap2_event_notify(ev);
+    struct pollfd pfd = { (int)handle, POLLIN, 0 };
+    int ret = poll(&pfd, 1, 0);
+    assert(ret == 1);
+    assert(pfd.revents & POLLIN);
+    qcap2_event_wait(ev);
+#endif
 
     assert(qcap2_event_stop(ev) == QCAP_RS_SUCCESSFUL);
     qcap2_event_delete(ev);

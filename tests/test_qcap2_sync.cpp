@@ -1,4 +1,5 @@
 #include "qcap2.sync.h"
+#include "qcap2.buffer.h"
 #include <stdio.h>
 #include <assert.h>
 #include <thread>
@@ -138,6 +139,146 @@ void test_qcap2_rcbuffer_queue_t() {
     qcap2_rcbuffer_queue_delete(queue);
 }
 
+struct TestQueueVideoFrame {
+    int index;
+    int prepared_value;
+    int consumed_count;
+    int free_count;
+    qcap2_av_frame_t frame;
+
+    TestQueueVideoFrame() : index(0), prepared_value(-1), consumed_count(0), free_count(0) {
+        qcap2_av_frame_init(&frame);
+    }
+
+    static void on_free_resource(PVOID pData) {
+        TestQueueVideoFrame* pThis = qcap2_container_of(pData, TestQueueVideoFrame, frame);
+        pThis->free_count++;
+    }
+};
+
+void test_qcap2_rcbuffer_queue_provider_consumer_scheme_t() {
+    const int kBufferCount = 3;
+    const int kIterations = 12;
+
+    qcap2_rcbuffer_queue_t* free_queue = qcap2_rcbuffer_queue_new();
+    qcap2_rcbuffer_queue_t* source_queue = qcap2_rcbuffer_queue_new();
+    qcap2_event_t* free_event = qcap2_event_new();
+    qcap2_event_t* source_event = qcap2_event_new();
+    assert(free_queue != NULL);
+    assert(source_queue != NULL);
+    assert(free_event != NULL);
+    assert(source_event != NULL);
+
+    TestQueueVideoFrame frames[kBufferCount];
+    qcap2_rcbuffer_t* rcbufs[kBufferCount + 1];
+    for (int i = 0; i < kBufferCount; ++i) {
+        frames[i].index = i;
+        rcbufs[i] = qcap2_rcbuffer_new(&frames[i].frame, TestQueueVideoFrame::on_free_resource);
+        assert(rcbufs[i] != NULL);
+        assert(qcap2_rcbuffer_get_data(rcbufs[i]) == &frames[i].frame);
+    }
+    rcbufs[kBufferCount] = NULL;
+
+    qcap2_rcbuffer_queue_set_event(free_queue, free_event);
+    qcap2_rcbuffer_queue_set_buffers(free_queue, rcbufs);
+    assert(qcap2_rcbuffer_queue_get_buffer_count(free_queue) == kBufferCount);
+    assert(qcap2_rcbuffer_queue_start(free_queue) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_queue_set_event(source_queue, source_event);
+    assert(qcap2_rcbuffer_queue_start(source_queue) == QCAP_RS_SUCCESSFUL);
+
+    std::thread provider([&]() {
+        for (int i = 0; i < kIterations; ++i) {
+            assert(qcap2_event_wait(free_event) == QCAP_RS_SUCCESSFUL);
+
+            qcap2_rcbuffer_t* rcbuf = NULL;
+            assert(qcap2_rcbuffer_queue_pop(free_queue, &rcbuf) == QCAP_RS_SUCCESSFUL);
+            assert(rcbuf != NULL);
+
+            qcap2_av_frame_t* frame = (qcap2_av_frame_t*)qcap2_rcbuffer_get_data(rcbuf);
+            TestQueueVideoFrame* owner = qcap2_container_of(frame, TestQueueVideoFrame, frame);
+            owner->prepared_value = i;
+            qcap2_av_frame_set_pts(frame, i);
+
+            assert(qcap2_rcbuffer_queue_push(source_queue, rcbuf) == QCAP_RS_SUCCESSFUL);
+        }
+    });
+
+    std::thread consumer([&]() {
+        for (int i = 0; i < kIterations; ++i) {
+            assert(qcap2_event_wait(source_event) == QCAP_RS_SUCCESSFUL);
+
+            qcap2_rcbuffer_t* rcbuf = NULL;
+            assert(qcap2_rcbuffer_queue_pop(source_queue, &rcbuf) == QCAP_RS_SUCCESSFUL);
+            assert(rcbuf != NULL);
+
+            qcap2_av_frame_t* frame = (qcap2_av_frame_t*)qcap2_rcbuffer_get_data(rcbuf);
+            TestQueueVideoFrame* owner = qcap2_container_of(frame, TestQueueVideoFrame, frame);
+            int64_t pts = -1;
+            qcap2_av_frame_get_pts(frame, &pts);
+            assert(owner->prepared_value == i);
+            assert(pts == i);
+            owner->consumed_count++;
+
+            assert(qcap2_rcbuffer_queue_push(free_queue, rcbuf) == QCAP_RS_SUCCESSFUL);
+        }
+    });
+
+    provider.join();
+    consumer.join();
+
+    int consumed_count = 0;
+    for (int i = 0; i < kBufferCount; ++i) {
+        assert(frames[i].free_count == 0);
+        consumed_count += frames[i].consumed_count;
+    }
+    assert(consumed_count == kIterations);
+    assert(qcap2_rcbuffer_queue_get_buffer_count(free_queue) == kBufferCount);
+    assert(qcap2_rcbuffer_queue_is_empty(source_queue));
+
+    assert(qcap2_rcbuffer_queue_stop(source_queue) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_rcbuffer_queue_stop(free_queue) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_queue_delete(source_queue);
+    qcap2_rcbuffer_queue_delete(free_queue);
+    qcap2_event_delete(source_event);
+    qcap2_event_delete(free_event);
+
+    for (int i = 0; i < kBufferCount; ++i) {
+        assert(frames[i].free_count == 1);
+    }
+}
+
+void test_qcap2_rcbuffer_queue_event_t() {
+    qcap2_rcbuffer_queue_t* queue = qcap2_rcbuffer_queue_new();
+    qcap2_event_t* event = qcap2_event_new();
+    assert(queue != NULL);
+    assert(event != NULL);
+
+    qcap2_rcbuffer_queue_set_event(queue, event);
+    assert(qcap2_rcbuffer_queue_start(queue) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* dummy_buf1 = (qcap2_rcbuffer_t*)0x1234;
+    qcap2_rcbuffer_t* dummy_buf2 = (qcap2_rcbuffer_t*)0x5678;
+
+    assert(qcap2_rcbuffer_queue_push(queue, dummy_buf1) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_rcbuffer_queue_push(queue, dummy_buf2) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* pop_buf = NULL;
+    assert(qcap2_event_wait(event) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_rcbuffer_queue_pop(queue, &pop_buf) == QCAP_RS_SUCCESSFUL);
+    assert(pop_buf == dummy_buf1);
+
+    pop_buf = NULL;
+    assert(qcap2_event_wait(event) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_rcbuffer_queue_pop(queue, &pop_buf) == QCAP_RS_SUCCESSFUL);
+    assert(pop_buf == dummy_buf2);
+
+    assert(qcap2_rcbuffer_queue_is_empty(queue));
+    assert(qcap2_rcbuffer_queue_stop(queue) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_queue_delete(queue);
+    qcap2_event_delete(event);
+}
+
 void test_qcap2_timer_t() {
     qcap2_timer_t* timer = qcap2_timer_new();
     assert(timer != NULL);
@@ -195,6 +336,8 @@ int main() {
     test_qcap2_event_t();
     test_qcap2_event_handlers_t();
     test_qcap2_rcbuffer_queue_t();
+    test_qcap2_rcbuffer_queue_provider_consumer_scheme_t();
+    test_qcap2_rcbuffer_queue_event_t();
     test_qcap2_timer_t();
     test_qcap2_window_t();
     test_qcap2_binder_t();

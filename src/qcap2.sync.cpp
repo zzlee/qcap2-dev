@@ -1,4 +1,5 @@
 #include "qcap2.sync.h"
+#include "qcap2.buffer.h"
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
@@ -12,13 +13,13 @@ typedef void* HWND;
 #include <queue>
 #include <vector>
 #include <atomic>
+#include <new>
 
 #ifdef __linux__
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <poll.h>
 #endif
-
 
 #ifdef __cplusplus
 extern "C" {
@@ -300,32 +301,56 @@ extern "C" {
 
 // --- qcap2_rcbuffer_queue_t ---
 typedef struct qcap2_rcbuffer_queue_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv_push;
-    std::condition_variable* cv_pop;
-    std::queue<qcap2_rcbuffer_t*>* q;
+    std::mutex mtx;
+    std::condition_variable cv_push;
+    std::condition_variable cv_pop;
+    std::queue<qcap2_rcbuffer_t*> q;
+    qcap2_event_t* event;
     int maxBuffers;
     bool running;
 } qcap2_rcbuffer_queue_priv_t;
 
+static void qcap2_rcbuffer_queue_notify_event(qcap2_event_t* pEvent) {
+    if (pEvent) {
+        qcap2_event_notify(pEvent);
+    }
+}
+
+static void qcap2_rcbuffer_queue_release_all(std::queue<qcap2_rcbuffer_t*>& q) {
+    while (!q.empty()) {
+        qcap2_rcbuffer_t* pRCBuffer = q.front();
+        q.pop();
+        if (pRCBuffer) {
+            qcap2_rcbuffer_release(pRCBuffer);
+        }
+    }
+}
+
 qcap2_rcbuffer_queue_t* qcap2_rcbuffer_queue_new() {
-    qcap2_rcbuffer_queue_priv_t* pThis = new qcap2_rcbuffer_queue_priv_t;
-    pThis->mtx = new std::mutex();
-    pThis->cv_push = new std::condition_variable();
-    pThis->cv_pop = new std::condition_variable();
-    pThis->q = new std::queue<qcap2_rcbuffer_t*>();
-    pThis->maxBuffers = 0;
-    pThis->running = false;
+    qcap2_rcbuffer_queue_priv_t* pThis = new (std::nothrow) qcap2_rcbuffer_queue_priv_t();
+    if (pThis) {
+        pThis->event = NULL;
+        pThis->maxBuffers = 0;
+        pThis->running = false;
+    }
     return (qcap2_rcbuffer_queue_t*)pThis;
 }
 
 void qcap2_rcbuffer_queue_delete(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        delete p->q;
-        delete p->cv_pop;
-        delete p->cv_push;
-        delete p->mtx;
+        std::queue<qcap2_rcbuffer_t*> qPending;
+        qcap2_event_t* pEvent = NULL;
+        {
+            std::lock_guard<std::mutex> lock(p->mtx);
+            p->running = false;
+            p->q.swap(qPending);
+            pEvent = p->event;
+        }
+        p->cv_pop.notify_all();
+        p->cv_push.notify_all();
+        qcap2_rcbuffer_queue_notify_event(pEvent);
+        qcap2_rcbuffer_queue_release_all(qPending);
         delete p;
     }
 }
@@ -333,24 +358,56 @@ void qcap2_rcbuffer_queue_delete(qcap2_rcbuffer_queue_t* pThis) {
 void qcap2_rcbuffer_queue_set_max_buffers(qcap2_rcbuffer_queue_t* pThis, int nMaxBuffers) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->maxBuffers = nMaxBuffers;
+        std::lock_guard<std::mutex> lock(p->mtx);
+        p->maxBuffers = (nMaxBuffers > 0) ? nMaxBuffers : 0;
+        p->cv_push.notify_all();
     }
 }
 
 void qcap2_rcbuffer_queue_set_event(qcap2_rcbuffer_queue_t* pThis, qcap2_event_t* pEvent) {
-    // Optional integration point, skipped for pure std:: implementations
+    if (pThis) {
+        qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
+        bool bNotify = false;
+        {
+            std::lock_guard<std::mutex> lock(p->mtx);
+            p->event = pEvent;
+            bNotify = (pEvent && !p->q.empty());
+        }
+        if (bNotify) {
+            qcap2_rcbuffer_queue_notify_event(pEvent);
+        }
+    }
 }
 
 void qcap2_rcbuffer_queue_set_buffers(qcap2_rcbuffer_queue_t* pThis, qcap2_rcbuffer_t** pBuffers) {
-    // Pre-allocate buffers integration point
+    if (pThis && pBuffers) {
+        qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
+        qcap2_event_t* pEvent = NULL;
+        bool bNotify = false;
+        {
+            std::lock_guard<std::mutex> lock(p->mtx);
+            bool bWasEmpty = p->q.empty();
+            for (int i = 0; pBuffers[i]; ++i) {
+                if (p->maxBuffers > 0 && p->q.size() >= (size_t)p->maxBuffers) {
+                    break;
+                }
+                p->q.push(pBuffers[i]);
+            }
+            bNotify = bWasEmpty && !p->q.empty();
+            pEvent = p->event;
+        }
+        p->cv_pop.notify_all();
+        if (bNotify) {
+            qcap2_rcbuffer_queue_notify_event(pEvent);
+        }
+    }
 }
 
 int qcap2_rcbuffer_queue_get_buffer_count(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        return p->q->size();
+        std::lock_guard<std::mutex> lock(p->mtx);
+        return (int)p->q.size();
     }
     return 0;
 }
@@ -358,8 +415,8 @@ int qcap2_rcbuffer_queue_get_buffer_count(qcap2_rcbuffer_queue_t* pThis) {
 bool qcap2_rcbuffer_queue_is_full(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        if (p->maxBuffers > 0 && p->q->size() >= (size_t)p->maxBuffers) return true;
+        std::lock_guard<std::mutex> lock(p->mtx);
+        return (p->maxBuffers > 0 && p->q.size() >= (size_t)p->maxBuffers);
     }
     return false;
 }
@@ -367,8 +424,8 @@ bool qcap2_rcbuffer_queue_is_full(qcap2_rcbuffer_queue_t* pThis) {
 bool qcap2_rcbuffer_queue_is_empty(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        return p->q->empty();
+        std::lock_guard<std::mutex> lock(p->mtx);
+        return p->q.empty();
     }
     return true;
 }
@@ -376,60 +433,90 @@ bool qcap2_rcbuffer_queue_is_empty(qcap2_rcbuffer_queue_t* pThis) {
 QRESULT qcap2_rcbuffer_queue_start(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
+        std::lock_guard<std::mutex> lock(p->mtx);
         p->running = true;
+        p->cv_push.notify_all();
         return QCAP_RS_SUCCESSFUL;
     }
-    return QCAP_RS_ERROR_GENERAL;
+    return QCAP_RS_ERROR_INVALID_PARAMETER;
 }
 
 QRESULT qcap2_rcbuffer_queue_stop(qcap2_rcbuffer_queue_t* pThis) {
     if (pThis) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->running = false;
-        p->cv_pop->notify_all();
-        p->cv_push->notify_all();
+        qcap2_event_t* pEvent = NULL;
+        {
+            std::lock_guard<std::mutex> lock(p->mtx);
+            p->running = false;
+            pEvent = p->event;
+        }
+        p->cv_pop.notify_all();
+        p->cv_push.notify_all();
+        qcap2_rcbuffer_queue_notify_event(pEvent);
         return QCAP_RS_SUCCESSFUL;
     }
-    return QCAP_RS_ERROR_GENERAL;
+    return QCAP_RS_ERROR_INVALID_PARAMETER;
 }
 
 QRESULT qcap2_rcbuffer_queue_push(qcap2_rcbuffer_queue_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
     if (pThis && pRCBuffer) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::unique_lock<std::mutex> lock(*(p->mtx));
+        qcap2_event_t* pEvent = NULL;
+        bool bNotify = false;
+        {
+            std::unique_lock<std::mutex> lock(p->mtx);
 
-        p->cv_push->wait(lock, [p]{
-            return !p->running || (p->maxBuffers <= 0 || p->q->size() < (size_t)p->maxBuffers);
-        });
+            p->cv_push.wait(lock, [p]{
+                return !p->running || (p->maxBuffers <= 0 || p->q.size() < (size_t)p->maxBuffers);
+            });
 
-        if (!p->running) return QCAP_RS_ERROR_GENERAL;
+            if (!p->running) return QCAP_RS_ERROR_GENERAL;
 
-        p->q->push(pRCBuffer);
-        p->cv_pop->notify_one();
+            bNotify = p->q.empty();
+            p->q.push(pRCBuffer);
+            pEvent = p->event;
+        }
+
+        p->cv_pop.notify_one();
+        if (bNotify) {
+            qcap2_rcbuffer_queue_notify_event(pEvent);
+        }
         return QCAP_RS_SUCCESSFUL;
     }
-    return QCAP_RS_ERROR_GENERAL;
+    return QCAP_RS_ERROR_INVALID_PARAMETER;
 }
 
 QRESULT qcap2_rcbuffer_queue_pop(qcap2_rcbuffer_queue_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (ppRCBuffer) {
+        *ppRCBuffer = NULL;
+    }
+
     if (pThis && ppRCBuffer) {
         qcap2_rcbuffer_queue_priv_t* p = (qcap2_rcbuffer_queue_priv_t*)pThis;
-        std::unique_lock<std::mutex> lock(*(p->mtx));
+        qcap2_event_t* pEvent = NULL;
+        bool bNotifyAgain = false;
+        {
+            std::unique_lock<std::mutex> lock(p->mtx);
 
-        p->cv_pop->wait(lock, [p]{
-            return !p->running || !p->q->empty();
-        });
+            p->cv_pop.wait(lock, [p]{
+                return !p->running || !p->q.empty();
+            });
 
-        if (!p->running && p->q->empty()) return QCAP_RS_ERROR_GENERAL;
+            if (!p->running && p->q.empty()) return QCAP_RS_ERROR_GENERAL;
 
-        *ppRCBuffer = p->q->front();
-        p->q->pop();
-        p->cv_push->notify_one();
+            *ppRCBuffer = p->q.front();
+            p->q.pop();
+            bNotifyAgain = !p->q.empty();
+            pEvent = p->event;
+        }
+
+        p->cv_push.notify_one();
+        if (bNotifyAgain) {
+            qcap2_rcbuffer_queue_notify_event(pEvent);
+        }
         return QCAP_RS_SUCCESSFUL;
     }
-    return QCAP_RS_ERROR_GENERAL;
+    return QCAP_RS_ERROR_INVALID_PARAMETER;
 }
 
 #ifdef __cplusplus

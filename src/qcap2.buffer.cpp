@@ -1,4 +1,5 @@
 #include "qcap2.buffer.h"
+#include "qcap2.user.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -47,11 +48,59 @@ typedef struct _qcap2_av_packet_priv_t {
 
 typedef struct _qcap2_rcbuffer_priv_t {
     PVOID pData;
+    ULONG nDataSize;
     qcap2_on_free_resource_t pOnFreeResource;
-    std::atomic<int> use_count;
-    std::atomic<int> weak_count;
-    std::atomic<int> res_count;
+    std::atomic<int32_t> use_count;
+    std::atomic<int32_t> weak_count;
+    std::atomic<int32_t> res_count;
+    std::atomic<bool> resource_freed;
 } qcap2_rcbuffer_priv_t;
+
+static int32_t qcap2_atomic_inc_if_positive(std::atomic<int32_t>& value) {
+    int32_t n = value.load(std::memory_order_acquire);
+    while (n > 0) {
+        if (value.compare_exchange_weak(n, n + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return n + 1;
+        }
+    }
+    return 0;
+}
+
+static int32_t qcap2_atomic_dec_if_positive(std::atomic<int32_t>& value) {
+    int32_t n = value.load(std::memory_order_acquire);
+    while (n > 0) {
+        if (value.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return n - 1;
+        }
+    }
+    return -1;
+}
+
+static void qcap2_rcbuffer_maybe_delete(qcap2_rcbuffer_priv_t* p) {
+    if (p &&
+        p->use_count.load(std::memory_order_acquire) == 0 &&
+        p->weak_count.load(std::memory_order_acquire) == 0 &&
+        p->res_count.load(std::memory_order_acquire) == 0) {
+        delete p;
+    }
+}
+
+static void qcap2_rcbuffer_release_resource(qcap2_rcbuffer_priv_t* p) {
+    if (!p) return;
+
+    int32_t nResCount = qcap2_atomic_dec_if_positive(p->res_count);
+    if (nResCount == 0) {
+        bool bExpected = false;
+        if (p->resource_freed.compare_exchange_strong(bExpected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            PVOID pData = p->pData;
+            if (p->pOnFreeResource) {
+                p->pOnFreeResource(pData);
+            }
+        }
+    }
+
+    qcap2_rcbuffer_maybe_delete(p);
+}
 
 
 // --- qcap2_rcbuffer_t ---
@@ -60,10 +109,12 @@ qcap2_rcbuffer_t* qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFr
     qcap2_rcbuffer_priv_t* p = new (std::nothrow) qcap2_rcbuffer_priv_t();
     if (p) {
         p->pData = pData;
+        p->nDataSize = 0;
         p->pOnFreeResource = pOnFreeResource;
-        p->use_count = 1;
-        p->weak_count = 0;
-        p->res_count = 1;
+        p->use_count.store(1, std::memory_order_release);
+        p->weak_count.store(0, std::memory_order_release);
+        p->res_count.store(1, std::memory_order_release);
+        p->resource_freed.store(false, std::memory_order_release);
     }
     return (qcap2_rcbuffer_t*)p;
 }
@@ -73,45 +124,56 @@ void qcap2_rcbuffer_delete(qcap2_rcbuffer_t* pRCBuffer) {
 }
 
 void qcap2_rcbuffer_to_buffer(qcap2_rcbuffer_t* pRCBuffer, BYTE** ppBuffer, ULONG* pBufferSize) {
+    if (ppBuffer) *ppBuffer = NULL;
+    if (pBufferSize) *pBufferSize = 0;
+
     if (pRCBuffer) {
         qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)pRCBuffer;
         if (ppBuffer) *ppBuffer = (BYTE*)p->pData;
-        if (pBufferSize) *pBufferSize = 0; // We don't track size in this simple implementation
+        if (pBufferSize) *pBufferSize = p->nDataSize;
     }
 }
 
 qcap2_rcbuffer_t* qcap2_rcbuffer_cast(BYTE * pBuffer, ULONG nBufferLen) {
-    return qcap2_rcbuffer_new(pBuffer, NULL); // dummy implementation
+    qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)qcap2_rcbuffer_new(pBuffer, NULL);
+    if (p) {
+        p->nDataSize = nBufferLen;
+    }
+    return (qcap2_rcbuffer_t*)p;
 }
 
 void qcap2_rcbuffer_add_ref(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
         qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)pRCBuffer;
-        p->use_count++;
+        qcap2_atomic_inc_if_positive(p->use_count);
     }
 }
 
 void qcap2_rcbuffer_release(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
         qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)pRCBuffer;
-        if (--p->use_count <= 0) {
-            if (p->pOnFreeResource) {
-                p->pOnFreeResource(p->pData);
-            }
-            delete p;
+        int32_t nUseCount = qcap2_atomic_dec_if_positive(p->use_count);
+        if (nUseCount == 0) {
+            qcap2_rcbuffer_release_resource(p);
         }
     }
 }
 
 PVOID qcap2_rcbuffer_lock_data(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
-        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->pData;
+        qcap2_rcbuffer_priv_t* p = (qcap2_rcbuffer_priv_t*)pRCBuffer;
+        if (!p->resource_freed.load(std::memory_order_acquire) &&
+            qcap2_atomic_inc_if_positive(p->res_count) > 0) {
+            return p->pData;
+        }
     }
     return NULL;
 }
 
 void qcap2_rcbuffer_unlock_data(qcap2_rcbuffer_t* pRCBuffer) {
-    // nothing
+    if (pRCBuffer) {
+        qcap2_rcbuffer_release_resource((qcap2_rcbuffer_priv_t*)pRCBuffer);
+    }
 }
 
 PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer) {
@@ -123,25 +185,24 @@ PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer) {
 
 int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
-        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->use_count;
+        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->use_count.load(std::memory_order_acquire);
     }
     return 0;
 }
 
 int32_t qcap2_rcbuffer_weak_count(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
-        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->weak_count;
+        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->weak_count.load(std::memory_order_acquire);
     }
     return 0;
 }
 
 int32_t qcap2_rcbuffer_res_count(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
-        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->res_count;
+        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->res_count.load(std::memory_order_acquire);
     }
     return 0;
 }
-
 
 // --- qcap2_av_frame_t ---
 
@@ -295,21 +356,127 @@ void qcap2_av_frame_get_buffer1(qcap2_av_frame_t* pFrame, uint8_t* pBuffer[4], i
     }
 }
 
+static int qcap2_align_value(int value, int alignment) {
+    if (value <= 0) return 0;
+    if (alignment <= 1) return value;
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static bool qcap2_av_frame_set_owned_layout(qcap2_av_frame_priv_t* p, size_t nTotalSize, int nPlanes, const size_t nPlaneOffset[4], const int nStride[4]) {
+    if (!p || nTotalSize == 0 || nPlanes <= 0 || nPlanes > 4) return false;
+
+    uint8_t* pMemory = (uint8_t*)malloc(nTotalSize);
+    if (!pMemory) return false;
+
+    memset(p->pBuffer, 0, sizeof(p->pBuffer));
+    memset(p->pStride, 0, sizeof(p->pStride));
+    for (int i = 0; i < nPlanes; ++i) {
+        p->pBuffer[i] = pMemory + nPlaneOffset[i];
+        p->pStride[i] = nStride[i];
+    }
+    p->bOwnsBuffer = true;
+    p->nVideoBits = (int64_t)nTotalSize * 8;
+    return true;
+}
+
 bool qcap2_av_frame_alloc_buffer(qcap2_av_frame_t* pFrame, int align, int valign) {
     if (!pFrame) return false;
     qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
-    if (p->bOwnsBuffer && p->pBuffer[0]) {
-        free(p->pBuffer[0]);
-    }
 
-    // allocate based on width/height/color space?
-    // just dummy allocate 1 for now if needed, or based on stride.
-    // Assuming simple calculation for height * stride.
-    int size = p->nHeight * p->pStride[0];
-    if (size == 0) size = 1024 * 1024 * 4; // default large buffer
-    p->pBuffer[0] = (uint8_t*)malloc(size);
-    p->bOwnsBuffer = true;
-    return p->pBuffer[0] != NULL;
+    qcap2_av_frame_free_buffer(pFrame);
+
+    int nWidth = (int)p->nWidth;
+    int nHeight = (int)p->nHeight;
+    if (nWidth <= 0 || nHeight <= 0) return false;
+
+    int nAlignedHeight = qcap2_align_value(nHeight, valign);
+    int nChromaWidth = (nWidth + 1) / 2;
+    int nChromaHeight = (nHeight + 1) / 2;
+    int nAlignedChromaHeight = qcap2_align_value(nChromaHeight, valign);
+
+    size_t nOffset[4] = { 0, 0, 0, 0 };
+    int nStride[4] = { 0, 0, 0, 0 };
+    size_t nSize[4] = { 0, 0, 0, 0 };
+
+    switch (p->nColorSpaceType) {
+    case QCAP_COLORSPACE_TYPE_RGB24:
+    case QCAP_COLORSPACE_TYPE_BGR24:
+        nStride[0] = qcap2_align_value(nWidth * 3, align);
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        return qcap2_av_frame_set_owned_layout(p, nSize[0], 1, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_ARGB32:
+    case QCAP_COLORSPACE_TYPE_ABGR32:
+        nStride[0] = qcap2_align_value(nWidth * 4, align);
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        return qcap2_av_frame_set_owned_layout(p, nSize[0], 1, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_Y416:
+        nStride[0] = qcap2_align_value(nWidth * 8, align);
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        return qcap2_av_frame_set_owned_layout(p, nSize[0], 1, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_YUY2:
+    case QCAP_COLORSPACE_TYPE_UYVY:
+        nStride[0] = qcap2_align_value(nWidth * 2, align);
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        return qcap2_av_frame_set_owned_layout(p, nSize[0], 1, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_Y800:
+        nStride[0] = qcap2_align_value(nWidth, align);
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        return qcap2_av_frame_set_owned_layout(p, nSize[0], 1, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_YV12:
+    case QCAP_COLORSPACE_TYPE_I420:
+        nStride[0] = qcap2_align_value(nWidth, align);
+        nStride[1] = qcap2_align_value(nChromaWidth, align);
+        nStride[2] = nStride[1];
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        nSize[1] = (size_t)nStride[1] * nAlignedChromaHeight;
+        nSize[2] = nSize[1];
+        nOffset[1] = nSize[0];
+        nOffset[2] = nSize[0] + nSize[1];
+        return qcap2_av_frame_set_owned_layout(p, nSize[0] + nSize[1] + nSize[2], 3, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_YV24:
+        nStride[0] = qcap2_align_value(nWidth, align);
+        nStride[1] = nStride[0];
+        nStride[2] = nStride[0];
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        nSize[1] = nSize[0];
+        nSize[2] = nSize[0];
+        nOffset[1] = nSize[0];
+        nOffset[2] = nSize[0] + nSize[1];
+        return qcap2_av_frame_set_owned_layout(p, nSize[0] + nSize[1] + nSize[2], 3, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_NV12:
+        nStride[0] = qcap2_align_value(nWidth, align);
+        nStride[1] = nStride[0];
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        nSize[1] = (size_t)nStride[1] * nAlignedChromaHeight;
+        nOffset[1] = nSize[0];
+        return qcap2_av_frame_set_owned_layout(p, nSize[0] + nSize[1], 2, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_P010:
+        nStride[0] = qcap2_align_value(nWidth * 2, align);
+        nStride[1] = nStride[0];
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        nSize[1] = (size_t)nStride[1] * nAlignedChromaHeight;
+        nOffset[1] = nSize[0];
+        return qcap2_av_frame_set_owned_layout(p, nSize[0] + nSize[1], 2, nOffset, nStride);
+
+    case QCAP_COLORSPACE_TYPE_P210:
+        nStride[0] = qcap2_align_value(nWidth * 2, align);
+        nStride[1] = nStride[0];
+        nSize[0] = (size_t)nStride[0] * nAlignedHeight;
+        nSize[1] = (size_t)nStride[1] * nAlignedHeight;
+        nOffset[1] = nSize[0];
+        return qcap2_av_frame_set_owned_layout(p, nSize[0] + nSize[1], 2, nOffset, nStride);
+
+    default:
+        return false;
+    }
 }
 
 void qcap2_av_frame_free_buffer(qcap2_av_frame_t* pFrame) {
@@ -317,9 +484,11 @@ void qcap2_av_frame_free_buffer(qcap2_av_frame_t* pFrame) {
     qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
     if (p->bOwnsBuffer && p->pBuffer[0]) {
         free(p->pBuffer[0]);
-        p->pBuffer[0] = NULL;
     }
+    memset(p->pBuffer, 0, sizeof(p->pBuffer));
+    memset(p->pStride, 0, sizeof(p->pStride));
     p->bOwnsBuffer = false;
+    p->nVideoBits = 0;
 }
 
 QRESULT qcap2_av_frame_copy(qcap2_av_frame_t* pSrcFrame, qcap2_av_frame_t* pDstFrame) {
@@ -472,6 +641,61 @@ void qcap2_av_packet_free_buffer(qcap2_av_packet_t* pPacket) {
     }
     p->bOwnsBuffer = false;
     p->nSize = 0;
+}
+
+
+// --- qcap2.user.h rc-buffer helpers ---
+
+typedef struct _qcap2_rcbuffer_av_frame_owner_t {
+    PVOID pOwner;
+    qcap2_av_frame_t av_frame;
+} qcap2_rcbuffer_av_frame_owner_t;
+
+typedef struct _qcap2_rcbuffer_av_packet_owner_t {
+    PVOID pOwner;
+    qcap2_av_packet_t av_packet;
+} qcap2_rcbuffer_av_packet_owner_t;
+
+static void qcap2_rcbuffer_free_av_frame(PVOID pData) {
+    if (!pData) return;
+    qcap2_rcbuffer_av_frame_owner_t* pOwner = qcap2_container_of(pData, qcap2_rcbuffer_av_frame_owner_t, av_frame);
+    qcap2_av_frame_free_buffer(&pOwner->av_frame);
+    delete pOwner;
+}
+
+static void qcap2_rcbuffer_free_av_packet(PVOID pData) {
+    if (!pData) return;
+    qcap2_rcbuffer_av_packet_owner_t* pOwner = qcap2_container_of(pData, qcap2_rcbuffer_av_packet_owner_t, av_packet);
+    qcap2_av_packet_free_buffer(&pOwner->av_packet);
+    delete pOwner;
+}
+
+qcap2_rcbuffer_t* qcap2_rcbuffer_new_av_frame() {
+    qcap2_rcbuffer_av_frame_owner_t* pOwner = new (std::nothrow) qcap2_rcbuffer_av_frame_owner_t();
+    if (!pOwner) return NULL;
+
+    pOwner->pOwner = pOwner;
+    qcap2_av_frame_init(&pOwner->av_frame);
+
+    qcap2_rcbuffer_t* pRCBuffer = qcap2_rcbuffer_new(&pOwner->av_frame, qcap2_rcbuffer_free_av_frame);
+    if (!pRCBuffer) {
+        delete pOwner;
+    }
+    return pRCBuffer;
+}
+
+qcap2_rcbuffer_t* qcap2_rcbuffer_new_av_packet() {
+    qcap2_rcbuffer_av_packet_owner_t* pOwner = new (std::nothrow) qcap2_rcbuffer_av_packet_owner_t();
+    if (!pOwner) return NULL;
+
+    pOwner->pOwner = pOwner;
+    qcap2_av_packet_init(&pOwner->av_packet);
+
+    qcap2_rcbuffer_t* pRCBuffer = qcap2_rcbuffer_new(&pOwner->av_packet, qcap2_rcbuffer_free_av_packet);
+    if (!pRCBuffer) {
+        delete pOwner;
+    }
+    return pRCBuffer;
 }
 
 #ifdef __cplusplus

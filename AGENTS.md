@@ -4,6 +4,7 @@
 - `include/`: Public QCAP headers, split into modular `qcap.*.h` files plus umbrella headers like `qcap.h`.
 
 ## Build, Test, and Development Commands
+- Before refactoring or adding features, read relevant notes in `./wiki/` to understand API semantics and implementation constraints.
 - To setup the environment and install dependencies, run `./setup-env.sh`.
 - Example consumer compile (from README): `g++ your_program.cpp -I./include -L./lib -lqcap -lavcodec -lavformat -lavutil -lswscale -lboost_system -o your_program`.
   Adjust paths to where the real QCAP library lives; this repo does not ship binaries.

@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavformat-dev \
     libavutil-dev \
     libswscale-dev \
+    libavfilter-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

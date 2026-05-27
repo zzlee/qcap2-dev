@@ -18,6 +18,8 @@ find_library(AVFORMAT_LIB NAMES avformat)
 find_library(AVCODEC_LIB NAMES avcodec)
 find_library(AVUTIL_LIB NAMES avutil)
 find_library(SWRESAMPLE_LIB NAMES swresample)
+find_library(SWSCALE_LIB NAMES swscale)
+find_library(AVFILTER_LIB NAMES avfilter)
 
 # 1. test_qcap2_buffer
 add_executable(test_qcap2_buffer
@@ -62,22 +64,25 @@ else()
     message(WARNING "FFmpeg libraries NOT found. Skipping test_qcap2_demuxer.")
 endif()
 
-# 5. test_qcap2_processing (optional based on swresample & avutil presence)
-if(SWRESAMPLE_LIB AND AVUTIL_LIB)
-    message(STATUS "FFmpeg swresample found. Building test_qcap2_processing.")
+# 5. test_qcap2_processing (optional based on FFmpeg components presence)
+if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB)
+    message(STATUS "FFmpeg swresample, swscale, and avfilter found. Building test_qcap2_processing.")
     add_executable(test_qcap2_processing
         tests/test_qcap2_processing.cpp
         src/qcap2.processing.cpp
         src/qcap2.buffer.cpp
         src/qcap2.sync.cpp
+        src/qcap2.formats.cpp
     )
     target_link_libraries(test_qcap2_processing PRIVATE
         Threads::Threads
         ${SWRESAMPLE_LIB}
+        ${SWSCALE_LIB}
+        ${AVFILTER_LIB}
         ${AVUTIL_LIB}
     )
 else()
-    message(WARNING "FFmpeg swresample/avutil NOT found. Skipping test_qcap2_processing.")
+    message(WARNING "FFmpeg swresample/swscale/avfilter/avutil NOT found. Skipping test_qcap2_processing.")
 endif()
 
 # Register CTest

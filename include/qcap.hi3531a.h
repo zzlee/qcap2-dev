@@ -101,12 +101,6 @@ struct qcap_generic_av_frame_t {
 		VIDEO_FRAME_INFO_S video_frame;
 #endif
 
-#if 0
-		struct {
-			AUDIO_FRAME_S frames[2];
-		} audio_frame;
-#endif
-
 		qcap_native_audio_frame_t native_audio_frame;
 		qcap_av_frame_t av_frame;
 	} u;

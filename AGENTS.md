@@ -8,8 +8,8 @@
 - To setup the environment and install dependencies, run `./setup-env.sh`.
 - **Docker-Based Building & Testing**:
   - Build the Docker image: `docker build -t qcap2-build-env .`
-  - Build/run tests (mounting local workspace): `docker run --rm -v $(pwd):/workspace qcap2-build-env sh -c "mkdir -p build && cd build && cmake .. && make && ctest --output-on-failure"`
-  - Launch an interactive development shell: `docker run --rm -it -v $(pwd):/workspace qcap2-build-env bash`
+  - Build/run tests (mounting local workspace): `docker run --rm --user $(id -u):$(id -g) -v $(pwd):/workspace qcap2-build-env sh -c "mkdir -p build && cd build && cmake .. && make && ctest --output-on-failure"`
+  - Launch an interactive development shell: `docker run --rm -it --user $(id -u):$(id -g) -v $(pwd):/workspace qcap2-build-env bash`
   - Build for ARM64 or custom architectures: `docker build --build-arg BASE_IMAGE=arm64v8/ubuntu:24.04 -t qcap2-build-env-arm64 .`
 - Example consumer compile (from README): `g++ your_program.cpp -I./include -L./lib -lqcap -lavcodec -lavformat -lavutil -lswscale -lboost_system -o your_program`.
   Adjust paths to where the real QCAP library lives; this repo does not ship binaries.

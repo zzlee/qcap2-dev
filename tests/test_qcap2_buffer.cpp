@@ -37,6 +37,66 @@ void test_qcap2_av_frame() {
     qcap2_av_frame_free_buffer(&frame);
 }
 
+void test_qcap2_av_frame_copy() {
+    // Test 1: Null Arguments
+    qcap2_av_frame_t frame;
+    qcap2_av_frame_init(&frame);
+    assert(qcap2_av_frame_copy(NULL, NULL) == QCAP_RS_ERROR_GENERAL);
+    assert(qcap2_av_frame_copy(&frame, NULL) == QCAP_RS_ERROR_GENERAL);
+    assert(qcap2_av_frame_copy(NULL, &frame) == QCAP_RS_ERROR_GENERAL);
+
+    // Test 2: Basic Properties Copy
+    qcap2_av_frame_t src;
+    qcap2_av_frame_init(&src);
+    qcap2_av_frame_set_video_property(&src, QCAP_COLORSPACE_TYPE_NV12, 1920, 1080);
+    qcap2_av_frame_set_pts(&src, 54321);
+
+    qcap2_av_frame_t dst;
+    qcap2_av_frame_init(&dst);
+    assert(qcap2_av_frame_copy(&src, &dst) == QCAP_RS_SUCCESSFUL);
+
+    ULONG color, width, height;
+    qcap2_av_frame_get_video_property(&dst, &color, &width, &height);
+    assert(color == QCAP_COLORSPACE_TYPE_NV12);
+    assert(width == 1920);
+    assert(height == 1080);
+
+    int64_t pts;
+    qcap2_av_frame_get_pts(&dst, &pts);
+    assert(pts == 54321);
+
+    // Test 3: Deep Copy of Buffer
+    qcap2_av_frame_t src_buf;
+    qcap2_av_frame_init(&src_buf);
+    qcap2_av_frame_set_video_property(&src_buf, QCAP_COLORSPACE_TYPE_NV12, 16, 16);
+    assert(qcap2_av_frame_alloc_buffer(&src_buf, 16, 1));
+
+    uint8_t* pSrcBuf;
+    int srcStride;
+    qcap2_av_frame_get_buffer(&src_buf, &pSrcBuf, &srcStride);
+    assert(pSrcBuf != NULL);
+    assert(srcStride > 0);
+
+    // Fill with known pattern
+    size_t size = srcStride * 16;
+    memset(pSrcBuf, 0xAB, size);
+
+    qcap2_av_frame_t dst_buf;
+    qcap2_av_frame_init(&dst_buf);
+    assert(qcap2_av_frame_copy(&src_buf, &dst_buf) == QCAP_RS_SUCCESSFUL);
+
+    uint8_t* pDstBuf;
+    int dstStride;
+    qcap2_av_frame_get_buffer(&dst_buf, &pDstBuf, &dstStride);
+    assert(pDstBuf != NULL);
+    assert(dstStride == srcStride);
+    assert(pDstBuf != pSrcBuf); // Verify deep copy
+    assert(memcmp(pSrcBuf, pDstBuf, size) == 0); // Verify data identity
+
+    qcap2_av_frame_free_buffer(&src_buf);
+    qcap2_av_frame_free_buffer(&dst_buf);
+}
+
 void test_qcap2_av_frame_alloc_buffer_layout() {
     qcap2_av_frame_t frame;
     qcap2_av_frame_init(&frame);
@@ -242,6 +302,7 @@ void test_qcap2_rcbuffer_new_av_packet() {
 
 int main() {
     test_qcap2_av_frame();
+    test_qcap2_av_frame_copy();
     test_qcap2_av_frame_alloc_buffer_layout();
     test_qcap2_av_packet();
     test_qcap2_rcbuffer();

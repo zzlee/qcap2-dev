@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 find_library(AVFORMAT_LIB NAMES avformat)
 find_library(AVCODEC_LIB NAMES avcodec)
 find_library(AVUTIL_LIB NAMES avutil)
+find_library(SWRESAMPLE_LIB NAMES swresample)
 
 # 1. test_qcap2_buffer
 add_executable(test_qcap2_buffer
@@ -61,6 +62,24 @@ else()
     message(WARNING "FFmpeg libraries NOT found. Skipping test_qcap2_demuxer.")
 endif()
 
+# 5. test_qcap2_processing (optional based on swresample & avutil presence)
+if(SWRESAMPLE_LIB AND AVUTIL_LIB)
+    message(STATUS "FFmpeg swresample found. Building test_qcap2_processing.")
+    add_executable(test_qcap2_processing
+        tests/test_qcap2_processing.cpp
+        src/qcap2.processing.cpp
+        src/qcap2.buffer.cpp
+        src/qcap2.sync.cpp
+    )
+    target_link_libraries(test_qcap2_processing PRIVATE
+        Threads::Threads
+        ${SWRESAMPLE_LIB}
+        ${AVUTIL_LIB}
+    )
+else()
+    message(WARNING "FFmpeg swresample/avutil NOT found. Skipping test_qcap2_processing.")
+endif()
+
 # Register CTest
 enable_testing()
 add_test(NAME test_qcap2_buffer COMMAND test_qcap2_buffer)
@@ -68,4 +87,7 @@ add_test(NAME test_qcap2_utils COMMAND test_qcap2_utils)
 add_test(NAME test_qcap2_sync COMMAND test_qcap2_sync)
 if(TARGET test_qcap2_demuxer)
     add_test(NAME test_qcap2_demuxer COMMAND test_qcap2_demuxer)
+endif()
+if(TARGET test_qcap2_processing)
+    add_test(NAME test_qcap2_processing COMMAND test_qcap2_processing)
 endif()

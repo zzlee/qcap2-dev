@@ -17,6 +17,7 @@ typedef void* HWND;
 
 #ifdef __linux__
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <poll.h>
 #endif
@@ -213,33 +214,221 @@ struct HandlerData {
     PVOID userData;
 };
 
+struct InvokeData {
+    qcap2_on_event_t callback;
+    PVOID userData;
+};
+
 typedef struct qcap2_event_handlers_priv_t {
     std::mutex* mtx;
     std::vector<HandlerData>* handlers;
+    std::vector<InvokeData>* pending_invokes;
+    std::thread* monitor_thread;
+    bool running;
+#ifdef __linux__
+    int wakeup_fd;
+#else
+    std::condition_variable* cv;
+#endif
 } qcap2_event_handlers_priv_t;
+
+#ifdef __linux__
+static void qcap2_event_handlers_monitor_thread_func(qcap2_event_handlers_priv_t* p) {
+    while (true) {
+        std::vector<struct pollfd> fds;
+        std::vector<HandlerData> active_handlers;
+        int wakeup_fd = -1;
+        std::vector<InvokeData> invokes_to_run;
+
+        {
+            std::lock_guard<std::mutex> lock(*(p->mtx));
+            if (!p->running) {
+                break;
+            }
+            wakeup_fd = p->wakeup_fd;
+
+            if (!p->pending_invokes->empty()) {
+                invokes_to_run = std::move(*(p->pending_invokes));
+                p->pending_invokes->clear();
+            }
+
+            // Add wakeup_fd as fds[0]
+            struct pollfd wfd = { wakeup_fd, POLLIN, 0 };
+            fds.push_back(wfd);
+
+            // Add all registered handlers
+            for (const auto& h : *(p->handlers)) {
+                struct pollfd fd_entry = { (int)h.handle, POLLIN, 0 };
+                fds.push_back(fd_entry);
+                active_handlers.push_back(h);
+            }
+        }
+
+        // Execute invokes outside the lock
+        for (const auto& inv : invokes_to_run) {
+            inv.callback(inv.userData);
+        }
+
+        // Check if stopped during callbacks
+        {
+            std::lock_guard<std::mutex> lock(*(p->mtx));
+            if (!p->running) {
+                break;
+            }
+        }
+
+        int ret = poll(fds.data(), fds.size(), -1);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break; // Error or interrupted
+        }
+
+        // Check if stopped
+        {
+            std::lock_guard<std::mutex> lock(*(p->mtx));
+            if (!p->running) {
+                break;
+            }
+        }
+
+        // Check wakeup_fd
+        if (fds[0].revents & POLLIN) {
+            uint64_t val = 0;
+            read(wakeup_fd, &val, sizeof(val));
+        }
+
+        // Check other fds
+        for (size_t i = 1; i < fds.size(); ++i) {
+            if (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+                // To avoid invoking a callback of a handler that was just removed
+                bool exists = false;
+                HandlerData h;
+                {
+                    std::lock_guard<std::mutex> lock(*(p->mtx));
+                    for (const auto& current_handler : *(p->handlers)) {
+                        if (current_handler.handle == active_handlers[i - 1].handle &&
+                            current_handler.callback == active_handlers[i - 1].callback &&
+                            current_handler.userData == active_handlers[i - 1].userData) {
+                            exists = true;
+                            h = current_handler;
+                            break;
+                        }
+                    }
+                }
+                if (exists) {
+                    h.callback(h.userData);
+                }
+            }
+        }
+    }
+}
+#else
+static void qcap2_event_handlers_monitor_thread_func(qcap2_event_handlers_priv_t* p) {
+    while (true) {
+        std::vector<InvokeData> invokes_to_run;
+        {
+            std::unique_lock<std::mutex> lock(*(p->mtx));
+            p->cv->wait(lock, [p] { return !p->running || !p->pending_invokes->empty(); });
+            if (!p->running && p->pending_invokes->empty()) {
+                break;
+            }
+            if (!p->pending_invokes->empty()) {
+                invokes_to_run = std::move(*(p->pending_invokes));
+                p->pending_invokes->clear();
+            }
+        }
+        for (const auto& inv : invokes_to_run) {
+            inv.callback(inv.userData);
+        }
+    }
+}
+#endif
 
 qcap2_event_handlers_t* qcap2_event_handlers_new() {
     qcap2_event_handlers_priv_t* pThis = new qcap2_event_handlers_priv_t;
     pThis->mtx = new std::mutex();
     pThis->handlers = new std::vector<HandlerData>();
+    pThis->pending_invokes = new std::vector<InvokeData>();
+    pThis->monitor_thread = nullptr;
+    pThis->running = false;
+#ifdef __linux__
+    pThis->wakeup_fd = -1;
+#else
+    pThis->cv = new std::condition_variable();
+#endif
     return (qcap2_event_handlers_t*)pThis;
 }
 
 void qcap2_event_handlers_delete(qcap2_event_handlers_t* pThis) {
     if (pThis) {
+        qcap2_event_handlers_stop(pThis);
         qcap2_event_handlers_priv_t* p = (qcap2_event_handlers_priv_t*)pThis;
+        delete p->pending_invokes;
         delete p->handlers;
+#ifndef __linux__
+        delete p->cv;
+#endif
         delete p->mtx;
         delete p;
     }
 }
 
 QRESULT qcap2_event_handlers_start(qcap2_event_handlers_t* pThis) {
-    return pThis ? QCAP_RS_SUCCESSFUL : QCAP_RS_ERROR_GENERAL;
+    if (pThis) {
+        qcap2_event_handlers_priv_t* p = (qcap2_event_handlers_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (!p->running) {
+            p->running = true;
+#ifdef __linux__
+            p->wakeup_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+            if (p->wakeup_fd < 0) {
+                p->running = false;
+                return QCAP_RS_ERROR_GENERAL;
+            }
+#endif
+            p->monitor_thread = new std::thread(qcap2_event_handlers_monitor_thread_func, p);
+        }
+        return QCAP_RS_SUCCESSFUL;
+    }
+    return QCAP_RS_ERROR_GENERAL;
 }
 
 QRESULT qcap2_event_handlers_stop(qcap2_event_handlers_t* pThis) {
-    return pThis ? QCAP_RS_SUCCESSFUL : QCAP_RS_ERROR_GENERAL;
+    if (pThis) {
+        qcap2_event_handlers_priv_t* p = (qcap2_event_handlers_priv_t*)pThis;
+        std::thread* thread_to_join = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*(p->mtx));
+            if (p->running) {
+                p->running = false;
+#ifdef __linux__
+                if (p->wakeup_fd >= 0) {
+                    uint64_t val = 1;
+                    write(p->wakeup_fd, &val, sizeof(val));
+                }
+#else
+                p->cv->notify_all();
+#endif
+                thread_to_join = p->monitor_thread;
+                p->monitor_thread = nullptr;
+            }
+        }
+        if (thread_to_join) {
+            thread_to_join->join();
+            delete thread_to_join;
+        }
+#ifdef __linux__
+        {
+            std::lock_guard<std::mutex> lock(*(p->mtx));
+            if (p->wakeup_fd >= 0) {
+                close(p->wakeup_fd);
+                p->wakeup_fd = -1;
+            }
+        }
+#endif
+        return QCAP_RS_SUCCESSFUL;
+    }
+    return QCAP_RS_ERROR_GENERAL;
 }
 
 QRESULT qcap2_event_handlers_add_handler(qcap2_event_handlers_t* pThis, uintptr_t nHandle, qcap2_on_event_t pOnEvent, PVOID pUserData) {
@@ -247,6 +436,12 @@ QRESULT qcap2_event_handlers_add_handler(qcap2_event_handlers_t* pThis, uintptr_
         qcap2_event_handlers_priv_t* p = (qcap2_event_handlers_priv_t*)pThis;
         std::lock_guard<std::mutex> lock(*(p->mtx));
         p->handlers->push_back({nHandle, pOnEvent, pUserData});
+#ifdef __linux__
+        if (p->running && p->wakeup_fd >= 0) {
+            uint64_t val = 1;
+            write(p->wakeup_fd, &val, sizeof(val));
+        }
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -263,29 +458,32 @@ QRESULT qcap2_event_handlers_remove_handler(qcap2_event_handlers_t* pThis, uintp
                 ++it;
             }
         }
+#ifdef __linux__
+        if (p->running && p->wakeup_fd >= 0) {
+            uint64_t val = 1;
+            write(p->wakeup_fd, &val, sizeof(val));
+        }
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
 }
 
 QRESULT qcap2_event_handlers_invoke(qcap2_event_handlers_t* pThis, qcap2_on_event_t pOnEvent, PVOID pUserData) {
-    if (pThis) {
+    if (pThis && pOnEvent) {
         qcap2_event_handlers_priv_t* p = (qcap2_event_handlers_priv_t*)pThis;
-        std::vector<HandlerData> handlersCopy;
-        {
-            std::lock_guard<std::mutex> lock(*(p->mtx));
-            handlersCopy = *(p->handlers);
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->pending_invokes->push_back({pOnEvent, pUserData});
+#ifdef __linux__
+        if (p->running && p->wakeup_fd >= 0) {
+            uint64_t val = 1;
+            write(p->wakeup_fd, &val, sizeof(val));
         }
-
-        for (const auto& h : handlersCopy) {
-            h.callback(h.userData);
+#else
+        if (p->running) {
+            p->cv->notify_all();
         }
-
-        // Also invoke the specific one if passed
-        if (pOnEvent) {
-            pOnEvent(pUserData);
-        }
-
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -529,14 +727,20 @@ extern "C" {
 
 // --- qcap2_timer_t ---
 typedef struct qcap2_timer_priv_t {
+#ifdef __linux__
+    int tfd;
+    uint64_t interval_ms;
+#else
     uint64_t interval_ms;
     std::mutex* mtx;
     std::condition_variable* cv;
     bool running;
     bool triggered;
     std::thread* timer_thread;
+#endif
 } qcap2_timer_priv_t;
 
+#ifndef __linux__
 static void timer_thread_func(qcap2_timer_priv_t* p) {
     while (true) {
         std::unique_lock<std::mutex> lock(*(p->mtx));
@@ -553,39 +757,69 @@ static void timer_thread_func(qcap2_timer_priv_t* p) {
         }
     }
 }
+#endif
 
 qcap2_timer_t* qcap2_timer_new() {
     qcap2_timer_priv_t* pThis = new qcap2_timer_priv_t;
+#ifdef __linux__
+    pThis->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    pThis->interval_ms = 0;
+#else
     pThis->interval_ms = 0;
     pThis->mtx = new std::mutex();
     pThis->cv = new std::condition_variable();
     pThis->running = false;
     pThis->triggered = false;
     pThis->timer_thread = nullptr;
+#endif
     return (qcap2_timer_t*)pThis;
 }
 
 void qcap2_timer_delete(qcap2_timer_t* pThis) {
     if (pThis) {
-        qcap2_timer_stop(pThis); // Ensure it's stopped
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        if (p->tfd >= 0) {
+            close(p->tfd);
+        }
+        delete p;
+#else
+        qcap2_timer_stop(pThis); // Ensure it's stopped
         delete p->cv;
         delete p->mtx;
         delete p;
+#endif
     }
 }
 
 void qcap2_timer_set_interval(qcap2_timer_t* pThis, uint64_t nInterval) {
     if (pThis) {
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        p->interval_ms = nInterval;
+#else
         std::lock_guard<std::mutex> lock(*(p->mtx));
         p->interval_ms = nInterval;
+#endif
     }
 }
 
 QRESULT qcap2_timer_start(qcap2_timer_t* pThis) {
     if (pThis) {
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        if (p->tfd < 0) return QCAP_RS_ERROR_GENERAL;
+
+        struct itimerspec new_value;
+        new_value.it_interval.tv_sec = p->interval_ms / 1000;
+        new_value.it_interval.tv_nsec = (p->interval_ms % 1000) * 1000000;
+        new_value.it_value.tv_sec = p->interval_ms / 1000;
+        new_value.it_value.tv_nsec = (p->interval_ms % 1000) * 1000000;
+
+        if (timerfd_settime(p->tfd, 0, &new_value, NULL) == 0) {
+            return QCAP_RS_SUCCESSFUL;
+        }
+#else
         std::lock_guard<std::mutex> lock(*(p->mtx));
         if (!p->running) {
             p->running = true;
@@ -593,6 +827,7 @@ QRESULT qcap2_timer_start(qcap2_timer_t* pThis) {
             p->timer_thread = new std::thread(timer_thread_func, p);
         }
         return QCAP_RS_SUCCESSFUL;
+#endif
     }
     return QCAP_RS_ERROR_GENERAL;
 }
@@ -600,6 +835,16 @@ QRESULT qcap2_timer_start(qcap2_timer_t* pThis) {
 QRESULT qcap2_timer_stop(qcap2_timer_t* pThis) {
     if (pThis) {
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        if (p->tfd < 0) return QCAP_RS_ERROR_GENERAL;
+
+        struct itimerspec new_value;
+        memset(&new_value, 0, sizeof(new_value));
+
+        if (timerfd_settime(p->tfd, 0, &new_value, NULL) == 0) {
+            return QCAP_RS_SUCCESSFUL;
+        }
+#else
         std::thread* thread_to_join = nullptr;
         {
             std::lock_guard<std::mutex> lock(*(p->mtx));
@@ -615,13 +860,19 @@ QRESULT qcap2_timer_stop(qcap2_timer_t* pThis) {
             delete thread_to_join;
         }
         return QCAP_RS_SUCCESSFUL;
+#endif
     }
     return QCAP_RS_ERROR_GENERAL;
 }
 
 QRESULT qcap2_timer_get_native_handle(qcap2_timer_t* pThis, uintptr_t* pHandle) {
     if (pThis && pHandle) {
+        qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        *pHandle = (uintptr_t)p->tfd;
+#else
         *pHandle = (uintptr_t)pThis;
+#endif
         return QCAP_RS_SUCCESSFUL;
     }
     return QCAP_RS_ERROR_GENERAL;
@@ -630,6 +881,31 @@ QRESULT qcap2_timer_get_native_handle(qcap2_timer_t* pThis, uintptr_t* pHandle) 
 QRESULT qcap2_timer_wait(qcap2_timer_t* pThis, uint64_t* pExpirations) {
     if (pThis) {
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        if (p->tfd < 0) return QCAP_RS_ERROR_GENERAL;
+
+        struct pollfd pfd = { p->tfd, POLLIN, 0 };
+        while (true) {
+            int ret = poll(&pfd, 1, -1);
+            if (ret > 0) {
+                uint64_t exp = 0;
+                ssize_t n = read(p->tfd, &exp, sizeof(exp));
+                if (n == sizeof(exp)) {
+                    if (pExpirations) {
+                        *pExpirations = exp;
+                    }
+                    return QCAP_RS_SUCCESSFUL;
+                } else if (n < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+            } else if (ret < 0) {
+                if (errno == EINTR) continue;
+                return QCAP_RS_ERROR_GENERAL;
+            }
+        }
+#else
         std::unique_lock<std::mutex> lock(*(p->mtx));
         p->cv->wait(lock, [p]{ return p->triggered || !p->running; });
 
@@ -638,6 +914,7 @@ QRESULT qcap2_timer_wait(qcap2_timer_t* pThis, uint64_t* pExpirations) {
         p->triggered = false;
         if (pExpirations) *pExpirations = 1;
         return QCAP_RS_SUCCESSFUL;
+#endif
     }
     return QCAP_RS_ERROR_GENERAL;
 }
@@ -645,9 +922,23 @@ QRESULT qcap2_timer_wait(qcap2_timer_t* pThis, uint64_t* pExpirations) {
 QRESULT qcap2_timer_next(qcap2_timer_t* pThis, uint64_t nDuration) {
     if (pThis) {
         qcap2_timer_priv_t* p = (qcap2_timer_priv_t*)pThis;
+#ifdef __linux__
+        if (p->tfd < 0) return QCAP_RS_ERROR_GENERAL;
+
+        struct itimerspec new_value;
+        new_value.it_interval.tv_sec = 0;
+        new_value.it_interval.tv_nsec = 0;
+        new_value.it_value.tv_sec = nDuration / 1000;
+        new_value.it_value.tv_nsec = (nDuration % 1000) * 1000000;
+
+        if (timerfd_settime(p->tfd, 0, &new_value, NULL) == 0) {
+            return QCAP_RS_SUCCESSFUL;
+        }
+#else
         std::lock_guard<std::mutex> lock(*(p->mtx));
         p->interval_ms = nDuration;
         return QCAP_RS_SUCCESSFUL;
+#endif
     }
     return QCAP_RS_ERROR_GENERAL;
 }

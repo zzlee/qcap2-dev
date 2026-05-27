@@ -5,6 +5,9 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 void test_qcap2_benaphore_lock_t() {
     qcap2_benaphore_lock_t* lock = qcap2_benaphore_lock_new();
@@ -101,17 +104,83 @@ void test_qcap2_event_t() {
     qcap2_event_delete(ev);
 }
 
+struct TestPipeContext {
+    int fd;
+    int* counter;
+};
+
+static QRETURN pipe_event_handler(PVOID data) {
+    if (data) {
+        TestPipeContext* ctx = (TestPipeContext*)data;
+        char buf[128];
+        int n = ::read(ctx->fd, buf, sizeof(buf));
+        (void)n;
+        (*ctx->counter)++;
+    }
+    return QCAP_RT_OK;
+}
+
+static std::thread::id main_thread_id;
+static std::thread::id callback_thread_id;
+
+static QRETURN thread_id_check_callback(PVOID data) {
+    if (data) {
+        int* counter = (int*)data;
+        (*counter)++;
+    }
+    callback_thread_id = std::this_thread::get_id();
+    return QCAP_RT_OK;
+}
+
 void test_qcap2_event_handlers_t() {
     qcap2_event_handlers_t* handlers = qcap2_event_handlers_new();
     assert(handlers != NULL);
 
-    int counter = 0;
-    assert(qcap2_event_handlers_add_handler(handlers, 1, dummy_event_handler, &counter) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_event_handlers_invoke(handlers, NULL, NULL) == QCAP_RS_SUCCESSFUL);
+    main_thread_id = std::this_thread::get_id();
+    callback_thread_id = std::thread::id(); // clear
 
-    assert(counter == 1);
+    // Start handlers first so the background thread is running
+    assert(qcap2_event_handlers_start(handlers) == QCAP_RS_SUCCESSFUL);
 
-    assert(qcap2_event_handlers_remove_handler(handlers, 1) == QCAP_RS_SUCCESSFUL);
+    int invoke_counter = 0;
+    assert(qcap2_event_handlers_invoke(handlers, thread_id_check_callback, &invoke_counter) == QCAP_RS_SUCCESSFUL);
+    
+    // It is asynchronous, so sleep a bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(invoke_counter == 1);
+    assert(callback_thread_id != main_thread_id); // Must have run in the background thread context!
+
+#ifdef __linux__
+    int pipefds[2];
+    assert(pipe(pipefds) == 0);
+
+    int thread_counter = 0;
+    TestPipeContext ctx = { pipefds[0], &thread_counter };
+    // Add the read-end to the event handler list
+    assert(qcap2_event_handlers_add_handler(handlers, pipefds[0], pipe_event_handler, &ctx) == QCAP_RS_SUCCESSFUL);
+
+    // Write to the write-end of pipe to trigger callback
+    char val = 'x';
+    assert(write(pipefds[1], &val, 1) == 1);
+
+    // Wait for callback to execute in monitoring thread
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(thread_counter == 1);
+
+    // Remove handler
+    assert(qcap2_event_handlers_remove_handler(handlers, pipefds[0]) == QCAP_RS_SUCCESSFUL);
+
+    // Write again to make sure callback is NOT invoked after removing
+    assert(write(pipefds[1], &val, 1) == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(thread_counter == 1); // Should still be 1
+
+    close(pipefds[0]);
+    close(pipefds[1]);
+#endif
+
+    // Stop handlers
+    assert(qcap2_event_handlers_stop(handlers) == QCAP_RS_SUCCESSFUL);
     qcap2_event_handlers_delete(handlers);
 }
 
@@ -282,6 +351,12 @@ void test_qcap2_rcbuffer_queue_event_t() {
 void test_qcap2_timer_t() {
     qcap2_timer_t* timer = qcap2_timer_new();
     assert(timer != NULL);
+
+    uintptr_t handle = 0;
+    assert(qcap2_timer_get_native_handle(timer, &handle) == QCAP_RS_SUCCESSFUL);
+#ifdef __linux__
+    assert((int)handle > 0);
+#endif
 
     qcap2_timer_set_interval(timer, 50);
     assert(qcap2_timer_start(timer) == QCAP_RS_SUCCESSFUL);

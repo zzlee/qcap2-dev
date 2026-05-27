@@ -1,0 +1,4 @@
+build/
+.git/
+.antigravitycli/
+test_qcap2_*

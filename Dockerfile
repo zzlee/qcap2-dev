@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install core build dependencies, FFmpeg development libraries, and Boost
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     make \
     g++ \
     git \
@@ -32,5 +33,5 @@ WORKDIR /workspace
 # Copy codebase into the container
 COPY . /workspace
 
-# Clean build artifacts and run the sync and demuxer tests
-CMD ["sh", "-c", "make clean && make test"]
+# Configure, build, and run the test suite via CTest
+CMD ["sh", "-c", "mkdir -p build && cd build && cmake .. && make -j$(nproc) && ctest --output-on-failure"]

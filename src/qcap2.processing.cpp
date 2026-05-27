@@ -303,6 +303,265 @@ QRESULT qcap2_audio_resampler_pop(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer
 }
 
 // ==============================================================================
+// qcap2_frame_pool_t Implementation
+// ==============================================================================
+
+typedef struct qcap2_frame_pool_priv_t {
+    std::mutex* mtx;
+
+    int backend_type;
+    int frame_count;
+
+    // Video settings
+    ULONG video_color_space;
+    ULONG video_width;
+    ULONG video_height;
+    int video_align;
+    int video_valign;
+    ULONG video_width_border;
+    ULONG video_height_border;
+    BOOL video_mapped;
+
+    // Audio settings
+    ULONG audio_channels;
+    ULONG audio_sample_fmt;
+    ULONG audio_sample_freq;
+    ULONG audio_frame_size;
+    int audio_align;
+
+    // Pool state
+    bool running;
+    bool is_video; // true if video properties were set, false if audio
+    std::vector<qcap2_rcbuffer_t*> pool;
+
+    qcap2_frame_pool_priv_t() {
+        mtx = new std::mutex();
+        backend_type = QCAP2_FRAME_POOL_BACKEND_TYPE_DEFAULT;
+        frame_count = 4;
+
+        video_color_space = QCAP_COLORSPACE_TYPE_BGR24;
+        video_width = 0;
+        video_height = 0;
+        video_align = 16;
+        video_valign = 1;
+        video_width_border = 0;
+        video_height_border = 0;
+        video_mapped = FALSE;
+
+        audio_channels = 0;
+        audio_sample_fmt = 0;
+        audio_sample_freq = 0;
+        audio_frame_size = 0;
+        audio_align = 1;
+
+        running = false;
+        is_video = true;
+    }
+
+    ~qcap2_frame_pool_priv_t() {
+        cleanup();
+        delete mtx;
+    }
+
+    void cleanup() {
+        for (auto buf : pool) {
+            qcap2_rcbuffer_release(buf);
+        }
+        pool.clear();
+    }
+} qcap2_frame_pool_priv_t;
+
+qcap2_frame_pool_t* qcap2_frame_pool_new() {
+    qcap2_frame_pool_priv_t* p = new qcap2_frame_pool_priv_t;
+    return (qcap2_frame_pool_t*)p;
+}
+
+void qcap2_frame_pool_delete(qcap2_frame_pool_t* pThis) {
+    if (pThis) {
+        qcap2_frame_pool_stop(pThis);
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        delete p;
+    }
+}
+
+void qcap2_frame_pool_set_backend_type(qcap2_frame_pool_t* pThis, int nBackendType) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->backend_type = nBackendType;
+    }
+}
+
+void qcap2_frame_pool_set_frame_count(qcap2_frame_pool_t* pThis, int nFrameCount) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->frame_count = nFrameCount;
+    }
+}
+
+void qcap2_frame_pool_set_video_frame_align(qcap2_frame_pool_t* pThis, int nFrameAlign, int nFrameVAlign) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->video_align = nFrameAlign;
+        p->video_valign = nFrameVAlign;
+    }
+}
+
+void qcap2_frame_pool_set_audio_frame_align(qcap2_frame_pool_t* pThis, int nFrameAlign) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->audio_align = nFrameAlign;
+    }
+}
+
+void qcap2_frame_pool_set_video_property(qcap2_frame_pool_t* pThis, ULONG nColorSpaceType, ULONG nFrameWidth, ULONG nFrameHeight) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->video_color_space = nColorSpaceType;
+        p->video_width = nFrameWidth;
+        p->video_height = nFrameHeight;
+        p->is_video = true;
+    }
+}
+
+void qcap2_frame_pool_set_video_property1(qcap2_frame_pool_t* pThis, ULONG nWidthBorder, ULONG nHeightBorder, BOOL bMapped) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->video_width_border = nWidthBorder;
+        p->video_height_border = nHeightBorder;
+        p->video_mapped = bMapped;
+    }
+}
+
+void qcap2_frame_pool_set_audio_property(qcap2_frame_pool_t* pThis, ULONG nChannels, ULONG nSampleFmt, ULONG nSampleFrequency, ULONG nAudioFrameSize) {
+    if (pThis) {
+        qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->audio_channels = nChannels;
+        p->audio_sample_fmt = nSampleFmt;
+        p->audio_sample_freq = nSampleFrequency;
+        p->audio_frame_size = nAudioFrameSize;
+        p->is_video = false;
+    }
+}
+
+QRESULT qcap2_frame_pool_start(qcap2_frame_pool_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    if (p->running) return QCAP_RS_SUCCESSFUL;
+
+    // Pre-allocate frames
+    int count = p->frame_count > 0 ? p->frame_count : 4;
+    for (int i = 0; i < count; ++i) {
+        qcap2_av_frame_t* frame = new qcap2_av_frame_t;
+        qcap2_av_frame_init(frame);
+
+        bool alloc_ok = false;
+        if (p->is_video) {
+            ULONG alloc_w = p->video_width + p->video_width_border * 2;
+            ULONG alloc_h = p->video_height + p->video_height_border * 2;
+            qcap2_av_frame_set_video_property(frame, p->video_color_space, alloc_w, alloc_h);
+            alloc_ok = qcap2_av_frame_alloc_buffer(frame, p->video_align, p->video_valign);
+        } else {
+            qcap2_av_frame_set_audio_property(frame, p->audio_channels, p->audio_sample_fmt, p->audio_sample_freq, p->audio_frame_size);
+
+            // Compute audio buffer size: channels * bytes_per_sample * frame_size
+            int bytes_per_sample = av_get_bytes_per_sample((AVSampleFormat)p->audio_sample_fmt);
+            if (bytes_per_sample <= 0) bytes_per_sample = 2; // fallback to 16-bit
+            size_t buf_size = (size_t)p->audio_channels * bytes_per_sample * p->audio_frame_size;
+            if (buf_size > 0) {
+                uint8_t* audio_buf = (uint8_t*)malloc(buf_size);
+                if (audio_buf) {
+                    memset(audio_buf, 0, buf_size);
+                    qcap2_av_frame_set_buffer(frame, audio_buf, (int)buf_size);
+                    alloc_ok = true;
+                }
+            }
+        }
+
+        if (!alloc_ok) {
+            delete frame;
+            // Cleanup already allocated
+            p->cleanup();
+            return QCAP_RS_ERROR_OUT_OF_MEMORY;
+        }
+
+        qcap2_rcbuffer_t* rc = qcap2_rcbuffer_new(frame, [](PVOID pData) {
+            qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
+            if (f) {
+                // For video frames, free_buffer handles the owned buffer.
+                // For audio frames, the buffer pointer was set externally via set_buffer,
+                // so we need to free it manually before free_buffer clears pointers.
+                uint8_t* buf = nullptr;
+                int stride = 0;
+                qcap2_av_frame_get_buffer(f, &buf, &stride);
+                ULONG col = 0, w = 0, h = 0;
+                qcap2_av_frame_get_video_property(f, &col, &w, &h);
+                if (w == 0 && h == 0 && buf) {
+                    // Audio frame: manually free the audio buffer
+                    free(buf);
+                } else {
+                    // Video frame: use free_buffer
+                    qcap2_av_frame_free_buffer(f);
+                }
+                delete f;
+            }
+        });
+
+        if (!rc) {
+            qcap2_av_frame_free_buffer(frame);
+            delete frame;
+            p->cleanup();
+            return QCAP_RS_ERROR_OUT_OF_MEMORY;
+        }
+
+        p->pool.push_back(rc);
+    }
+
+    p->running = true;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_frame_pool_stop(qcap2_frame_pool_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    p->running = false;
+    p->cleanup();
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_frame_pool_get_buffer(qcap2_frame_pool_t* pThis, qcap2_rcbuffer_t** ppBuffer) {
+    if (!pThis || !ppBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_frame_pool_priv_t* p = (qcap2_frame_pool_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    if (!p->running) return QCAP_RS_ERROR_GENERAL;
+
+    *ppBuffer = nullptr;
+
+    // Find an idle buffer (use_count == 1 means only the pool holds a reference)
+    for (auto buf : p->pool) {
+        if (qcap2_rcbuffer_use_count(buf) == 1) {
+            qcap2_rcbuffer_add_ref(buf);
+            *ppBuffer = buf;
+            return QCAP_RS_SUCCESSFUL;
+        }
+    }
+
+    // No idle buffer available
+    return QCAP_RS_ERROR_GENERAL;
+}
+
+// ==============================================================================
 // qcap2_video_scaler_t Implementation
 // ==============================================================================
 

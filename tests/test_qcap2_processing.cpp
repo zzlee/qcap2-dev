@@ -300,12 +300,238 @@ void test_video_scaler_filter_graph() {
     printf("Video scaler avfilter filter graph tests passed successfully!\n");
 }
 
+void test_frame_pool_video_basic() {
+    qcap2_frame_pool_t* pool = qcap2_frame_pool_new();
+    assert(pool != NULL);
+
+    // Configure: 3 BGR24 640x480 frames
+    qcap2_frame_pool_set_frame_count(pool, 3);
+    qcap2_frame_pool_set_video_property(pool, QCAP_COLORSPACE_TYPE_BGR24, 640, 480);
+    qcap2_frame_pool_set_video_frame_align(pool, 16, 1);
+
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    // Get a buffer
+    qcap2_rcbuffer_t* buf1 = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf1) == QCAP_RS_SUCCESSFUL);
+    assert(buf1 != NULL);
+
+    // Inspect the frame inside
+    PVOID data = qcap2_rcbuffer_lock_data(buf1);
+    assert(data != NULL);
+    qcap2_av_frame_t* frame = (qcap2_av_frame_t*)data;
+
+    ULONG col = 0, w = 0, h = 0;
+    qcap2_av_frame_get_video_property(frame, &col, &w, &h);
+    assert(col == QCAP_COLORSPACE_TYPE_BGR24);
+    assert(w == 640);
+    assert(h == 480);
+
+    // Verify buffer is allocated
+    uint8_t* ptrs[4] = { nullptr };
+    int strides[4] = { 0 };
+    qcap2_av_frame_get_buffer1(frame, ptrs, strides);
+    assert(ptrs[0] != NULL);
+    assert(strides[0] >= 640 * 3);
+
+    qcap2_rcbuffer_unlock_data(buf1);
+    qcap2_rcbuffer_release(buf1);
+
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_frame_pool_delete(pool);
+
+    printf("Frame pool video basic tests passed successfully!\n");
+}
+
+void test_frame_pool_video_recycling() {
+    qcap2_frame_pool_t* pool = qcap2_frame_pool_new();
+    assert(pool != NULL);
+
+    qcap2_frame_pool_set_frame_count(pool, 2);
+    qcap2_frame_pool_set_video_property(pool, QCAP_COLORSPACE_TYPE_RGB24, 320, 240);
+
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    // Get first buffer
+    qcap2_rcbuffer_t* buf1 = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf1) == QCAP_RS_SUCCESSFUL);
+
+    // Get second buffer
+    qcap2_rcbuffer_t* buf2 = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf2) == QCAP_RS_SUCCESSFUL);
+
+    // They must be different
+    assert(buf1 != buf2);
+
+    // Now both are in use — no idle buffer available
+    qcap2_rcbuffer_t* buf3 = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf3) == QCAP_RS_ERROR_GENERAL);
+    assert(buf3 == NULL);
+
+    // Release buf1, then we should be able to get it back
+    qcap2_rcbuffer_release(buf1);
+
+    qcap2_rcbuffer_t* buf4 = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf4) == QCAP_RS_SUCCESSFUL);
+    assert(buf4 == buf1); // recycled!
+
+    qcap2_rcbuffer_release(buf4);
+    qcap2_rcbuffer_release(buf2);
+
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_frame_pool_delete(pool);
+
+    printf("Frame pool video recycling tests passed successfully!\n");
+}
+
+void test_frame_pool_audio() {
+    qcap2_frame_pool_t* pool = qcap2_frame_pool_new();
+    assert(pool != NULL);
+
+    // Configure: 2 audio frames, stereo S16, 48kHz, 1024 samples
+    qcap2_frame_pool_set_frame_count(pool, 2);
+    qcap2_frame_pool_set_audio_property(pool, 2, 1 /* AV_SAMPLE_FMT_S16 */, 48000, 1024);
+
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* buf = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_SUCCESSFUL);
+    assert(buf != NULL);
+
+    PVOID data = qcap2_rcbuffer_lock_data(buf);
+    assert(data != NULL);
+    qcap2_av_frame_t* frame = (qcap2_av_frame_t*)data;
+
+    ULONG ch = 0, fmt = 0, freq = 0, fsize = 0;
+    qcap2_av_frame_get_audio_property(frame, &ch, &fmt, &freq, &fsize);
+    assert(ch == 2);
+    assert(fmt == 1);
+    assert(freq == 48000);
+    assert(fsize == 1024);
+
+    // Verify buffer is allocated: 2 channels * 2 bytes_per_sample * 1024 = 4096 bytes
+    uint8_t* audio_buf = NULL;
+    int audio_stride = 0;
+    qcap2_av_frame_get_buffer(frame, &audio_buf, &audio_stride);
+    assert(audio_buf != NULL);
+    assert(audio_stride == 4096);
+
+    qcap2_rcbuffer_unlock_data(buf);
+    qcap2_rcbuffer_release(buf);
+
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_frame_pool_delete(pool);
+
+    printf("Frame pool audio tests passed successfully!\n");
+}
+
+void test_frame_pool_video_with_border() {
+    qcap2_frame_pool_t* pool = qcap2_frame_pool_new();
+    assert(pool != NULL);
+
+    qcap2_frame_pool_set_frame_count(pool, 1);
+    qcap2_frame_pool_set_video_property(pool, QCAP_COLORSPACE_TYPE_BGR24, 640, 480);
+    // Set 8-pixel border on each side
+    qcap2_frame_pool_set_video_property1(pool, 8, 8, FALSE);
+
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* buf = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_SUCCESSFUL);
+
+    PVOID data = qcap2_rcbuffer_lock_data(buf);
+    qcap2_av_frame_t* frame = (qcap2_av_frame_t*)data;
+
+    ULONG col = 0, w = 0, h = 0;
+    qcap2_av_frame_get_video_property(frame, &col, &w, &h);
+    // Allocated with border: 640 + 8*2 = 656, 480 + 8*2 = 496
+    assert(w == 656);
+    assert(h == 496);
+
+    qcap2_rcbuffer_unlock_data(buf);
+    qcap2_rcbuffer_release(buf);
+
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_frame_pool_delete(pool);
+
+    printf("Frame pool video with border tests passed successfully!\n");
+}
+
+void test_frame_pool_lifecycle() {
+    qcap2_frame_pool_t* pool = qcap2_frame_pool_new();
+    assert(pool != NULL);
+
+    // get_buffer before start should fail
+    qcap2_rcbuffer_t* buf = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_ERROR_GENERAL);
+
+    qcap2_frame_pool_set_frame_count(pool, 2);
+    qcap2_frame_pool_set_video_property(pool, QCAP_COLORSPACE_TYPE_I420, 1920, 1080);
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    // Double start should be idempotent
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    // Get buffer should work now
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_SUCCESSFUL);
+    assert(buf != NULL);
+
+    // Verify I420 layout (3-plane)
+    PVOID data = qcap2_rcbuffer_lock_data(buf);
+    qcap2_av_frame_t* frame = (qcap2_av_frame_t*)data;
+    uint8_t* ptrs[4] = { nullptr };
+    int strides[4] = { 0 };
+    qcap2_av_frame_get_buffer1(frame, ptrs, strides);
+    assert(ptrs[0] != NULL);
+    assert(ptrs[1] != NULL);
+    assert(ptrs[2] != NULL);
+    assert(strides[0] >= 1920);
+    assert(strides[1] >= 960);
+
+    qcap2_rcbuffer_unlock_data(buf);
+    qcap2_rcbuffer_release(buf);
+
+    // Stop and restart
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+
+    // get_buffer after stop should fail
+    buf = NULL;
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_ERROR_GENERAL);
+
+    // Restart with different config
+    qcap2_frame_pool_set_frame_count(pool, 1);
+    qcap2_frame_pool_set_video_property(pool, QCAP_COLORSPACE_TYPE_NV12, 1280, 720);
+    assert(qcap2_frame_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    assert(qcap2_frame_pool_get_buffer(pool, &buf) == QCAP_RS_SUCCESSFUL);
+    data = qcap2_rcbuffer_lock_data(buf);
+    frame = (qcap2_av_frame_t*)data;
+    ULONG col = 0, w = 0, h = 0;
+    qcap2_av_frame_get_video_property(frame, &col, &w, &h);
+    assert(col == QCAP_COLORSPACE_TYPE_NV12);
+    assert(w == 1280);
+    assert(h == 720);
+
+    qcap2_rcbuffer_unlock_data(buf);
+    qcap2_rcbuffer_release(buf);
+
+    assert(qcap2_frame_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_frame_pool_delete(pool);
+
+    printf("Frame pool lifecycle tests passed successfully!\n");
+}
+
 int main() {
     test_audio_resampler();
     test_video_scaler_direct();
     test_video_scaler_crop();
     test_video_scaler_buffer_pool();
     test_video_scaler_filter_graph();
+    test_frame_pool_video_basic();
+    test_frame_pool_video_recycling();
+    test_frame_pool_audio();
+    test_frame_pool_video_with_border();
+    test_frame_pool_lifecycle();
 
     printf("All processing unit tests passed successfully!\n");
     return 0;

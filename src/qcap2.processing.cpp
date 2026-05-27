@@ -25,6 +25,7 @@ extern "C" {
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavcodec/avcodec.h>
 
 #ifdef __cplusplus
 }
@@ -289,6 +290,746 @@ QRESULT qcap2_audio_resampler_push(qcap2_audio_resampler_t* pThis, qcap2_rcbuffe
 QRESULT qcap2_audio_resampler_pop(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
     if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_audio_resampler_priv_t* p = (qcap2_audio_resampler_priv_t*)pThis;
+
+    std::unique_lock<std::mutex> lock(*(p->mtx));
+    p->cv->wait(lock, [p] { return !p->running || !p->output_queue.empty(); });
+
+    if (!p->running && p->output_queue.empty()) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    *ppRCBuffer = p->output_queue.front();
+    p->output_queue.pop();
+    return QCAP_RS_SUCCESSFUL;
+}
+
+// ==============================================================================
+// qcap2_audio_encoder_t Implementation
+// ==============================================================================
+
+static enum AVCodecID qcap2_audio_format_to_ffmpeg_codec_id(ULONG nEncoderFormat) {
+    switch (nEncoderFormat) {
+        case QCAP_ENCODER_FORMAT_PCM: return AV_CODEC_ID_PCM_S16LE;
+        case QCAP_ENCODER_FORMAT_AAC:
+        // case QCAP_ENCODER_FORMAT_AAC_RAW: // Same value as QCAP_ENCODER_FORMAT_AAC
+        case QCAP_ENCODER_FORMAT_AAC_ADTS: return AV_CODEC_ID_AAC;
+        case QCAP_ENCODER_FORMAT_MP2: return AV_CODEC_ID_MP2;
+        case QCAP_ENCODER_FORMAT_MP3: return AV_CODEC_ID_MP3;
+        case QCAP_ENCODER_FORMAT_OPUS: return AV_CODEC_ID_OPUS;
+        case QCAP_ENCODER_FORMAT_AC3: return AV_CODEC_ID_AC3;
+        case QCAP_ENCODER_FORMAT_G711_ALAW: return AV_CODEC_ID_PCM_ALAW;
+        case QCAP_ENCODER_FORMAT_G711_ULAW: return AV_CODEC_ID_PCM_MULAW;
+        case QCAP_ENCODER_FORMAT_G722: return AV_CODEC_ID_ADPCM_G722;
+        case QCAP_ENCODER_FORMAT_G726: return AV_CODEC_ID_ADPCM_G726;
+        default: return AV_CODEC_ID_NONE;
+    }
+}
+
+typedef struct qcap2_audio_encoder_priv_t {
+    std::mutex* mtx;
+    std::condition_variable* cv;
+    std::queue<qcap2_rcbuffer_t*> output_queue;
+
+    qcap2_audio_encoder_property_t* property;
+    uint8_t* extra_data;
+    int extra_data_size;
+
+    int max_frames;
+    int packet_count;
+    bool multithread;
+    qcap2_event_t* event;
+
+    AVCodecContext* avctx;
+    bool running;
+
+    qcap2_audio_encoder_priv_t() {
+        mtx = new std::mutex();
+        cv = new std::condition_variable();
+        property = qcap2_audio_encoder_property_new();
+        extra_data = nullptr;
+        extra_data_size = 0;
+        max_frames = 0;
+        packet_count = 0;
+        multithread = false;
+        event = nullptr;
+        avctx = nullptr;
+        running = false;
+    }
+
+    ~qcap2_audio_encoder_priv_t() {
+        if (property) {
+            qcap2_audio_encoder_property_delete(property);
+        }
+        if (extra_data) {
+            delete[] extra_data;
+        }
+        if (avctx) {
+            avcodec_free_context(&avctx);
+        }
+        while (!output_queue.empty()) {
+            qcap2_rcbuffer_release(output_queue.front());
+            output_queue.pop();
+        }
+        delete cv;
+        delete mtx;
+    }
+} qcap2_audio_encoder_priv_t;
+
+qcap2_audio_encoder_t* qcap2_audio_encoder_new() {
+    qcap2_audio_encoder_priv_t* p = new qcap2_audio_encoder_priv_t;
+    return (qcap2_audio_encoder_t*)p;
+}
+
+void qcap2_audio_encoder_delete(qcap2_audio_encoder_t* pThis) {
+    if (pThis) {
+        qcap2_audio_encoder_stop(pThis);
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        delete p;
+    }
+}
+
+void qcap2_audio_encoder_set_audio_property(qcap2_audio_encoder_t* pThis, qcap2_audio_encoder_property_t* pAudioEncoderProperty) {
+    if (pThis && pAudioEncoderProperty) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+        qcap2_audio_encoder_property_get_property1(pAudioEncoderProperty, &type, &fmt, &ch, &bits, &freq, &rate);
+        qcap2_audio_encoder_property_set_property1(p->property, type, fmt, ch, bits, freq, rate);
+    }
+}
+
+void qcap2_audio_encoder_get_audio_property(qcap2_audio_encoder_t* pThis, qcap2_audio_encoder_property_t* pAudioEncoderProperty) {
+    if (pThis && pAudioEncoderProperty) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+        qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
+        qcap2_audio_encoder_property_set_property1(pAudioEncoderProperty, type, fmt, ch, bits, freq, rate);
+    }
+}
+
+void qcap2_audio_encoder_get_extra_data(qcap2_audio_encoder_t* pThis, uint8_t** ppExtraData, int* pExtraDataSize) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (ppExtraData) *ppExtraData = p->extra_data;
+        if (pExtraDataSize) *pExtraDataSize = p->extra_data_size;
+    }
+}
+
+void qcap2_audio_encoder_set_extra_data(qcap2_audio_encoder_t* pThis, uint8_t* pExtraData, int nExtraDataSize) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (p->extra_data) {
+            delete[] p->extra_data;
+            p->extra_data = nullptr;
+            p->extra_data_size = 0;
+        }
+        if (pExtraData && nExtraDataSize > 0) {
+            p->extra_data = new uint8_t[nExtraDataSize + AV_INPUT_BUFFER_PADDING_SIZE];
+            memcpy(p->extra_data, pExtraData, nExtraDataSize);
+            memset(p->extra_data + nExtraDataSize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            p->extra_data_size = nExtraDataSize;
+        }
+    }
+}
+
+void qcap2_audio_encoder_set_frame_count(qcap2_audio_encoder_t* pThis, int nFrameCount) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->max_frames = nFrameCount;
+    }
+}
+
+void qcap2_audio_encoder_set_packet_count(qcap2_audio_encoder_t* pThis, int nPacketCount) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->packet_count = nPacketCount;
+    }
+}
+
+void qcap2_audio_encoder_set_multithread(qcap2_audio_encoder_t* pThis, bool bMultiThread) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->multithread = bMultiThread;
+    }
+}
+
+void qcap2_audio_encoder_set_event(qcap2_audio_encoder_t* pThis, qcap2_event_t* pEvent) {
+    if (pThis) {
+        qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->event = pEvent;
+    }
+}
+
+QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    if (p->running) return QCAP_RS_SUCCESSFUL;
+
+    ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+    qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
+
+    enum AVCodecID codec_id = qcap2_audio_format_to_ffmpeg_codec_id(fmt);
+    if (codec_id == AV_CODEC_ID_NONE) {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    const AVCodec* codec = avcodec_find_encoder(codec_id);
+    if (!codec) {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    p->avctx = avcodec_alloc_context3(codec);
+    if (!p->avctx) {
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    p->avctx->bit_rate = rate;
+    p->avctx->sample_rate = freq;
+    av_channel_layout_default(&p->avctx->ch_layout, ch);
+
+    if (codec->sample_fmts) {
+        p->avctx->sample_fmt = codec->sample_fmts[0];
+    } else {
+        p->avctx->sample_fmt = AV_SAMPLE_FMT_S16;
+    }
+
+    if (p->extra_data && p->extra_data_size > 0) {
+        p->avctx->extradata = (uint8_t*)av_mallocz(p->extra_data_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (p->avctx->extradata) {
+            memcpy(p->avctx->extradata, p->extra_data, p->extra_data_size);
+            p->avctx->extradata_size = p->extra_data_size;
+        }
+    }
+
+    // Set AV_CODEC_FLAG_GLOBAL_HEADER if requested format is not ADTS and is AAC
+    if (fmt == QCAP_ENCODER_FORMAT_AAC_RAW || fmt == QCAP_ENCODER_FORMAT_AAC) {
+        p->avctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    if (avcodec_open2(p->avctx, codec, nullptr) < 0) {
+        avcodec_free_context(&p->avctx);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    // Capture extra data generated by encoder
+    if (p->avctx->extradata && p->avctx->extradata_size > 0 && (!p->extra_data || p->extra_data_size == 0)) {
+        p->extra_data_size = p->avctx->extradata_size;
+        p->extra_data = new uint8_t[p->extra_data_size + AV_INPUT_BUFFER_PADDING_SIZE];
+        memcpy(p->extra_data, p->avctx->extradata, p->extra_data_size);
+        memset(p->extra_data + p->extra_data_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    }
+
+    p->running = true;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_encoder_stop(qcap2_audio_encoder_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    p->running = false;
+    if (p->avctx) {
+        avcodec_free_context(&p->avctx);
+    }
+    while (!p->output_queue.empty()) {
+        qcap2_rcbuffer_release(p->output_queue.front());
+        p->output_queue.pop();
+    }
+    p->cv->notify_all();
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+
+    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
+    if (!pData) return QCAP_RS_ERROR_GENERAL;
+
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (!p->running || !p->avctx) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    AVFrame* av_frame = av_frame_alloc();
+    if (!av_frame) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    ULONG in_ch = 0, in_fmt = 0, in_rate = 0, in_size = 0;
+    qcap2_av_frame_get_audio_property(pFrame, &in_ch, &in_fmt, &in_rate, &in_size);
+
+    uint8_t* pInputBuffer = nullptr;
+    int nInputStride = 0;
+    qcap2_av_frame_get_buffer(pFrame, &pInputBuffer, &nInputStride);
+
+    int64_t nPTS = 0;
+    qcap2_av_frame_get_pts(pFrame, &nPTS);
+    double dSampleTime = 0;
+    qcap2_av_frame_get_sample_time(pFrame, &dSampleTime);
+
+    av_channel_layout_default(&av_frame->ch_layout, in_ch);
+    av_frame->format = p->avctx->sample_fmt; // Assume input format matches encoder requirement via resampler
+    av_frame->sample_rate = in_rate;
+    av_frame->nb_samples = in_size;
+    av_frame->pts = nPTS;
+
+    uint8_t* in_ptrs[4] = { nullptr };
+    int in_strides[4] = { 0 };
+    qcap2_av_frame_get_buffer1(pFrame, in_ptrs, in_strides);
+
+    if (in_ptrs[0]) {
+        for (int i = 0; i < 4; ++i) {
+            av_frame->data[i] = in_ptrs[i];
+            av_frame->linesize[i] = in_strides[i];
+        }
+    } else {
+        av_frame->data[0] = pInputBuffer;
+        av_frame->linesize[0] = nInputStride;
+    }
+
+    int ret = avcodec_send_frame(p->avctx, av_frame);
+    av_frame_free(&av_frame);
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
+
+    if (ret < 0) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(p->avctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else if (ret < 0) {
+            av_packet_free(&pkt);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        qcap2_rcbuffer_t* out_rc = nullptr;
+        qcap2_av_packet_t* new_packet = new qcap2_av_packet_t;
+        qcap2_av_packet_init(new_packet);
+        out_rc = qcap2_rcbuffer_new(new_packet, [](PVOID pData) {
+            qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)pData;
+            if (pkt) {
+                qcap2_av_packet_free_buffer(pkt);
+                delete pkt;
+            }
+        });
+
+        if (out_rc) {
+            PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
+            if (out_data) {
+                qcap2_av_packet_t* out_packet = (qcap2_av_packet_t*)out_data;
+                qcap2_av_packet_alloc_buffer(out_packet, pkt->size);
+
+                uint8_t* out_buf = nullptr;
+                int out_size = 0;
+                qcap2_av_packet_get_buffer(out_packet, &out_buf, &out_size);
+                if (out_buf && pkt->size <= out_size) {
+                    memcpy(out_buf, pkt->data, pkt->size);
+                }
+
+                qcap2_av_packet_set_pts(out_packet, pkt->pts);
+                qcap2_av_packet_set_dts(out_packet, pkt->dts);
+                qcap2_av_packet_set_property(out_packet, 0, (pkt->flags & AV_PKT_FLAG_KEY) ? TRUE : FALSE);
+                qcap2_av_packet_set_sample_time(out_packet, dSampleTime);
+
+                qcap2_rcbuffer_unlock_data(out_rc);
+                p->output_queue.push(out_rc);
+            } else {
+                qcap2_rcbuffer_release(out_rc);
+            }
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+
+    p->cv->notify_all();
+    if (p->event) {
+        qcap2_event_notify(p->event);
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+
+    std::unique_lock<std::mutex> lock(*(p->mtx));
+    p->cv->wait(lock, [p] { return !p->running || !p->output_queue.empty(); });
+
+    if (!p->running && p->output_queue.empty()) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    *ppRCBuffer = p->output_queue.front();
+    p->output_queue.pop();
+    return QCAP_RS_SUCCESSFUL;
+}
+
+// ==============================================================================
+// qcap2_audio_decoder_t Implementation
+// ==============================================================================
+
+typedef struct qcap2_audio_decoder_priv_t {
+    std::mutex* mtx;
+    std::condition_variable* cv;
+    std::queue<qcap2_rcbuffer_t*> output_queue;
+
+    qcap2_audio_encoder_property_t* property;
+    uint8_t* extra_data;
+    int extra_data_size;
+
+    int max_frames;
+    int packet_count;
+    bool multithread;
+    qcap2_event_t* event;
+
+    int payload_type;
+    AVCodecContext* avctx;
+    bool running;
+
+    qcap2_audio_decoder_priv_t() {
+        mtx = new std::mutex();
+        cv = new std::condition_variable();
+        property = qcap2_audio_encoder_property_new();
+        extra_data = nullptr;
+        extra_data_size = 0;
+        max_frames = 0;
+        packet_count = 0;
+        multithread = false;
+        event = nullptr;
+        payload_type = 0;
+        avctx = nullptr;
+        running = false;
+    }
+
+    ~qcap2_audio_decoder_priv_t() {
+        if (property) {
+            qcap2_audio_encoder_property_delete(property);
+        }
+        if (extra_data) {
+            delete[] extra_data;
+        }
+        if (avctx) {
+            avcodec_free_context(&avctx);
+        }
+        while (!output_queue.empty()) {
+            qcap2_rcbuffer_release(output_queue.front());
+            output_queue.pop();
+        }
+        delete cv;
+        delete mtx;
+    }
+} qcap2_audio_decoder_priv_t;
+
+qcap2_audio_decoder_t* qcap2_audio_decoder_new() {
+    qcap2_audio_decoder_priv_t* p = new qcap2_audio_decoder_priv_t;
+    return (qcap2_audio_decoder_t*)p;
+}
+
+void qcap2_audio_decoder_delete(qcap2_audio_decoder_t* pThis) {
+    if (pThis) {
+        qcap2_audio_decoder_stop(pThis);
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        delete p;
+    }
+}
+
+void qcap2_audio_decoder_set_audio_property(qcap2_audio_decoder_t* pThis, qcap2_audio_encoder_property_t* pAudioEncoderProperty) {
+    if (pThis && pAudioEncoderProperty) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+        qcap2_audio_encoder_property_get_property1(pAudioEncoderProperty, &type, &fmt, &ch, &bits, &freq, &rate);
+        qcap2_audio_encoder_property_set_property1(p->property, type, fmt, ch, bits, freq, rate);
+    }
+}
+
+void qcap2_audio_decoder_get_audio_property(qcap2_audio_decoder_t* pThis, qcap2_audio_encoder_property_t* pAudioEncoderProperty) {
+    if (pThis && pAudioEncoderProperty) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+        qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
+        qcap2_audio_encoder_property_set_property1(pAudioEncoderProperty, type, fmt, ch, bits, freq, rate);
+    }
+}
+
+void qcap2_audio_decoder_get_extra_data(qcap2_audio_decoder_t* pThis, uint8_t** ppExtraData, int* pExtraDataSize) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (ppExtraData) *ppExtraData = p->extra_data;
+        if (pExtraDataSize) *pExtraDataSize = p->extra_data_size;
+    }
+}
+
+void qcap2_audio_decoder_set_extra_data(qcap2_audio_decoder_t* pThis, uint8_t* pExtraData, int nExtraDataSize) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (p->extra_data) {
+            delete[] p->extra_data;
+            p->extra_data = nullptr;
+            p->extra_data_size = 0;
+        }
+        if (pExtraData && nExtraDataSize > 0) {
+            p->extra_data = new uint8_t[nExtraDataSize + AV_INPUT_BUFFER_PADDING_SIZE];
+            memcpy(p->extra_data, pExtraData, nExtraDataSize);
+            memset(p->extra_data + nExtraDataSize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            p->extra_data_size = nExtraDataSize;
+        }
+    }
+}
+
+void qcap2_audio_decoder_set_frame_count(qcap2_audio_decoder_t* pThis, int nFrameCount) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->max_frames = nFrameCount;
+    }
+}
+
+void qcap2_audio_decoder_set_packet_count(qcap2_audio_decoder_t* pThis, int nPacketCount) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->packet_count = nPacketCount;
+    }
+}
+
+void qcap2_audio_decoder_set_multithread(qcap2_audio_decoder_t* pThis, bool bMultiThread) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->multithread = bMultiThread;
+    }
+}
+
+void qcap2_audio_decoder_set_event(qcap2_audio_decoder_t* pThis, qcap2_event_t* pEvent) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->event = pEvent;
+    }
+}
+
+void qcap2_audio_decoder_set_buffers(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** pBuffers) {
+    // Currently unimplemented for audio buffers pooling but available in API
+    (void)pThis;
+    (void)pBuffers;
+}
+
+void qcap2_audio_decoder_set_payload_type(qcap2_audio_decoder_t* pThis, int nPayloadType) {
+    if (pThis) {
+        qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        p->payload_type = nPayloadType;
+    }
+}
+
+QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    if (p->running) return QCAP_RS_SUCCESSFUL;
+
+    ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
+    qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
+
+    enum AVCodecID codec_id = qcap2_audio_format_to_ffmpeg_codec_id(fmt);
+    if (codec_id == AV_CODEC_ID_NONE) {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    const AVCodec* codec = avcodec_find_decoder(codec_id);
+    if (!codec) {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    p->avctx = avcodec_alloc_context3(codec);
+    if (!p->avctx) {
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    if (p->extra_data && p->extra_data_size > 0) {
+        p->avctx->extradata = (uint8_t*)av_mallocz(p->extra_data_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (p->avctx->extradata) {
+            memcpy(p->avctx->extradata, p->extra_data, p->extra_data_size);
+            p->avctx->extradata_size = p->extra_data_size;
+        }
+    }
+
+    av_channel_layout_default(&p->avctx->ch_layout, ch);
+    p->avctx->sample_rate = freq;
+
+    if (avcodec_open2(p->avctx, codec, nullptr) < 0) {
+        avcodec_free_context(&p->avctx);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    p->running = true;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    p->running = false;
+    if (p->avctx) {
+        avcodec_free_context(&p->avctx);
+    }
+    while (!p->output_queue.empty()) {
+        qcap2_rcbuffer_release(p->output_queue.front());
+        p->output_queue.pop();
+    }
+    p->cv->notify_all();
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+
+    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
+    if (!pData) return QCAP_RS_ERROR_GENERAL;
+
+    qcap2_av_packet_t* pPacket = (qcap2_av_packet_t*)pData;
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (!p->running || !p->avctx) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    AVPacket* av_pkt = av_packet_alloc();
+    if (!av_pkt) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    uint8_t* pInputBuffer = nullptr;
+    int nInputSize = 0;
+    qcap2_av_packet_get_buffer(pPacket, &pInputBuffer, &nInputSize);
+
+    int64_t nPTS = 0, nDTS = 0;
+    qcap2_av_packet_get_pts(pPacket, &nPTS);
+    qcap2_av_packet_get_dts(pPacket, &nDTS);
+
+    double dSampleTime = 0;
+    qcap2_av_packet_get_sample_time(pPacket, &dSampleTime);
+
+    av_pkt->data = pInputBuffer;
+    av_pkt->size = nInputSize;
+    av_pkt->pts = nPTS;
+    av_pkt->dts = nDTS;
+
+    int stream_idx = 0;
+    BOOL is_key = FALSE;
+    qcap2_av_packet_get_property(pPacket, &stream_idx, &is_key);
+    if (is_key) {
+        av_pkt->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    int ret = avcodec_send_packet(p->avctx, av_pkt);
+    av_packet_free(&av_pkt);
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
+
+    if (ret < 0) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(p->avctx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else if (ret < 0) {
+            av_frame_free(&frame);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        qcap2_rcbuffer_t* out_rc = nullptr;
+        qcap2_av_frame_t* new_frame = new qcap2_av_frame_t;
+        qcap2_av_frame_init(new_frame);
+        out_rc = qcap2_rcbuffer_new(new_frame, [](PVOID pData) {
+            qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
+            if (f) {
+                uint8_t* buf = nullptr;
+                int stride = 0;
+                qcap2_av_frame_get_buffer(f, &buf, &stride);
+                if (buf) {
+                    free(buf);
+                }
+                delete f;
+            }
+        });
+
+        if (out_rc) {
+            PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
+            if (out_data) {
+                qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
+
+                int ch = frame->ch_layout.nb_channels;
+                int in_rate = frame->sample_rate;
+                int format = frame->format;
+
+                qcap2_av_frame_set_audio_property(out_frame, ch, format, in_rate, frame->nb_samples);
+
+                int size = av_samples_get_buffer_size(nullptr, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
+
+                uint8_t* out_buf = (uint8_t*)malloc(size);
+                if (out_buf) {
+                    uint8_t* out_ptrs[AV_NUM_DATA_POINTERS] = { nullptr };
+                    av_samples_fill_arrays(out_ptrs, nullptr, out_buf, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
+                    av_samples_copy(out_ptrs, frame->data, 0, 0, frame->nb_samples, ch, (enum AVSampleFormat)format);
+                    qcap2_av_frame_set_buffer(out_frame, out_buf, size);
+                }
+
+                qcap2_av_frame_set_pts(out_frame, frame->pts);
+                qcap2_av_frame_set_sample_time(out_frame, dSampleTime);
+
+                qcap2_rcbuffer_unlock_data(out_rc);
+                p->output_queue.push(out_rc);
+            } else {
+                qcap2_rcbuffer_release(out_rc);
+            }
+        }
+        av_frame_unref(frame);
+    }
+    av_frame_free(&frame);
+
+    p->cv->notify_all();
+    if (p->event) {
+        qcap2_event_notify(p->event);
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_decoder_pop(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
 
     std::unique_lock<std::mutex> lock(*(p->mtx));
     p->cv->wait(lock, [p] { return !p->running || !p->output_queue.empty(); });

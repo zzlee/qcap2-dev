@@ -18,3 +18,4 @@ This directory contains implementation notes and usage constraints for QCAP2 API
 - [VIDEO-SCALER.md](./VIDEO-SCALER.md) — `qcap2_video_scaler_t` dual-backend conversion (swscale/avfilter), cropping math, and zero-allocation buffer pool recycling.
 - [FRAME-POOL.md](./FRAME-POOL.md) — `qcap2_frame_pool_t` pre-allocated frame buffer pool with reference-counted recycling for video and audio frames.
 - [PACKET-POOL.md](./PACKET-POOL.md) — `qcap2_packet_pool_t` pre-allocated packet buffer pool with dynamic resizing and reference-counted recycling.
+- [AUDIO-ENCODER-DECODER.md](./AUDIO-ENCODER-DECODER.md) — `qcap2_audio_encoder_t` and `qcap2_audio_decoder_t` FFmpeg-backed implementations, context mappings, and thread safety rules.

@@ -10,8 +10,14 @@ add_compile_options(-Wall -Wextra -g)
 # Includes
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+
 # Thread dependency
 find_package(Threads REQUIRED)
+
+# PkgConfig for Freetype and Harfbuzz
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FREETYPE REQUIRED freetype2)
+pkg_check_modules(HARFBUZZ REQUIRED harfbuzz)
 
 # Find FFmpeg development libraries
 find_library(AVFORMAT_LIB NAMES avformat)
@@ -86,6 +92,29 @@ else()
     message(WARNING "FFmpeg swresample/swscale/avfilter/avcodec/avutil NOT found. Skipping test_qcap2_processing.")
 endif()
 
+
+# 6. test_qcap2_graphics
+if(FREETYPE_FOUND AND HARFBUZZ_FOUND)
+    message(STATUS "FreeType and HarfBuzz found. Building test_qcap2_graphics.")
+    add_executable(test_qcap2_graphics
+        tests/test_qcap2_graphics.cpp
+        src/qcap2.graphics.cpp
+        src/qcap2.buffer.cpp
+        src/qcap2.utils.cpp
+    )
+    target_include_directories(test_qcap2_graphics PRIVATE
+        ${FREETYPE_INCLUDE_DIRS}
+        ${HARFBUZZ_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_qcap2_graphics PRIVATE
+        Threads::Threads
+        ${FREETYPE_LIBRARIES}
+        ${HARFBUZZ_LIBRARIES}
+    )
+else()
+    message(WARNING "FreeType and HarfBuzz NOT found. Skipping test_qcap2_graphics.")
+endif()
+
 # Register CTest
 enable_testing()
 add_test(NAME test_qcap2_buffer COMMAND test_qcap2_buffer)
@@ -96,4 +125,7 @@ if(TARGET test_qcap2_demuxer)
 endif()
 if(TARGET test_qcap2_processing)
     add_test(NAME test_qcap2_processing COMMAND test_qcap2_processing)
+endif()
+if(TARGET test_qcap2_graphics)
+    add_test(NAME test_qcap2_graphics COMMAND test_qcap2_graphics)
 endif()

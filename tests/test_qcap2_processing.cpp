@@ -1042,6 +1042,78 @@ void test_video_decoder_h264_integration() {
 
     printf("Video decoder H.264 integration tests passed successfully!\n");
 }
+void test_packet_pool_basic() {
+    qcap2_packet_pool_t* pool = qcap2_packet_pool_new();
+    assert(pool != NULL);
+
+    qcap2_packet_pool_set_packet_count(pool, 3);
+    assert(qcap2_packet_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* buf1 = NULL;
+    assert(qcap2_packet_pool_get_buffer(pool, 1024, &buf1) == QCAP_RS_SUCCESSFUL);
+    assert(buf1 != NULL);
+
+    PVOID data = qcap2_rcbuffer_lock_data(buf1);
+    assert(data != NULL);
+    qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)data;
+
+    uint8_t* pBuffer = NULL;
+    int nSize = 0;
+    qcap2_av_packet_get_buffer(pkt, &pBuffer, &nSize);
+    assert(pBuffer != NULL);
+    assert(nSize >= 1024);
+
+    qcap2_rcbuffer_unlock_data(buf1);
+    qcap2_rcbuffer_release(buf1);
+
+    assert(qcap2_packet_pool_stop(pool) == QCAP_RS_SUCCESSFUL);
+    qcap2_packet_pool_delete(pool);
+
+    printf("Packet pool basic tests passed successfully!\n");
+}
+
+void test_packet_pool_recycling_and_resizing() {
+    qcap2_packet_pool_t* pool = qcap2_packet_pool_new();
+    assert(pool != NULL);
+
+    qcap2_packet_pool_set_packet_count(pool, 2);
+    assert(qcap2_packet_pool_start(pool) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* buf1 = NULL;
+    assert(qcap2_packet_pool_get_buffer(pool, 100, &buf1) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* buf2 = NULL;
+    assert(qcap2_packet_pool_get_buffer(pool, 200, &buf2) == QCAP_RS_SUCCESSFUL);
+
+    // No more buffers
+    qcap2_rcbuffer_t* buf3 = NULL;
+    assert(qcap2_packet_pool_get_buffer(pool, 300, &buf3) == QCAP_RS_ERROR_GENERAL);
+
+    // Release and recycle
+    qcap2_rcbuffer_release(buf1);
+
+    qcap2_rcbuffer_t* buf4 = NULL;
+    // Request larger buffer on the recycled one
+    assert(qcap2_packet_pool_get_buffer(pool, 500, &buf4) == QCAP_RS_SUCCESSFUL);
+    assert(buf4 == buf1); // should be recycled
+
+    PVOID data = qcap2_rcbuffer_lock_data(buf4);
+    qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)data;
+    uint8_t* pBuffer = NULL;
+    int nSize = 0;
+    qcap2_av_packet_get_buffer(pkt, &pBuffer, &nSize);
+    assert(pBuffer != NULL);
+    assert(nSize >= 500); // verify resized
+
+    qcap2_rcbuffer_unlock_data(buf4);
+
+    qcap2_rcbuffer_release(buf4);
+    qcap2_rcbuffer_release(buf2);
+
+    qcap2_packet_pool_delete(pool);
+
+    printf("Packet pool recycling and resizing tests passed successfully!\n");
+}
 
 int main() {
     test_audio_resampler();
@@ -1061,6 +1133,8 @@ int main() {
     test_video_encoder_lifecycle();
     test_video_decoder_lifecycle();
     test_video_decoder_h264_integration();
+    test_packet_pool_basic();
+    test_packet_pool_recycling_and_resizing();
 
     printf("All processing unit tests passed successfully!\n");
     return 0;

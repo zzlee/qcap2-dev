@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavutil-dev \
     libswscale-dev \
     libavfilter-dev \
+    libfreetype-dev \
+    libharfbuzz-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

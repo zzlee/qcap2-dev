@@ -65,8 +65,8 @@ else()
 endif()
 
 # 5. test_qcap2_processing (optional based on FFmpeg components presence)
-if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB)
-    message(STATUS "FFmpeg swresample, swscale, and avfilter found. Building test_qcap2_processing.")
+if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB AND AVCODEC_LIB)
+    message(STATUS "FFmpeg swresample, swscale, avfilter, and avcodec found. Building test_qcap2_processing.")
     add_executable(test_qcap2_processing
         tests/test_qcap2_processing.cpp
         src/qcap2.processing.cpp
@@ -79,10 +79,11 @@ if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB)
         ${SWRESAMPLE_LIB}
         ${SWSCALE_LIB}
         ${AVFILTER_LIB}
+        ${AVCODEC_LIB}
         ${AVUTIL_LIB}
     )
 else()
-    message(WARNING "FFmpeg swresample/swscale/avfilter/avutil NOT found. Skipping test_qcap2_processing.")
+    message(WARNING "FFmpeg swresample/swscale/avfilter/avcodec/avutil NOT found. Skipping test_qcap2_processing.")
 endif()
 
 # Register CTest

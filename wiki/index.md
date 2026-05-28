@@ -16,4 +16,7 @@ This directory contains implementation notes and usage constraints for QCAP2 API
 
 - [AUDIO-RESAMPLER.md](./AUDIO-RESAMPLER.md) — `qcap2_audio_resampler_t` thread-safe concurrent conversion, FFmpeg dynamic reinitialization, and no-leak lifecycle management.
 - [VIDEO-SCALER.md](./VIDEO-SCALER.md) — `qcap2_video_scaler_t` dual-backend conversion (swscale/avfilter), cropping math, and zero-allocation buffer pool recycling.
+- [VIDEO-ENCODER.md](./VIDEO-ENCODER.md) — `qcap2_video_encoder_t` C-compatible video encoding component using `libavcodec`, supporting software rate control, low-latency, and dynamic properties.
+- [VIDEO-DECODER.md](./VIDEO-DECODER.md) — `qcap2_video_decoder_t` C-compatible video decoding component using `libavcodec`, supporting low-latency decoding, output scaling/colorspace format conversion, and registered buffer recycling.
 - [FRAME-POOL.md](./FRAME-POOL.md) — `qcap2_frame_pool_t` pre-allocated frame buffer pool with reference-counted recycling for video and audio frames.
+

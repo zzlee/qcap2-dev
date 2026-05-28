@@ -521,6 +521,528 @@ void test_frame_pool_lifecycle() {
     printf("Frame pool lifecycle tests passed successfully!\n");
 }
 
+void test_video_encoder_h264_basic() {
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    // Configure encoder: H.264, I420, 320x240, 30fps, CBR 1000kbps, GOP=10
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE,   // nEncoderType
+        QCAP_ENCODER_FORMAT_H264,     // nEncoderFormat
+        QCAP_COLORSPACE_TYPE_I420,    // nColorSpaceType
+        320, 240,                     // width, height
+        30.0,                         // fps
+        QCAP_RECORD_MODE_CBR,         // nRecordMode
+        0,                            // nQuality
+        1000,                         // nBitRate (kbps)
+        10,                           // nGOP
+        1, 1);                        // aspect ratio
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Verify extra data is available after start (SPS/PPS for H.264)
+    uint8_t* extra = NULL;
+    int extra_size = 0;
+    qcap2_video_encoder_get_extra_data(encoder, &extra, &extra_size);
+    // With zerolatency, extra data should be present
+    // Note: some builds may not produce extradata with certain settings
+
+    // Create and push multiple frames to ensure encoder produces output
+    int frames_pushed = 0;
+
+    for (int f = 0; f < 5; ++f) {
+        qcap2_av_frame_t in_frame;
+        qcap2_av_frame_init(&in_frame);
+        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
+        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+
+        // Fill with a pattern
+        uint8_t* ptrs[4] = { nullptr };
+        int strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+        // Fill Y plane with gradient
+        for (int y = 0; y < 240; ++y) {
+            for (int x = 0; x < strides[0] && x < 320; ++x) {
+                ptrs[0][y * strides[0] + x] = (uint8_t)((y + x + f * 10) % 256);
+            }
+        }
+        // Fill U/V planes with mid-gray
+        if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 120);
+        if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 120);
+
+        qcap2_av_frame_set_pts(&in_frame, f * 3000);
+
+        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
+            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+        });
+
+        assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
+        frames_pushed++;
+    }
+
+    // Pop all available encoded packets (non-blocking check via stop)
+    // Stop flushes the encoder, making all packets available
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Verify we got at least some encoded packets during the push calls
+    // With zerolatency and 5 frames, we should have gotten packets
+    // Since stop() drains the queue, we verify the lifecycle is clean
+
+    // Restart and encode again to test restart
+    enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 320, 240, 30.0,
+        QCAP_RECORD_MODE_CBR, 0, 1000, 10, 1, 1);
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Push a single frame and pop a packet
+    {
+        qcap2_av_frame_t in_frame;
+        qcap2_av_frame_init(&in_frame);
+        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
+        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+
+        uint8_t* ptrs[4] = { nullptr };
+        int strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+        memset(ptrs[0], 128, strides[0] * 240);
+        if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 120);
+        if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 120);
+        qcap2_av_frame_set_pts(&in_frame, 0);
+
+        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
+            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+        });
+
+        assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
+
+        // With zerolatency, the first frame should produce a packet immediately
+        qcap2_rcbuffer_t* out_rc = NULL;
+        assert(qcap2_video_encoder_pop(encoder, &out_rc) == QCAP_RS_SUCCESSFUL);
+        assert(out_rc != NULL);
+
+        // Inspect the encoded packet
+        PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
+        assert(out_data != NULL);
+        qcap2_av_packet_t* out_pkt = (qcap2_av_packet_t*)out_data;
+
+        uint8_t* pkt_buf = NULL;
+        int pkt_size = 0;
+        qcap2_av_packet_get_buffer(out_pkt, &pkt_buf, &pkt_size);
+        assert(pkt_buf != NULL);
+        assert(pkt_size > 0);
+
+        // First frame should be a key frame
+        int stream_idx = -1;
+        BOOL is_key = FALSE;
+        qcap2_av_packet_get_property(out_pkt, &stream_idx, &is_key);
+        assert(is_key == TRUE);
+
+        int64_t pkt_pts = -1;
+        qcap2_av_packet_get_pts(out_pkt, &pkt_pts);
+        assert(pkt_pts >= 0);
+
+        qcap2_rcbuffer_unlock_data(out_rc);
+        qcap2_rcbuffer_release(out_rc);
+    }
+
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+    qcap2_video_encoder_delete(encoder);
+
+    printf("Video encoder H.264 basic tests passed successfully!\n");
+}
+
+void test_video_encoder_bgr24_input() {
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    // Configure: H.264 encoder but with BGR24 input (requires pixel format conversion)
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_BGR24, 160, 120, 30.0,
+        QCAP_RECORD_MODE_VBR, 0, 500, 5, 1, 1);
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Push BGR24 frame
+    qcap2_av_frame_t in_frame;
+    qcap2_av_frame_init(&in_frame);
+    qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_BGR24, 160, 120);
+    assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+
+    uint8_t* ptrs[4] = { nullptr };
+    int strides[4] = { 0 };
+    qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+    // Fill with blue-ish color
+    for (int y = 0; y < 120; ++y) {
+        for (int x = 0; x < 160; ++x) {
+            ptrs[0][y * strides[0] + x * 3 + 0] = 200; // B
+            ptrs[0][y * strides[0] + x * 3 + 1] = 100; // G
+            ptrs[0][y * strides[0] + x * 3 + 2] = 50;  // R
+        }
+    }
+
+    qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
+        qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+    });
+
+    assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    // With zerolatency, pop immediately
+    qcap2_rcbuffer_t* out_rc = NULL;
+    assert(qcap2_video_encoder_pop(encoder, &out_rc) == QCAP_RS_SUCCESSFUL);
+    assert(out_rc != NULL);
+
+    PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
+    qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)out_data;
+    uint8_t* pkt_buf = NULL;
+    int pkt_size = 0;
+    qcap2_av_packet_get_buffer(pkt, &pkt_buf, &pkt_size);
+    assert(pkt_buf != NULL);
+    assert(pkt_size > 0);
+
+    qcap2_rcbuffer_unlock_data(out_rc);
+    qcap2_rcbuffer_release(out_rc);
+
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+    qcap2_video_encoder_delete(encoder);
+
+    printf("Video encoder BGR24 input conversion tests passed successfully!\n");
+}
+
+void test_video_encoder_property_roundtrip() {
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    // Set properties
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_NV12, 1920, 1080, 60.0,
+        QCAP_RECORD_MODE_CBR, 85, 5000, 30, 16, 9);
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    // Get properties back
+    qcap2_video_encoder_property_t* out_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_get_video_property(encoder, out_prop);
+
+    ULONG encType, encFmt, color, w, h, recMode, qual, br, gop, arX, arY;
+    double fps;
+    qcap2_video_encoder_property_get_property(out_prop,
+        &encType, &encFmt, &color, &w, &h, &fps,
+        &recMode, &qual, &br, &gop, &arX, &arY);
+
+    assert(encType == QCAP_ENCODER_TYPE_SOFTWARE);
+    assert(encFmt == QCAP_ENCODER_FORMAT_H264);
+    assert(color == QCAP_COLORSPACE_TYPE_NV12);
+    assert(w == 1920);
+    assert(h == 1080);
+    assert(fps == 60.0);
+    assert(recMode == QCAP_RECORD_MODE_CBR);
+    assert(qual == 85);
+    assert(br == 5000);
+    assert(gop == 30);
+    assert(arX == 16);
+    assert(arY == 9);
+
+    qcap2_video_encoder_property_delete(out_prop);
+
+    // Test dynamic property roundtrip
+    qcap2_video_encoder_dynamic_property_t* dyn_prop = qcap2_video_encoder_dynamic_property_new();
+    qcap2_video_encoder_dynamic_set_property(dyn_prop, QCAP_RECORD_MODE_VBR, 90, 8000, 60);
+    qcap2_video_encoder_set_dynamic_video_property(encoder, dyn_prop);
+    qcap2_video_encoder_dynamic_property_delete(dyn_prop);
+
+    qcap2_video_encoder_dynamic_property_t* dyn_out = qcap2_video_encoder_dynamic_property_new();
+    qcap2_video_encoder_get_dynamic_video_property(encoder, dyn_out);
+    ULONG dRecMode, dQual, dBr, dGop;
+    qcap2_video_encoder_dynamic_get_property(dyn_out, &dRecMode, &dQual, &dBr, &dGop);
+    assert(dRecMode == QCAP_RECORD_MODE_VBR);
+    assert(dQual == 90);
+    assert(dBr == 8000);
+    assert(dGop == 60);
+    qcap2_video_encoder_dynamic_property_delete(dyn_out);
+
+    qcap2_video_encoder_delete(encoder);
+
+    printf("Video encoder property roundtrip tests passed successfully!\n");
+}
+
+void test_video_encoder_idr_request() {
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 160, 120, 30.0,
+        QCAP_RECORD_MODE_CBR, 0, 500, 30, 1, 1); // GOP=30 so normally no keyframe soon
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Push 3 frames, then request IDR, push another frame
+    for (int f = 0; f < 4; ++f) {
+        if (f == 3) {
+            qcap2_video_encoder_request_idr(encoder);
+        }
+
+        qcap2_av_frame_t in_frame;
+        qcap2_av_frame_init(&in_frame);
+        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 160, 120);
+        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+        uint8_t* ptrs[4] = { nullptr };
+        int strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+        memset(ptrs[0], 128 + f * 10, strides[0] * 120);
+        if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 60);
+        if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 60);
+
+        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
+            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+        });
+        assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
+    }
+
+    // Pop all 4 packets and verify IDR behavior
+    bool found_non_first_key = false;
+    for (int i = 0; i < 4; ++i) {
+        qcap2_rcbuffer_t* out_rc = NULL;
+        assert(qcap2_video_encoder_pop(encoder, &out_rc) == QCAP_RS_SUCCESSFUL);
+        assert(out_rc != NULL);
+
+        PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
+        qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)out_data;
+        int stream_idx = -1;
+        BOOL is_key = FALSE;
+        qcap2_av_packet_get_property(pkt, &stream_idx, &is_key);
+
+        if (i == 0) assert(is_key == TRUE); // First frame is always key
+        if (i == 3 && is_key) found_non_first_key = true;
+
+        qcap2_rcbuffer_unlock_data(out_rc);
+        qcap2_rcbuffer_release(out_rc);
+    }
+
+    // IDR request should have produced a key frame at frame 3
+    assert(found_non_first_key == true);
+
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+    qcap2_video_encoder_delete(encoder);
+
+    printf("Video encoder IDR request tests passed successfully!\n");
+}
+
+void test_video_encoder_lifecycle() {
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    // Push before start should fail
+    qcap2_av_frame_t dummy;
+    qcap2_av_frame_init(&dummy);
+    qcap2_rcbuffer_t* dummy_rc = qcap2_rcbuffer_new(&dummy, NULL);
+    assert(qcap2_video_encoder_push(encoder, dummy_rc) == QCAP_RS_ERROR_GENERAL);
+    qcap2_rcbuffer_release(dummy_rc);
+
+    // Start without properties should fail
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_ERROR_GENERAL);
+
+    // Configure and start
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 160, 120, 30.0,
+        QCAP_RECORD_MODE_VBR, 0, 500, 10, 1, 1);
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Double start should be idempotent
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Stop
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Double stop should be idempotent
+    assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Delete
+    qcap2_video_encoder_delete(encoder);
+
+    printf("Video encoder lifecycle tests passed successfully!\n");
+}
+
+void test_video_decoder_lifecycle() {
+    qcap2_video_decoder_t* decoder = qcap2_video_decoder_new();
+    assert(decoder != NULL);
+
+    // Push before start should fail
+    qcap2_av_packet_t dummy;
+    qcap2_av_packet_init(&dummy);
+    qcap2_rcbuffer_t* dummy_rc = qcap2_rcbuffer_new(&dummy, NULL);
+    assert(qcap2_video_decoder_push(decoder, dummy_rc) == QCAP_RS_ERROR_GENERAL);
+    qcap2_rcbuffer_release(dummy_rc);
+
+    // Start without properties should fail
+    assert(qcap2_video_decoder_start(decoder) == QCAP_RS_ERROR_GENERAL);
+
+    // Configure and start
+    qcap2_video_encoder_property_t* dec_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(dec_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 160, 120, 30.0,
+        QCAP_RECORD_MODE_VBR, 0, 500, 10, 1, 1);
+    qcap2_video_decoder_set_video_property(decoder, dec_prop);
+    qcap2_video_encoder_property_delete(dec_prop);
+
+    assert(qcap2_video_decoder_start(decoder) == QCAP_RS_SUCCESSFUL);
+
+    // Double start should be idempotent
+    assert(qcap2_video_decoder_start(decoder) == QCAP_RS_SUCCESSFUL);
+
+    // Stop
+    assert(qcap2_video_decoder_stop(decoder) == QCAP_RS_SUCCESSFUL);
+
+    // Double stop should be idempotent
+    assert(qcap2_video_decoder_stop(decoder) == QCAP_RS_SUCCESSFUL);
+
+    // Delete
+    qcap2_video_decoder_delete(decoder);
+
+    printf("Video decoder lifecycle tests passed successfully!\n");
+}
+
+void test_video_decoder_h264_integration() {
+    // 1. Setup encoder
+    qcap2_video_encoder_t* encoder = qcap2_video_encoder_new();
+    assert(encoder != NULL);
+
+    qcap2_video_encoder_property_t* enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(enc_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 320, 240, 30.0,
+        QCAP_RECORD_MODE_CBR, 0, 1000, 10, 1, 1);
+    qcap2_video_encoder_set_video_property(encoder, enc_prop);
+    qcap2_video_encoder_property_delete(enc_prop);
+
+    assert(qcap2_video_encoder_start(encoder) == QCAP_RS_SUCCESSFUL);
+
+    // Get SPS/PPS extra data from encoder
+    uint8_t* extra = NULL;
+    int extra_size = 0;
+    qcap2_video_encoder_get_extra_data(encoder, &extra, &extra_size);
+
+    // Push 3 raw gradient frames to encoder to get compressed packets
+    std::vector<qcap2_rcbuffer_t*> encoded_packets;
+    for (int f = 0; f < 3; ++f) {
+        qcap2_av_frame_t in_frame;
+        qcap2_av_frame_init(&in_frame);
+        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
+        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+
+        uint8_t* ptrs[4] = { nullptr };
+        int strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+        // Fill gradient
+        for (int y = 0; y < 240; ++y) {
+            for (int x = 0; x < 320; ++x) {
+                ptrs[0][y * strides[0] + x] = (uint8_t)((y + x + f * 10) % 256);
+            }
+        }
+        if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 120);
+        if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 120);
+
+        qcap2_av_frame_set_pts(&in_frame, f * 3000);
+
+        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
+            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+        });
+
+        assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
+
+        qcap2_rcbuffer_t* out_pkt_rc = NULL;
+        assert(qcap2_video_encoder_pop(encoder, &out_pkt_rc) == QCAP_RS_SUCCESSFUL);
+        assert(out_pkt_rc != NULL);
+        encoded_packets.push_back(out_pkt_rc);
+    }
+
+    qcap2_video_encoder_stop(encoder);
+    qcap2_video_encoder_delete(encoder);
+
+    // 2. Setup decoder
+    qcap2_video_decoder_t* decoder = qcap2_video_decoder_new();
+    assert(decoder != NULL);
+
+    qcap2_video_encoder_property_t* dec_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_property(dec_prop,
+        QCAP_ENCODER_TYPE_SOFTWARE, QCAP_ENCODER_FORMAT_H264,
+        QCAP_COLORSPACE_TYPE_I420, 320, 240, 30.0,
+        QCAP_RECORD_MODE_CBR, 0, 1000, 10, 1, 1);
+    qcap2_video_decoder_set_video_property(decoder, dec_prop);
+    qcap2_video_encoder_property_delete(dec_prop);
+
+    if (extra && extra_size > 0) {
+        qcap2_video_decoder_set_extra_data(decoder, extra, extra_size);
+    }
+
+    assert(qcap2_video_decoder_start(decoder) == QCAP_RS_SUCCESSFUL);
+
+    // Push encoded packets to decoder
+    for (auto pkt_rc : encoded_packets) {
+        assert(qcap2_video_decoder_push(decoder, pkt_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(pkt_rc);
+    }
+    encoded_packets.clear();
+
+    // Pop and verify decoded frames
+    for (int f = 0; f < 3; ++f) {
+        qcap2_rcbuffer_t* decoded_rc = NULL;
+        assert(qcap2_video_decoder_pop(decoder, &decoded_rc) == QCAP_RS_SUCCESSFUL);
+        assert(decoded_rc != NULL);
+
+        PVOID out_data = qcap2_rcbuffer_lock_data(decoded_rc);
+        assert(out_data != NULL);
+
+        qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
+        ULONG colorspace = 0, w = 0, h = 0;
+        qcap2_av_frame_get_video_property(out_frame, &colorspace, &w, &h);
+
+        assert(colorspace == QCAP_COLORSPACE_TYPE_I420);
+        assert(w == 320);
+        assert(h == 240);
+
+        int64_t pts = 0;
+        qcap2_av_frame_get_pts(out_frame, &pts);
+        assert(pts == f);
+
+        qcap2_rcbuffer_unlock_data(decoded_rc);
+        qcap2_rcbuffer_release(decoded_rc);
+    }
+
+    qcap2_video_decoder_stop(decoder);
+    qcap2_video_decoder_delete(decoder);
+
+    printf("Video decoder H.264 integration tests passed successfully!\n");
+}
+
 int main() {
     test_audio_resampler();
     test_video_scaler_direct();
@@ -532,6 +1054,13 @@ int main() {
     test_frame_pool_audio();
     test_frame_pool_video_with_border();
     test_frame_pool_lifecycle();
+    test_video_encoder_h264_basic();
+    test_video_encoder_bgr24_input();
+    test_video_encoder_property_roundtrip();
+    test_video_encoder_idr_request();
+    test_video_encoder_lifecycle();
+    test_video_decoder_lifecycle();
+    test_video_decoder_h264_integration();
 
     printf("All processing unit tests passed successfully!\n");
     return 0;

@@ -60,3 +60,6 @@ qcap_api.md
 # Test binaries
 test_qcap2_buffer
 test_qcap2_utils
+
+# Antigravity CLI workspace directory
+.antigravitycli/

@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <cmath>
+#include <stdlib.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -279,6 +280,8 @@ struct qcap2_v4l2_buffer_slot_t {
     int index;
     struct v4l2_buffer v4l2_buf;
     void* pMappedMemory;
+    void* pUserPtr;
+    int dma_fd;
     size_t nLength;
     qcap2_av_frame_t frame;
     qcap2_rcbuffer_t* rcbuf;
@@ -294,6 +297,33 @@ private:
     std::atomic<bool> thread_running;
     qcap2_v4l2_buffer_slot_t* slots;
     int slot_count;
+
+    void cleanup_slots(int up_to_index) {
+        if (slots) {
+            for (int j = 0; j < up_to_index; ++j) {
+                qcap2_v4l2_buffer_slot_t* slot = &slots[j];
+                if (slot->pMappedMemory && slot->pMappedMemory != MAP_FAILED) {
+                    munmap(slot->pMappedMemory, slot->nLength);
+                }
+                if (slot->pUserPtr) {
+                    free(slot->pUserPtr);
+                }
+                if (slot->dma_fd >= 0) {
+                    close(slot->dma_fd);
+                }
+                if (slot->rcbuf) {
+                    qcap2_rcbuffer_delete(slot->rcbuf);
+                }
+            }
+            delete[] slots;
+            slots = nullptr;
+        }
+        slot_count = 0;
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
 
     static void capture_thread_func(qcap2_v4l2_video_source_backend_t* self) {
         struct pollfd pfd;
@@ -312,7 +342,7 @@ private:
                 struct v4l2_buffer buf;
                 memset(&buf, 0, sizeof(buf));
                 buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                buf.memory = V4L2_MEMORY_MMAP;
+                buf.memory = self->p->v4l2_memory_val;
 
                 if (ioctl(self->fd, VIDIOC_DQBUF, &buf) < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -387,12 +417,15 @@ public:
         p->width = fmt.fmt.pix.width;
         p->height = fmt.fmt.pix.height;
         int stride = fmt.fmt.pix.bytesperline;
+        size_t buffer_size = fmt.fmt.pix.sizeimage;
+
+        enum v4l2_memory mem_type = static_cast<enum v4l2_memory>(p->v4l2_memory_val);
 
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
         req.count = p->frame_count > 0 ? p->frame_count : 4;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        req.memory = V4L2_MEMORY_MMAP;
+        req.memory = mem_type;
 
         if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
             close(fd);
@@ -413,73 +446,112 @@ public:
             slot->index = i;
             slot->pSource = this;
             slot->rcbuf = nullptr;
+            slot->pMappedMemory = nullptr;
+            slot->pUserPtr = nullptr;
+            slot->dma_fd = -1;
+            slot->nLength = buffer_size;
             qcap2_av_frame_init(&slot->frame);
 
             memset(&slot->v4l2_buf, 0, sizeof(slot->v4l2_buf));
             slot->v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            slot->v4l2_buf.memory = V4L2_MEMORY_MMAP;
+            slot->v4l2_buf.memory = mem_type;
             slot->v4l2_buf.index = i;
 
-            if (ioctl(fd, VIDIOC_QUERYBUF, &slot->v4l2_buf) < 0) {
-                for (int j = 0; j < i; ++j) {
-                    munmap(slots[j].pMappedMemory, slots[j].nLength);
-                    if (slots[j].rcbuf) qcap2_rcbuffer_delete(slots[j].rcbuf);
+            if (mem_type == V4L2_MEMORY_MMAP) {
+                if (ioctl(fd, VIDIOC_QUERYBUF, &slot->v4l2_buf) < 0) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
                 }
-                delete[] slots;
-                slots = nullptr;
-                slot_count = 0;
-                close(fd);
-                fd = -1;
-                return QCAP_RS_ERROR_GENERAL;
-            }
 
-            slot->nLength = slot->v4l2_buf.length;
-            slot->pMappedMemory = mmap(NULL, slot->nLength, PROT_READ | PROT_WRITE, MAP_SHARED, fd, slot->v4l2_buf.m.offset);
-            if (slot->pMappedMemory == MAP_FAILED) {
-                for (int j = 0; j < i; ++j) {
-                    munmap(slots[j].pMappedMemory, slots[j].nLength);
-                    if (slots[j].rcbuf) qcap2_rcbuffer_delete(slots[j].rcbuf);
+                slot->nLength = slot->v4l2_buf.length;
+                slot->pMappedMemory = mmap(NULL, slot->nLength, PROT_READ | PROT_WRITE, MAP_SHARED, fd, slot->v4l2_buf.m.offset);
+                if (slot->pMappedMemory == MAP_FAILED) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
                 }
-                delete[] slots;
-                slots = nullptr;
-                slot_count = 0;
-                close(fd);
-                fd = -1;
-                return QCAP_RS_ERROR_GENERAL;
-            }
 
-            qcap2_av_frame_set_video_property(&slot->frame, p->color_space, p->width, p->height);
-            qcap2_av_frame_set_buffer(&slot->frame, (uint8_t*)slot->pMappedMemory, stride);
+                qcap2_av_frame_set_video_property(&slot->frame, p->color_space, p->width, p->height);
+                qcap2_av_frame_set_buffer(&slot->frame, (uint8_t*)slot->pMappedMemory, stride);
+
+                if (p->v4l2_exp_buf) {
+                    struct v4l2_exportbuffer expbuf;
+                    memset(&expbuf, 0, sizeof(expbuf));
+                    expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                    expbuf.index = i;
+                    expbuf.flags = O_CLOEXEC | O_RDWR;
+                    if (ioctl(fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+                        cleanup_slots(i);
+                        return QCAP_RS_ERROR_GENERAL;
+                    }
+                    slot->dma_fd = expbuf.fd;
+                }
+            }
+            else if (mem_type == V4L2_MEMORY_USERPTR) {
+                void* ptr = nullptr;
+                if (posix_memalign(&ptr, 4096, buffer_size) != 0) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                slot->pUserPtr = ptr;
+                slot->v4l2_buf.m.userptr = (unsigned long)slot->pUserPtr;
+                slot->v4l2_buf.length = slot->nLength;
+
+                qcap2_av_frame_set_video_property(&slot->frame, p->color_space, p->width, p->height);
+                qcap2_av_frame_set_buffer(&slot->frame, (uint8_t*)slot->pUserPtr, stride);
+            }
+            else if (mem_type == V4L2_MEMORY_DMABUF) {
+                char temp_path[] = "/tmp/mock_dmabuf_XXXXXX";
+                slot->dma_fd = mkstemp(temp_path);
+                if (slot->dma_fd < 0) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                unlink(temp_path);
+
+                if (ftruncate(slot->dma_fd, buffer_size) < 0) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+
+                slot->pMappedMemory = mmap(NULL, slot->nLength, PROT_READ | PROT_WRITE, MAP_SHARED, slot->dma_fd, 0);
+                if (slot->pMappedMemory == MAP_FAILED) {
+                    cleanup_slots(i);
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+
+                slot->v4l2_buf.m.fd = slot->dma_fd;
+                slot->v4l2_buf.length = slot->nLength;
+
+                qcap2_av_frame_set_video_property(&slot->frame, p->color_space, p->width, p->height);
+                qcap2_av_frame_set_buffer(&slot->frame, (uint8_t*)slot->pMappedMemory, stride);
+            }
 
             slot->rcbuf = qcap2_rcbuffer_new(&slot->frame, qcap2_v4l2_buffer_on_free);
         }
 
         for (int i = 0; i < slot_count; ++i) {
-            if (ioctl(fd, VIDIOC_QBUF, &slots[i].v4l2_buf) < 0) {
-                for (int j = 0; j < slot_count; ++j) {
-                    munmap(slots[j].pMappedMemory, slots[j].nLength);
-                    if (slots[j].rcbuf) qcap2_rcbuffer_delete(slots[j].rcbuf);
-                }
-                delete[] slots;
-                slots = nullptr;
-                slot_count = 0;
-                close(fd);
-                fd = -1;
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = mem_type;
+            buf.index = i;
+            if (mem_type == V4L2_MEMORY_USERPTR) {
+                buf.m.userptr = (unsigned long)slots[i].pUserPtr;
+                buf.length = slots[i].nLength;
+            } else if (mem_type == V4L2_MEMORY_DMABUF) {
+                buf.m.fd = slots[i].dma_fd;
+                buf.length = slots[i].nLength;
+            }
+
+            if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                cleanup_slots(slot_count);
                 return QCAP_RS_ERROR_GENERAL;
             }
         }
 
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-            for (int j = 0; j < slot_count; ++j) {
-                munmap(slots[j].pMappedMemory, slots[j].nLength);
-                if (slots[j].rcbuf) qcap2_rcbuffer_delete(slots[j].rcbuf);
-            }
-            delete[] slots;
-            slots = nullptr;
-            slot_count = 0;
-            close(fd);
-            fd = -1;
+            cleanup_slots(slot_count);
             return QCAP_RS_ERROR_GENERAL;
         }
 
@@ -507,26 +579,7 @@ public:
             ioctl(fd, VIDIOC_STREAMOFF, &type);
         }
 
-        if (slots) {
-            for (int i = 0; i < slot_count; ++i) {
-                qcap2_v4l2_buffer_slot_t* slot = &slots[i];
-                if (slot->pMappedMemory && slot->pMappedMemory != MAP_FAILED) {
-                    munmap(slot->pMappedMemory, slot->nLength);
-                }
-                if (slot->rcbuf) {
-                    qcap2_rcbuffer_delete(slot->rcbuf);
-                }
-            }
-            delete[] slots;
-            slots = nullptr;
-            slot_count = 0;
-        }
-
-        if (fd >= 0) {
-            close(fd);
-            fd = -1;
-        }
-
+        cleanup_slots(slot_count);
         return QCAP_RS_SUCCESSFUL;
     }
 
@@ -545,8 +598,16 @@ public:
             struct v4l2_buffer buf;
             memset(&buf, 0, sizeof(buf));
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
+            buf.memory = p->v4l2_memory_val;
             buf.index = slot->index;
+
+            if (buf.memory == V4L2_MEMORY_USERPTR) {
+                buf.m.userptr = (unsigned long)slot->pUserPtr;
+                buf.length = slot->nLength;
+            } else if (buf.memory == V4L2_MEMORY_DMABUF) {
+                buf.m.fd = slot->dma_fd;
+                buf.length = slot->nLength;
+            }
 
             if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
                 return QCAP_RS_ERROR_GENERAL;

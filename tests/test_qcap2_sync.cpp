@@ -530,6 +530,19 @@ void test_qcap2_video_source_backends() {
     qcap2_rcbuffer_release(custom_rcbuf);
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
+    // 4. Test V4L2 memory modes (MMAP, USERPTR, DMABUF) fail-safe start & cleanup
+    qcap2_video_source_set_backend_type(vsrc, QCAP2_VIDEO_SOURCE_BACKEND_TYPE_V4L2);
+    qcap2_video_source_set_device_index(vsrc, 99); // nonexistent device index to trigger safe return
+
+    qcap2_video_source_set_memory(vsrc, V4L2_MEMORY_MMAP);
+    assert(qcap2_video_source_start(vsrc) == QCAP_RS_ERROR_GENERAL);
+
+    qcap2_video_source_set_memory(vsrc, V4L2_MEMORY_USERPTR);
+    assert(qcap2_video_source_start(vsrc) == QCAP_RS_ERROR_GENERAL);
+
+    qcap2_video_source_set_memory(vsrc, V4L2_MEMORY_DMABUF);
+    assert(qcap2_video_source_start(vsrc) == QCAP_RS_ERROR_GENERAL);
+
     qcap2_video_source_delete(vsrc);
 }
 

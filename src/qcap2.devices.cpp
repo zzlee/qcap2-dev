@@ -2,6 +2,10 @@
 #include "qcap2.buffer.h"
 #include "qcap2.formats.h"
 #include <new>
+#include <vector>
+#include <mutex>
+#include <chrono>
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,6 +14,11 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <errno.h>
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // Destructor definition for qcap2_video_source_priv_t
 qcap2_video_source_priv_t::~qcap2_video_source_priv_t() {
@@ -36,14 +45,232 @@ static void qcap2_v4l2_buffer_on_free(PVOID pData) {
     (void)pData;
 }
 
+struct qcap2_tpg_buffer_slot_t {
+    uint8_t* raw_buffer;
+    size_t buffer_size;
+    qcap2_av_frame_t frame;
+    qcap2_rcbuffer_t* rcbuf;
+    class qcap2_tpg_video_source_backend_t* pSource;
+};
+
+class qcap2_tpg_video_source_backend_t : public qcap2_video_source_backend_t {
+private:
+    qcap2_video_source_priv_t* p;
+    qcap2_tpg_buffer_slot_t* slots;
+    int slot_count;
+    std::thread* sim_thread;
+    std::atomic<bool> running;
+    std::mutex mtx;
+    std::vector<qcap2_rcbuffer_t*> idle_buffers;
+    uint64_t frame_index;
+
+    static void sim_thread_func(qcap2_tpg_video_source_backend_t* self) {
+        double fps = self->p->frame_rate > 0.0 ? self->p->frame_rate : 30.0;
+        int interval_ms = (int)(1000.0 / fps);
+        if (interval_ms <= 0) interval_ms = 33;
+
+        auto next_time = std::chrono::steady_clock::now();
+
+        while (self->running.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_until(next_time);
+            next_time += std::chrono::milliseconds(interval_ms);
+
+            qcap2_rcbuffer_t* rcbuf = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(self->mtx);
+                if (!self->idle_buffers.empty()) {
+                    rcbuf = self->idle_buffers.back();
+                    self->idle_buffers.pop_back();
+                }
+            }
+
+            if (rcbuf) {
+                // Generate a simulated frame (e.g. solid color with frame index)
+                PVOID pData = qcap2_rcbuffer_get_data(rcbuf);
+                if (pData) {
+                    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+                    uint8_t* pPixels = nullptr;
+                    int stride = 0;
+                    qcap2_av_frame_get_buffer(pFrame, &pPixels, &stride);
+
+                    if (pPixels && stride > 0) {
+                        uint8_t color_val = (uint8_t)((self->frame_index * 4) & 0xFF);
+                        memset(pPixels, color_val, self->p->height * stride);
+                    }
+
+                    // Set PTS and sample time
+                    uint64_t pts = self->frame_index * (1000000ULL / (uint64_t)fps);
+                    qcap2_av_frame_set_pts(pFrame, pts);
+                    qcap2_av_frame_set_sample_time(pFrame, (double)pts / 1000000.0);
+                }
+
+                self->frame_index++;
+
+                // Push to the user queue (increases ref count)
+                qcap2_rcbuffer_add_ref(rcbuf);
+                QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
+                if (qres != QCAP_RS_SUCCESSFUL) {
+                    qcap2_rcbuffer_release(rcbuf);
+                    std::lock_guard<std::mutex> lock(self->mtx);
+                    self->idle_buffers.push_back(rcbuf);
+                }
+            }
+        }
+    }
+
+public:
+    qcap2_tpg_video_source_backend_t(qcap2_video_source_priv_t* owner)
+        : p(owner), slots(nullptr), slot_count(0), sim_thread(nullptr), frame_index(0) {
+        running.store(false);
+    }
+
+    ~qcap2_tpg_video_source_backend_t() override {
+        stop();
+    }
+
+    QRESULT start() override {
+        if (running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        int count = p->frame_count > 0 ? p->frame_count : 4;
+        slot_count = count;
+        slots = new (std::nothrow) qcap2_tpg_buffer_slot_t[slot_count];
+        if (!slots) return QCAP_RS_ERROR_GENERAL;
+
+        ULONG width = p->width > 0 ? p->width : 640;
+        ULONG height = p->height > 0 ? p->height : 480;
+        ULONG color_space = p->color_space > 0 ? p->color_space : (ULONG)QCAP_COLORSPACE_TYPE_YUY2;
+
+        int bytes_per_pixel = 2;
+        if (color_space == QCAP_COLORSPACE_TYPE_BGR24 || color_space == QCAP_COLORSPACE_TYPE_RGB24) {
+            bytes_per_pixel = 3;
+        } else if (color_space == QCAP_COLORSPACE_TYPE_NV12) {
+            bytes_per_pixel = 2;
+        }
+
+        int stride = width * bytes_per_pixel;
+        size_t buffer_size = stride * height;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            idle_buffers.clear();
+        }
+
+        for (int i = 0; i < slot_count; ++i) {
+            qcap2_tpg_buffer_slot_t* slot = &slots[i];
+            slot->pSource = this;
+            slot->buffer_size = buffer_size;
+            slot->raw_buffer = new (std::nothrow) uint8_t[buffer_size];
+            if (!slot->raw_buffer) {
+                for (int j = 0; j < i; ++j) {
+                    delete[] slots[j].raw_buffer;
+                    qcap2_rcbuffer_delete(slots[j].rcbuf);
+                }
+                delete[] slots;
+                slots = nullptr;
+                slot_count = 0;
+                return QCAP_RS_ERROR_GENERAL;
+            }
+
+            memset(slot->raw_buffer, 128, buffer_size);
+
+            qcap2_av_frame_init(&slot->frame);
+            qcap2_av_frame_set_video_property(&slot->frame, color_space, width, height);
+            qcap2_av_frame_set_buffer(&slot->frame, slot->raw_buffer, stride);
+
+            slot->rcbuf = qcap2_rcbuffer_new(&slot->frame, [](PVOID){});
+            idle_buffers.push_back(slot->rcbuf);
+        }
+
+        running.store(true, std::memory_order_release);
+        sim_thread = new std::thread(sim_thread_func, this);
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        if (!running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        running.store(false, std::memory_order_release);
+        if (sim_thread) {
+            sim_thread->join();
+            delete sim_thread;
+            sim_thread = nullptr;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            idle_buffers.clear();
+        }
+
+        if (slots) {
+            for (int i = 0; i < slot_count; ++i) {
+                delete[] slots[i].raw_buffer;
+                qcap2_rcbuffer_delete(slots[i].rcbuf);
+            }
+            delete[] slots;
+            slots = nullptr;
+            slot_count = 0;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override {
+        if (!pRCBuffer) return QCAP_RS_ERROR_INVALID_PARAMETER;
+
+        PVOID pData = qcap2_rcbuffer_get_data(pRCBuffer);
+        if (!pData) return QCAP_RS_ERROR_GENERAL;
+
+        qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+        qcap2_tpg_buffer_slot_t* slot = qcap2_container_of(pFrame, qcap2_tpg_buffer_slot_t, frame);
+
+        // Verify if it belongs to our slot list
+        bool found = false;
+        if (slots) {
+            for (int i = 0; i < slot_count; ++i) {
+                if (&slots[i] == slot) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found || slot->pSource != this) {
+            return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (std::find(idle_buffers.begin(), idle_buffers.end(), pRCBuffer) == idle_buffers.end()) {
+                idle_buffers.push_back(pRCBuffer);
+            }
+        }
+
+        qcap2_rcbuffer_release(pRCBuffer);
+        return QCAP_RS_SUCCESSFUL;
+    }
+};
+
 class qcap2_user_video_source_backend_t : public qcap2_video_source_backend_t {
 private:
     qcap2_video_source_priv_t* p;
+
 public:
-    qcap2_user_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
+    qcap2_user_video_source_backend_t(qcap2_video_source_priv_t* owner)
+        : p(owner) {}
+
+    ~qcap2_user_video_source_backend_t() override = default;
+
+    QRESULT start() override {
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        return QCAP_RS_SUCCESSFUL;
+    }
+
     QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override {
+        if (!pRCBuffer) return QCAP_RS_ERROR_INVALID_PARAMETER;
         return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer);
     }
 };
@@ -163,7 +390,7 @@ public:
 
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
-        req.count = 4;
+        req.count = p->frame_count > 0 ? p->frame_count : 4;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
 
@@ -331,116 +558,6 @@ public:
     }
 };
 
-class qcap2_coe_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_coe_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_hsb_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_hsb_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_pylon_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_pylon_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_nvt_hdal_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_nvt_hdal_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_xlnx_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_xlnx_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_vitis_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_vitis_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_v4l2_sg_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_v4l2_sg_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_lblwr_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_lblwr_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_tpg_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_tpg_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_lt6911_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_lt6911_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
-class qcap2_imx585_video_source_backend_t : public qcap2_video_source_backend_t {
-private:
-    qcap2_video_source_priv_t* p;
-public:
-    qcap2_imx585_video_source_backend_t(qcap2_video_source_priv_t* owner) : p(owner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override { return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer); }
-};
-
 // qcap2_video_source_t implementation
 qcap2_video_source_t* qcap2_video_source_new() {
     return reinterpret_cast<qcap2_video_source_t*>(new (std::nothrow) qcap2_video_source_priv_t());
@@ -459,7 +576,9 @@ void qcap2_video_source_set_backend_type(qcap2_video_source_t* pThis, int nBacke
 }
 
 void qcap2_video_source_set_frame_count(qcap2_video_source_t* pThis, int nFrameCount) {
-    (void)pThis; (void)nFrameCount;
+    if (pThis) {
+        reinterpret_cast<qcap2_video_source_priv_t*>(pThis)->frame_count = nFrameCount;
+    }
 }
 
 void qcap2_video_source_set_event(qcap2_video_source_t* pThis, qcap2_event_t* pEvent) {
@@ -531,28 +650,8 @@ QRESULT qcap2_video_source_start(qcap2_video_source_t* pThis) {
 
     if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_V4L2) {
         priv->backend = new (std::nothrow) qcap2_v4l2_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_COE) {
-        priv->backend = new (std::nothrow) qcap2_coe_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_HSB) {
-        priv->backend = new (std::nothrow) qcap2_hsb_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_PYLON) {
-        priv->backend = new (std::nothrow) qcap2_pylon_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_NVT_HDAL) {
-        priv->backend = new (std::nothrow) qcap2_nvt_hdal_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_XLNX) {
-        priv->backend = new (std::nothrow) qcap2_xlnx_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_VITIS) {
-        priv->backend = new (std::nothrow) qcap2_vitis_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_V4L2_SG) {
-        priv->backend = new (std::nothrow) qcap2_v4l2_sg_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_LBLWR) {
-        priv->backend = new (std::nothrow) qcap2_lblwr_video_source_backend_t(priv);
     } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_TPG) {
         priv->backend = new (std::nothrow) qcap2_tpg_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_LT6911) {
-        priv->backend = new (std::nothrow) qcap2_lt6911_video_source_backend_t(priv);
-    } else if (priv->backend_type == QCAP2_VIDEO_SOURCE_BACKEND_TYPE_IMX585) {
-        priv->backend = new (std::nothrow) qcap2_imx585_video_source_backend_t(priv);
     } else {
         priv->backend = new (std::nothrow) qcap2_user_video_source_backend_t(priv);
     }
@@ -613,6 +712,11 @@ qcap2_audio_source_priv_t::~qcap2_audio_source_priv_t() {
     }
 }
 
+struct qcap2_audio_payload_t {
+    uint8_t* raw_buffer;
+    qcap2_av_frame_t frame;
+};
+
 class qcap2_user_audio_source_backend_t : public qcap2_audio_source_backend_t {
 private:
     qcap2_audio_source_priv_t* m_pOwner;
@@ -624,11 +728,229 @@ public:
 
 class qcap2_alsa_audio_source_backend_t : public qcap2_audio_source_backend_t {
 private:
-    qcap2_audio_source_priv_t* m_pOwner;
+    qcap2_audio_source_priv_t* p;
+    int fd;
+    std::thread* capture_thread;
+    std::atomic<bool> thread_running;
+
+    static void capture_thread_func(qcap2_alsa_audio_source_backend_t* self) {
+        ULONG channels = self->p->channels > 0 ? self->p->channels : 2;
+        ULONG sample_fmt = self->p->sample_fmt > 0 ? self->p->sample_fmt : 16;
+        ULONG sample_frequency = self->p->sample_frequency > 0 ? self->p->sample_frequency : 48000;
+        int period_time = self->p->period_time > 0 ? self->p->period_time : 20;
+
+        size_t nSamples = (sample_frequency * period_time) / 1000;
+        size_t buffer_size = nSamples * channels * (sample_fmt / 8);
+        if (buffer_size == 0) buffer_size = 4096;
+
+        struct pollfd pfd;
+        pfd.fd = self->fd;
+        pfd.events = POLLIN;
+
+        while (self->thread_running.load(std::memory_order_acquire)) {
+            int ret = poll(&pfd, 1, 50);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ret == 0) continue;
+
+            if (pfd.revents & POLLIN) {
+                qcap2_audio_payload_t* payload = new (std::nothrow) qcap2_audio_payload_t();
+                if (!payload) continue;
+                payload->raw_buffer = new (std::nothrow) uint8_t[buffer_size];
+                if (!payload->raw_buffer) {
+                    delete payload;
+                    continue;
+                }
+
+                ssize_t bytes_read = read(self->fd, payload->raw_buffer, buffer_size);
+                if (bytes_read <= 0) {
+                    delete[] payload->raw_buffer;
+                    delete payload;
+                    if (bytes_read < 0 && errno == EAGAIN) continue;
+                    break;
+                }
+
+                qcap2_av_frame_init(&payload->frame);
+                qcap2_av_frame_set_audio_property(&payload->frame, channels, sample_fmt, sample_frequency, bytes_read);
+                qcap2_av_frame_set_buffer(&payload->frame, payload->raw_buffer, bytes_read);
+
+                qcap2_rcbuffer_t* rcbuf = qcap2_rcbuffer_new(&payload->frame, [](PVOID pData) {
+                    qcap2_audio_payload_t* pl = qcap2_container_of((qcap2_av_frame_t*)pData, qcap2_audio_payload_t, frame);
+                    delete[] pl->raw_buffer;
+                    delete pl;
+                });
+
+                if (rcbuf) {
+                    QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
+                    if (qres != QCAP_RS_SUCCESSFUL) {
+                        qcap2_rcbuffer_release(rcbuf);
+                    }
+                }
+            }
+        }
+    }
+
 public:
-    qcap2_alsa_audio_source_backend_t(qcap2_audio_source_priv_t* pOwner) : m_pOwner(pOwner) {}
-    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
-    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
+    qcap2_alsa_audio_source_backend_t(qcap2_audio_source_priv_t* owner)
+        : p(owner), fd(-1), capture_thread(nullptr) {
+        thread_running.store(false);
+    }
+
+    ~qcap2_alsa_audio_source_backend_t() override {
+        stop();
+    }
+
+    QRESULT start() override {
+        if (thread_running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        char dev_path[64];
+        snprintf(dev_path, sizeof(dev_path), "/dev/snd/pcmC%dD%dc", p->card, p->device);
+
+        fd = open(dev_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        thread_running.store(true, std::memory_order_release);
+        capture_thread = new (std::nothrow) std::thread(capture_thread_func, this);
+        if (!capture_thread) {
+            close(fd);
+            fd = -1;
+            thread_running.store(false);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        if (!thread_running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        thread_running.store(false, std::memory_order_release);
+        if (capture_thread) {
+            capture_thread->join();
+            delete capture_thread;
+            capture_thread = nullptr;
+        }
+
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+};
+
+class qcap2_tpg_audio_source_backend_t : public qcap2_audio_source_backend_t {
+private:
+    qcap2_audio_source_priv_t* p;
+    std::thread* sim_thread;
+    std::atomic<bool> running;
+    uint64_t total_samples_generated;
+
+    static void sim_thread_func(qcap2_tpg_audio_source_backend_t* self) {
+        ULONG channels = self->p->channels > 0 ? self->p->channels : 2;
+        ULONG sample_fmt = self->p->sample_fmt > 0 ? self->p->sample_fmt : 16;
+        ULONG sample_frequency = self->p->sample_frequency > 0 ? self->p->sample_frequency : 48000;
+        int period_time = self->p->period_time > 0 ? self->p->period_time : 20;
+
+        size_t nSamples = (sample_frequency * period_time) / 1000;
+        size_t buffer_size = nSamples * channels * (sample_fmt / 8);
+        if (buffer_size == 0) buffer_size = 4096;
+
+        auto next_time = std::chrono::steady_clock::now();
+
+        while (self->running.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_until(next_time);
+            next_time += std::chrono::milliseconds(period_time);
+
+            qcap2_audio_payload_t* payload = new (std::nothrow) qcap2_audio_payload_t();
+            if (!payload) continue;
+
+            payload->raw_buffer = new (std::nothrow) uint8_t[buffer_size];
+            if (!payload->raw_buffer) {
+                delete payload;
+                continue;
+            }
+
+            // Generate 440Hz sine wave tone
+            if (sample_fmt == 16) {
+                int16_t* pSamples = (int16_t*)payload->raw_buffer;
+                for (size_t i = 0; i < nSamples; ++i) {
+                    double t = (double)(self->total_samples_generated + i) / (double)sample_frequency;
+                    int16_t val = (int16_t)(32767.0 * sin(2.0 * M_PI * 440.0 * t));
+                    for (ULONG c = 0; c < channels; ++c) {
+                        pSamples[i * channels + c] = val;
+                    }
+                }
+            } else {
+                memset(payload->raw_buffer, 0, buffer_size);
+            }
+
+            self->total_samples_generated += nSamples;
+
+            qcap2_av_frame_init(&payload->frame);
+            qcap2_av_frame_set_audio_property(&payload->frame, channels, sample_fmt, sample_frequency, buffer_size);
+            qcap2_av_frame_set_buffer(&payload->frame, payload->raw_buffer, buffer_size);
+
+            // Set PTS and sample time
+            uint64_t pts = (self->total_samples_generated - nSamples) * 1000000ULL / sample_frequency;
+            qcap2_av_frame_set_pts(&payload->frame, pts);
+            qcap2_av_frame_set_sample_time(&payload->frame, (double)pts / 1000000.0);
+
+            qcap2_rcbuffer_t* rcbuf = qcap2_rcbuffer_new(&payload->frame, [](PVOID pData) {
+                qcap2_audio_payload_t* pl = qcap2_container_of((qcap2_av_frame_t*)pData, qcap2_audio_payload_t, frame);
+                delete[] pl->raw_buffer;
+                delete pl;
+            });
+
+            if (rcbuf) {
+                QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
+                if (qres != QCAP_RS_SUCCESSFUL) {
+                    qcap2_rcbuffer_release(rcbuf);
+                }
+            }
+        }
+    }
+
+public:
+    qcap2_tpg_audio_source_backend_t(qcap2_audio_source_priv_t* owner)
+        : p(owner), sim_thread(nullptr), total_samples_generated(0) {
+        running.store(false);
+    }
+
+    ~qcap2_tpg_audio_source_backend_t() override {
+        stop();
+    }
+
+    QRESULT start() override {
+        if (running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        running.store(true, std::memory_order_release);
+        sim_thread = new (std::nothrow) std::thread(sim_thread_func, this);
+        if (!sim_thread) {
+            running.store(false);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        if (!running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        running.store(false, std::memory_order_release);
+        if (sim_thread) {
+            sim_thread->join();
+            delete sim_thread;
+            sim_thread = nullptr;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
 };
 
 // qcap2_audio_source_t implementation
@@ -718,8 +1040,10 @@ QRESULT qcap2_audio_source_start(qcap2_audio_source_t* pThis) {
 
     if (priv->backend) return QCAP_RS_SUCCESSFUL;
 
-    if (priv->backend_type == 1) {
+    if (priv->backend_type == QCAP2_AUDIO_SOURCE_BACKEND_TYPE_ALSA) {
         priv->backend = new (std::nothrow) qcap2_alsa_audio_source_backend_t(priv);
+    } else if (priv->backend_type == QCAP2_AUDIO_SOURCE_BACKEND_TYPE_TPG) {
+        priv->backend = new (std::nothrow) qcap2_tpg_audio_source_backend_t(priv);
     } else {
         priv->backend = new (std::nothrow) qcap2_user_audio_source_backend_t(priv);
     }
@@ -823,214 +1147,6 @@ const char* qcap2_video_source_get_v4l2_sg_name(qcap2_video_source_t* pThis, int
         return priv->v4l2_sg_names[index];
     }
     return nullptr;
-}
-
-// COE APIs
-void qcap2_video_source_set_config_file(qcap2_video_source_t* pThis, const char* strConfigFile) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        if (strConfigFile) {
-            strncpy(priv->coe_config_file, strConfigFile, sizeof(priv->coe_config_file) - 1);
-            priv->coe_config_file[sizeof(priv->coe_config_file) - 1] = '\0';
-        }
-    }
-}
-
-void qcap2_video_source_set_verbosity(qcap2_video_source_t* pThis, int nVerbosity) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->coe_verbosity = nVerbosity;
-    }
-}
-
-// HSB APIs
-void qcap2_video_source_set_device_ordinal(qcap2_video_source_t* pThis, int nDeviceOrdinal) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hsb_device_ordinal = nDeviceOrdinal;
-    }
-}
-
-void qcap2_video_source_set_hololink_ip(qcap2_video_source_t* pThis, const char* strHololinkIP) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        if (strHololinkIP) {
-            strncpy(priv->hsb_hololink_ip, strHololinkIP, sizeof(priv->hsb_hololink_ip) - 1);
-            priv->hsb_hololink_ip[sizeof(priv->hsb_hololink_ip) - 1] = '\0';
-        }
-    }
-}
-
-void qcap2_video_source_set_ibv_name(qcap2_video_source_t* pThis, const char* strIBVName) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        if (strIBVName) {
-            strncpy(priv->hsb_ibv_name, strIBVName, sizeof(priv->hsb_ibv_name) - 1);
-            priv->hsb_ibv_name[sizeof(priv->hsb_ibv_name) - 1] = '\0';
-        }
-    }
-}
-
-void qcap2_video_source_set_ibv_port(qcap2_video_source_t* pThis, uint32_t nIBVPort) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hsb_ibv_port = nIBVPort;
-    }
-}
-
-// Pylon APIs
-void qcap2_video_source_set_trigger_mode(qcap2_video_source_t* pThis, bool bOn) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_trigger_mode = bOn;
-    }
-}
-
-QRESULT qcap2_video_source_get_device_handle(qcap2_video_source_t* pThis, PYLON_DEVICE_HANDLE* pDeviceHandle) {
-    if (pThis && pDeviceHandle) {
-        *pDeviceHandle = nullptr;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_offsetx(qcap2_video_source_t* pThis, int nOffsetX) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_offset_x = nOffsetX;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_offsety(qcap2_video_source_t* pThis, int nOffsetY) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_offset_y = nOffsetY;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_exposure_time(qcap2_video_source_t* pThis, float fExposureTime) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_exposure_time = fExposureTime;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_white_balance_auto(qcap2_video_source_t* pThis, int nBalanceWhiteAutoEnum) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_white_balance_auto = nBalanceWhiteAutoEnum;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_auto_gain_lower_limit(qcap2_video_source_t* pThis, float fAutoGainLowerLimit) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_auto_gain_lower_limit = fAutoGainLowerLimit;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_auto_gain_upper_limit(qcap2_video_source_t* pThis, float fAutoGainUpperLimit) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_auto_gain_upper_limit = fAutoGainUpperLimit;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_gain(qcap2_video_source_t* pThis, float fGain) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_gain = fGain;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_set_gain_auto(qcap2_video_source_t* pThis, int nGainAutoEnum) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->pylon_gain_auto = nGainAutoEnum;
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-QRESULT qcap2_video_source_trigger(qcap2_video_source_t* pThis) {
-    if (pThis) {
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_INVALID_PARAMETER;
-}
-
-// HDAL APIs
-void qcap2_video_source_set_vcap_id(qcap2_video_source_t* pThis, int nVcapId) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_vcap_id = nVcapId;
-    }
-}
-
-void qcap2_video_source_set_vcap_id2(qcap2_video_source_t* pThis, int nVcapId) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_vcap_id2 = nVcapId;
-    }
-}
-
-void qcap2_video_source_set_hd_src_dim(qcap2_video_source_t* pThis, HD_DIM oSrcDim) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_src_dim = oSrcDim;
-    }
-}
-
-void qcap2_video_source_set_hd_src_pxl_fmt(qcap2_video_source_t* pThis, HD_VIDEO_PXLFMT nSrcPxlFmt) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_src_pxl_fmt = nSrcPxlFmt;
-    }
-}
-
-void qcap2_video_source_set_vproc_id(qcap2_video_source_t* pThis, int nVprocId) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_vproc_id = nVprocId;
-    }
-}
-
-void qcap2_video_source_set_drv_config(qcap2_video_source_t* pThis, HD_VIDEOCAP_DRV_CONFIG* pDrvConfig) {
-    if (pThis && pDrvConfig) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_drv_config = *pDrvConfig;
-    }
-}
-
-void qcap2_video_source_set_ctrl_func(qcap2_video_source_t* pThis, HD_VIDEOCAP_CTRLFUNC nCtrlFunc) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        priv->hdal_ctrl_func = nCtrlFunc;
-    }
-}
-
-void qcap2_video_source_set_vendor_isp_config(qcap2_video_source_t* pThis, const char* pszConfigUrl) {
-    if (pThis) {
-        qcap2_video_source_priv_t* priv = reinterpret_cast<qcap2_video_source_priv_t*>(pThis);
-        if (pszConfigUrl) {
-            strncpy(priv->hdal_vendor_isp_config, pszConfigUrl, sizeof(priv->hdal_vendor_isp_config) - 1);
-            priv->hdal_vendor_isp_config[sizeof(priv->hdal_vendor_isp_config) - 1] = '\0';
-        }
-    }
 }
 
 }

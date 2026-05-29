@@ -82,6 +82,7 @@ void qcap2_video_sink_set_src_ss_type(qcap2_video_sink_t* pThis, int nSrcSSType)
 void qcap2_video_sink_set_dst_ss_type(qcap2_video_sink_t* pThis, int nDstSSType); // refer to qcap2_stereoscopic_type_t
 QRESULT qcap2_video_sink_start(qcap2_video_sink_t* pThis);
 QRESULT qcap2_video_sink_stop(qcap2_video_sink_t* pThis);
+QRESULT qcap2_video_sink_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
 QRESULT qcap2_video_sink_push(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_source_t
@@ -101,6 +102,7 @@ void qcap2_audio_source_set_device(qcap2_audio_source_t* pThis, int nDevice);
 QRESULT qcap2_audio_source_start(qcap2_audio_source_t* pThis);
 QRESULT qcap2_audio_source_stop(qcap2_audio_source_t* pThis);
 QRESULT qcap2_audio_source_pop(qcap2_audio_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_source_push(qcap2_audio_source_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_sink_t
 qcap2_audio_sink_t* qcap2_audio_sink_new();
@@ -113,6 +115,7 @@ void qcap2_audio_sink_set_card(qcap2_audio_sink_t* pThis, int nCard);
 void qcap2_audio_sink_set_device(qcap2_audio_sink_t* pThis, int nDevice);
 QRESULT qcap2_audio_sink_start(qcap2_audio_sink_t* pThis);
 QRESULT qcap2_audio_sink_stop(qcap2_audio_sink_t* pThis);
+QRESULT qcap2_audio_sink_pop(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
 QRESULT qcap2_audio_sink_push(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_demuxer_t

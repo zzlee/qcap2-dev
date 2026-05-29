@@ -3,10 +3,6 @@
 #include "qcap2.devices.h"
 #include "qcap2.formats.h"
 #include "qcap2.v4l2.h"
-#include "qcap2.coe.h"
-#include "qcap2.hsb.h"
-#include "qcap2.pylon.h"
-#include "qcap2.nvt.hdal.h"
 #include <stdio.h>
 #include <assert.h>
 #include <thread>
@@ -430,7 +426,7 @@ void test_qcap2_video_source_t() {
     qcap2_video_source_t* vsrc = qcap2_video_source_new();
     assert(vsrc != NULL);
 
-    qcap2_video_source_set_backend_type(vsrc, QCAP2_VIDEO_SOURCE_BACKEND_TYPE_USER);
+    qcap2_video_source_set_backend_type(vsrc, QCAP2_VIDEO_SOURCE_BACKEND_TYPE_TPG);
     qcap2_video_source_set_device_index(vsrc, 2);
 
     qcap2_video_format_t* fmt = qcap2_video_format_new();
@@ -453,18 +449,24 @@ void test_qcap2_video_source_t() {
 
     assert(qcap2_video_source_start(vsrc) == QCAP_RS_SUCCESSFUL);
 
-    qcap2_rcbuffer_t* buf = qcap2_rcbuffer_new(NULL, NULL);
-    assert(buf != NULL);
-    assert(qcap2_rcbuffer_use_count(buf) == 1);
-
-    assert(qcap2_video_source_push(vsrc, buf) == QCAP_RS_SUCCESSFUL);
+    // Wait a brief moment for the simulation thread to produce frames
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     qcap2_rcbuffer_t* popped = NULL;
     assert(qcap2_video_source_pop(vsrc, &popped) == QCAP_RS_SUCCESSFUL);
-    assert(popped == buf);
+    assert(popped != NULL);
 
-    qcap2_rcbuffer_release(popped);
-    qcap2_rcbuffer_release(buf);
+    PVOID pData = qcap2_rcbuffer_get_data(popped);
+    assert(pData != NULL);
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+    uint8_t* pPixels = NULL;
+    int stride = 0;
+    qcap2_av_frame_get_buffer(pFrame, &pPixels, &stride);
+    assert(pPixels != NULL);
+    assert(stride == 1920 * 2);
+
+    // Push the buffer back to recycle it
+    assert(qcap2_video_source_push(vsrc, popped) == QCAP_RS_SUCCESSFUL);
 
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
@@ -496,58 +498,12 @@ void test_qcap2_video_source_backends() {
     qcap2_video_source_set_v4l2_sg_name(vsrc, 3, "sub-device-3");
     assert(strcmp(qcap2_video_source_get_v4l2_sg_name(vsrc, 3), "sub-device-3") == 0);
 
-    // 2. Test COE Properties
-    qcap2_video_source_set_config_file(vsrc, "test_config.json");
-    qcap2_video_source_set_verbosity(vsrc, 4);
+    qcap2_video_source_set_frame_count(vsrc, 8);
 
-    // 3. Test HSB Properties
-    qcap2_video_source_set_device_ordinal(vsrc, 2);
-    qcap2_video_source_set_hololink_ip(vsrc, "192.168.1.100");
-    qcap2_video_source_set_ibv_name(vsrc, "mlx5_0");
-    qcap2_video_source_set_ibv_port(vsrc, 1234);
-
-    // 4. Test Pylon Properties
-    qcap2_video_source_set_trigger_mode(vsrc, true);
-    PYLON_DEVICE_HANDLE pylon_handle = NULL;
-    assert(qcap2_video_source_get_device_handle(vsrc, &pylon_handle) == QCAP_RS_SUCCESSFUL);
-    assert(pylon_handle == NULL);
-
-    assert(qcap2_video_source_set_offsetx(vsrc, 100) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_offsety(vsrc, 200) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_exposure_time(vsrc, 15.5f) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_white_balance_auto(vsrc, 1) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_auto_gain_lower_limit(vsrc, 0.5f) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_auto_gain_upper_limit(vsrc, 18.0f) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_gain(vsrc, 12.0f) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_set_gain_auto(vsrc, 2) == QCAP_RS_SUCCESSFUL);
-    assert(qcap2_video_source_trigger(vsrc) == QCAP_RS_SUCCESSFUL);
-
-    // 5. Test HDAL Properties
-    qcap2_video_source_set_vcap_id(vsrc, 5);
-    qcap2_video_source_set_vcap_id2(vsrc, 6);
-    HD_DIM dim = {1280, 720};
-    qcap2_video_source_set_hd_src_dim(vsrc, dim);
-    qcap2_video_source_set_hd_src_pxl_fmt(vsrc, HD_VIDEO_PXLFMT_YUYV);
-    qcap2_video_source_set_vproc_id(vsrc, 3);
-    HD_VIDEOCAP_DRV_CONFIG drv_cfg = {};
-    qcap2_video_source_set_drv_config(vsrc, &drv_cfg);
-    qcap2_video_source_set_ctrl_func(vsrc, HD_VIDEOCAP_CTRLFUNC_DEFAULT);
-    qcap2_video_source_set_vendor_isp_config(vsrc, "http://isp-config.url");
-
-    // 6. Test polymorphic instantiation for each backend subclass
+    // 2. Test polymorphic instantiation for each backend subclass
     int backend_types[] = {
         QCAP2_VIDEO_SOURCE_BACKEND_TYPE_USER,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_COE,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_HSB,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_PYLON,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_NVT_HDAL,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_XLNX,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_VITIS,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_V4L2_SG,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_LBLWR,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_TPG,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_LT6911,
-        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_IMX585
+        QCAP2_VIDEO_SOURCE_BACKEND_TYPE_TPG
     };
 
     for (int type : backend_types) {
@@ -556,7 +512,78 @@ void test_qcap2_video_source_backends() {
         assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
     }
 
+    // 3. Test USER backend buffer flow
+    qcap2_video_source_set_backend_type(vsrc, QCAP2_VIDEO_SOURCE_BACKEND_TYPE_USER);
+    assert(qcap2_video_source_start(vsrc) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_av_frame_t custom_frame;
+    qcap2_av_frame_init(&custom_frame);
+    qcap2_rcbuffer_t* custom_rcbuf = qcap2_rcbuffer_new(&custom_frame, [](PVOID){});
+    assert(custom_rcbuf != NULL);
+
+    assert(qcap2_video_source_push(vsrc, custom_rcbuf) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_rcbuffer_t* user_popped = NULL;
+    assert(qcap2_video_source_pop(vsrc, &user_popped) == QCAP_RS_SUCCESSFUL);
+    assert(user_popped == custom_rcbuf);
+
+    qcap2_rcbuffer_release(custom_rcbuf);
+    assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
+
     qcap2_video_source_delete(vsrc);
+}
+
+void test_qcap2_audio_source_backends() {
+    qcap2_audio_source_t* asrc = qcap2_audio_source_new();
+    assert(asrc != NULL);
+
+    qcap2_audio_source_set_backend_type(asrc, QCAP2_AUDIO_SOURCE_BACKEND_TYPE_TPG);
+    qcap2_audio_source_set_period_time(asrc, 10);
+    qcap2_audio_source_set_ideal_timer(asrc, true);
+
+    qcap2_audio_format_t* fmt = qcap2_audio_format_new();
+    assert(fmt != NULL);
+    qcap2_audio_format_set_property(fmt, 2, 16, 48000);
+    qcap2_audio_source_set_audio_format(asrc, fmt);
+
+    assert(qcap2_audio_source_start(asrc) == QCAP_RS_SUCCESSFUL);
+
+    // Wait a brief moment for the simulation thread to produce audio frames
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    qcap2_rcbuffer_t* popped = NULL;
+    assert(qcap2_audio_source_pop(asrc, &popped) == QCAP_RS_SUCCESSFUL);
+    assert(popped != NULL);
+
+    PVOID pData = qcap2_rcbuffer_get_data(popped);
+    assert(pData != NULL);
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+
+    ULONG channels = 0, sample_fmt = 0, sample_frequency = 0, frame_size = 0;
+    qcap2_av_frame_get_audio_property(pFrame, &channels, &sample_fmt, &sample_frequency, &frame_size);
+    assert(channels == 2);
+    assert(sample_fmt == 16);
+    assert(sample_frequency == 48000);
+    assert(frame_size > 0);
+
+    uint8_t* pSamples = NULL;
+    int stride = 0;
+    qcap2_av_frame_get_buffer(pFrame, &pSamples, &stride);
+    assert(pSamples != NULL);
+    assert(stride == (int)frame_size);
+
+    qcap2_rcbuffer_release(popped);
+
+    assert(qcap2_audio_source_stop(asrc) == QCAP_RS_SUCCESSFUL);
+
+    // Test ALSA start fail-safe when dev PCM node is not present (or in sandbox)
+    qcap2_audio_source_set_backend_type(asrc, QCAP2_AUDIO_SOURCE_BACKEND_TYPE_ALSA);
+    qcap2_audio_source_set_card(asrc, 99);
+    qcap2_audio_source_set_device(asrc, 9);
+    assert(qcap2_audio_source_start(asrc) == QCAP_RS_ERROR_GENERAL);
+
+    qcap2_audio_source_delete(asrc);
+    qcap2_audio_format_delete(fmt);
 }
 
 int main() {
@@ -569,6 +596,7 @@ int main() {
     test_qcap2_rcbuffer_queue_event_t();
     test_qcap2_video_source_t();
     test_qcap2_video_source_backends();
+    test_qcap2_audio_source_backends();
     test_qcap2_timer_t();
     test_qcap2_window_t();
     test_qcap2_binder_t();

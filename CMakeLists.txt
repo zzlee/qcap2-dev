@@ -45,6 +45,8 @@ add_executable(test_qcap2_sync
     tests/test_qcap2_sync.cpp
     src/qcap2.sync.cpp
     src/qcap2.buffer.cpp
+    src/qcap2.devices.cpp
+    src/qcap2.formats.cpp
 )
 target_link_libraries(test_qcap2_sync PRIVATE Threads::Threads)
 

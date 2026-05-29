@@ -109,8 +109,8 @@ static void demuxer_read_thread(qcap2_demuxer_priv_t* priv) {
 
             if (!handled) {
                 // Not mapped, release buffer
-                qcap2_rcbuffer_release(rcbuf);
             }
+            qcap2_rcbuffer_release(rcbuf);
         }
 
         av_packet_unref(pkt);

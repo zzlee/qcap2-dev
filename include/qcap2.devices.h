@@ -62,6 +62,7 @@ QRESULT qcap2_video_source_start(qcap2_video_source_t* pThis);
 QRESULT qcap2_video_source_stop(qcap2_video_source_t* pThis);
 QRESULT qcap2_video_source_run(qcap2_video_source_t* pThis);
 QRESULT qcap2_video_source_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_source_push(qcap2_video_source_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_video_sink_t
 qcap2_video_sink_t* qcap2_video_sink_new();

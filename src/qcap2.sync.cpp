@@ -590,6 +590,7 @@ void qcap2_rcbuffer_queue_set_buffers(qcap2_rcbuffer_queue_t* pThis, qcap2_rcbuf
                     break;
                 }
                 p->q.push(pBuffers[i]);
+                qcap2_rcbuffer_add_ref(pBuffers[i]);
             }
             bNotify = bWasEmpty && !p->q.empty();
             pEvent = p->event;
@@ -672,6 +673,7 @@ QRESULT qcap2_rcbuffer_queue_push(qcap2_rcbuffer_queue_t* pThis, qcap2_rcbuffer_
 
             bNotify = p->q.empty();
             p->q.push(pRCBuffer);
+            qcap2_rcbuffer_add_ref(pRCBuffer);
             pEvent = p->event;
         }
 
@@ -951,18 +953,55 @@ QRESULT qcap2_timer_next(qcap2_timer_t* pThis, uint64_t nDuration) {
 extern "C" {
 #endif
 
-// --- qcap2_window_t ---
+class qcap2_window_backend_t {
+public:
+    virtual ~qcap2_window_backend_t() = default;
+    virtual QRESULT start() = 0;
+    virtual QRESULT stop() = 0;
+    virtual QRESULT handle_events() = 0;
+};
+
 typedef struct qcap2_window_priv_t {
     int backendType;
     int rect[4];
     bool fullScreen;
+    qcap2_window_backend_t* backend;
+
+    qcap2_window_priv_t() {
+        backendType = 0;
+        rect[0] = rect[1] = rect[2] = rect[3] = 0;
+        fullScreen = false;
+        backend = nullptr;
+    }
+    ~qcap2_window_priv_t() {
+        if (backend) {
+            delete backend;
+        }
+    }
 } qcap2_window_priv_t;
 
+class qcap2_fake_window_backend_t : public qcap2_window_backend_t {
+private:
+    qcap2_window_priv_t* m_pOwner;
+public:
+    qcap2_fake_window_backend_t(qcap2_window_priv_t* pOwner) : m_pOwner(pOwner) {}
+    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
+    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
+    QRESULT handle_events() override { return QCAP_RS_SUCCESSFUL; }
+};
+
+class qcap2_x11_window_backend_t : public qcap2_window_backend_t {
+private:
+    qcap2_window_priv_t* m_pOwner;
+public:
+    qcap2_x11_window_backend_t(qcap2_window_priv_t* pOwner) : m_pOwner(pOwner) {}
+    QRESULT start() override { return QCAP_RS_SUCCESSFUL; }
+    QRESULT stop() override { return QCAP_RS_SUCCESSFUL; }
+    QRESULT handle_events() override { return QCAP_RS_SUCCESSFUL; }
+};
+
 qcap2_window_t* qcap2_window_new() {
-    qcap2_window_priv_t* pThis = new qcap2_window_priv_t;
-    pThis->backendType = 0;
-    pThis->rect[0] = pThis->rect[1] = pThis->rect[2] = pThis->rect[3] = 0;
-    pThis->fullScreen = false;
+    qcap2_window_priv_t* pThis = new (std::nothrow) qcap2_window_priv_t();
     return (qcap2_window_t*)pThis;
 }
 
@@ -989,11 +1028,32 @@ void qcap2_window_set_full_screen(qcap2_window_t* pThis, bool bFullScreen) {
 }
 
 QRESULT qcap2_window_start(qcap2_window_t* pThis) {
-    return pThis ? QCAP_RS_SUCCESSFUL : QCAP_RS_ERROR_GENERAL;
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_window_priv_t* p = (qcap2_window_priv_t*)pThis;
+
+    if (p->backend) return QCAP_RS_SUCCESSFUL;
+
+    if (p->backendType == 1) {
+        p->backend = new (std::nothrow) qcap2_x11_window_backend_t(p);
+    } else {
+        p->backend = new (std::nothrow) qcap2_fake_window_backend_t(p);
+    }
+
+    if (!p->backend) return QCAP_RS_ERROR_GENERAL;
+
+    return p->backend->start();
 }
 
 QRESULT qcap2_window_stop(qcap2_window_t* pThis) {
-    return pThis ? QCAP_RS_SUCCESSFUL : QCAP_RS_ERROR_GENERAL;
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_window_priv_t* p = (qcap2_window_priv_t*)pThis;
+
+    if (p->backend) {
+        p->backend->stop();
+        delete p->backend;
+        p->backend = nullptr;
+    }
+    return QCAP_RS_SUCCESSFUL;
 }
 
 QRESULT qcap2_window_get_hwnd(qcap2_window_t* pThis, HWND* pHwnd) {
@@ -1013,7 +1073,12 @@ QRESULT qcap2_window_get_native_handle(qcap2_window_t* pThis, uintptr_t* pHandle
 }
 
 QRESULT qcap2_window_handle_events(qcap2_window_t* pThis) {
-    return pThis ? QCAP_RS_SUCCESSFUL : QCAP_RS_ERROR_GENERAL;
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_window_priv_t* p = (qcap2_window_priv_t*)pThis;
+    if (p->backend) {
+        return p->backend->handle_events();
+    }
+    return QCAP_RS_SUCCESSFUL;
 }
 
 #ifdef __cplusplus

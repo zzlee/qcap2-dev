@@ -10,6 +10,15 @@
 extern "C" {
 #endif
 
+typedef struct _qcap2_rcbuffer_priv_t {
+    PVOID pData;
+    ULONG nDataSize;
+    qcap2_on_free_resource_t pOnFreeResource;
+    std::atomic<int32_t> use_count;
+    std::atomic<int32_t> res_count;
+    std::atomic<bool> resource_freed;
+} qcap2_rcbuffer_priv_t;
+
 // A simple internal definition to overlay on the opaque struct arrays.
 typedef struct _qcap2_av_frame_priv_t {
     ULONG nColorSpaceType;
@@ -46,16 +55,6 @@ typedef struct _qcap2_av_packet_priv_t {
     bool bOwnsBuffer;
 } qcap2_av_packet_priv_t;
 
-typedef struct _qcap2_rcbuffer_priv_t {
-    PVOID pData;
-    ULONG nDataSize;
-    qcap2_on_free_resource_t pOnFreeResource;
-    std::atomic<int32_t> use_count;
-    std::atomic<int32_t> weak_count;
-    std::atomic<int32_t> res_count;
-    std::atomic<bool> resource_freed;
-} qcap2_rcbuffer_priv_t;
-
 static int32_t qcap2_atomic_inc_if_positive(std::atomic<int32_t>& value) {
     int32_t n = value.load(std::memory_order_acquire);
     while (n > 0) {
@@ -79,7 +78,6 @@ static int32_t qcap2_atomic_dec_if_positive(std::atomic<int32_t>& value) {
 static void qcap2_rcbuffer_maybe_delete(qcap2_rcbuffer_priv_t* p) {
     if (p &&
         p->use_count.load(std::memory_order_acquire) == 0 &&
-        p->weak_count.load(std::memory_order_acquire) == 0 &&
         p->res_count.load(std::memory_order_acquire) == 0) {
         delete p;
     }
@@ -92,16 +90,14 @@ static void qcap2_rcbuffer_release_resource(qcap2_rcbuffer_priv_t* p) {
     if (nResCount == 0) {
         bool bExpected = false;
         if (p->resource_freed.compare_exchange_strong(bExpected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            PVOID pData = p->pData;
             if (p->pOnFreeResource) {
-                p->pOnFreeResource(pData);
+                p->pOnFreeResource(p->pData);
             }
         }
     }
 
     qcap2_rcbuffer_maybe_delete(p);
 }
-
 
 // --- qcap2_rcbuffer_t ---
 
@@ -112,7 +108,6 @@ qcap2_rcbuffer_t* qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFr
         p->nDataSize = 0;
         p->pOnFreeResource = pOnFreeResource;
         p->use_count.store(1, std::memory_order_release);
-        p->weak_count.store(0, std::memory_order_release);
         p->res_count.store(1, std::memory_order_release);
         p->resource_freed.store(false, std::memory_order_release);
     }
@@ -186,13 +181,6 @@ PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer) {
 int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer) {
     if (pRCBuffer) {
         return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->use_count.load(std::memory_order_acquire);
-    }
-    return 0;
-}
-
-int32_t qcap2_rcbuffer_weak_count(qcap2_rcbuffer_t* pRCBuffer) {
-    if (pRCBuffer) {
-        return ((qcap2_rcbuffer_priv_t*)pRCBuffer)->weak_count.load(std::memory_order_acquire);
     }
     return 0;
 }

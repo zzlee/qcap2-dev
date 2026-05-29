@@ -19,8 +19,8 @@ PVOID qcap2_rcbuffer_lock_data(qcap2_rcbuffer_t* pRCBuffer);
 void qcap2_rcbuffer_unlock_data(qcap2_rcbuffer_t* pRCBuffer);
 PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer); // risky accessor
 int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer);
-int32_t qcap2_rcbuffer_weak_count(qcap2_rcbuffer_t* pRCBuffer);
 int32_t qcap2_rcbuffer_res_count(qcap2_rcbuffer_t* pRCBuffer);
+
 
 // qcap2_av_frame_t
 void qcap2_av_frame_init(qcap2_av_frame_t* pFrame);

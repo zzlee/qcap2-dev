@@ -1457,6 +1457,12 @@ static AVPixelFormat qcap2_to_ffmpeg_pix_fmt(ULONG nColorSpaceType) {
     }
 }
 
+class qcap2_video_scaler_backend_t {
+public:
+    virtual ~qcap2_video_scaler_backend_t() = default;
+    virtual QRESULT scale(qcap2_rcbuffer_t* src, qcap2_rcbuffer_t* dst, ULONG in_color, ULONG in_w, ULONG in_h, int64_t nPTS, double dSampleTime, int nFieldType, uint8_t* in_ptrs[4], int in_strides[4]) = 0;
+};
+
 typedef struct qcap2_video_scaler_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
@@ -1500,19 +1506,8 @@ typedef struct qcap2_video_scaler_priv_t {
     // Running state
     bool running;
 
-    // Direct mode: swscale cached context
-    SwsContext* sws_ctx;
-    ULONG cached_in_color;
-    ULONG cached_in_w;
-    ULONG cached_in_h;
-
-    // Filter mode: avfilter cached context
-    AVFilterGraph* filter_graph;
-    AVFilterContext* src_ctx;
-    AVFilterContext* sink_ctx;
-    ULONG filter_in_color;
-    ULONG filter_in_w;
-    ULONG filter_in_h;
+    // Polymorphic backend pointer
+    qcap2_video_scaler_backend_t* backend;
 
     qcap2_video_scaler_priv_t() {
         mtx = new std::mutex();
@@ -1544,17 +1539,7 @@ typedef struct qcap2_video_scaler_priv_t {
         backend_type = 0;
 
         running = false;
-        sws_ctx = nullptr;
-        cached_in_color = 0;
-        cached_in_w = 0;
-        cached_in_h = 0;
-
-        filter_graph = nullptr;
-        src_ctx = nullptr;
-        sink_ctx = nullptr;
-        filter_in_color = 0;
-        filter_in_w = 0;
-        filter_in_h = 0;
+        backend = nullptr;
     }
 
     ~qcap2_video_scaler_priv_t() {
@@ -1564,15 +1549,9 @@ typedef struct qcap2_video_scaler_priv_t {
     }
 
     void cleanup() {
-        if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-            sws_ctx = nullptr;
-        }
-        if (filter_graph) {
-            avfilter_graph_free(&filter_graph);
-            filter_graph = nullptr;
-            src_ctx = nullptr;
-            sink_ctx = nullptr;
+        if (backend) {
+            delete backend;
+            backend = nullptr;
         }
         for (auto buf : registered_buffers) {
             qcap2_rcbuffer_release(buf);
@@ -1587,101 +1566,300 @@ typedef struct qcap2_video_scaler_priv_t {
     }
 } qcap2_video_scaler_priv_t;
 
-static bool init_filter_graph(qcap2_video_scaler_priv_t* p, ULONG in_color, ULONG in_w, ULONG in_h) {
-    if (p->filter_graph) {
-        avfilter_graph_free(&p->filter_graph);
-        p->filter_graph = nullptr;
-        p->src_ctx = nullptr;
-        p->sink_ctx = nullptr;
+class qcap2_sws_video_scaler_backend_t : public qcap2_video_scaler_backend_t {
+private:
+    qcap2_video_scaler_priv_t* p;
+    SwsContext* sws_ctx;
+    ULONG cached_in_color;
+    ULONG cached_in_w;
+    ULONG cached_in_h;
+
+    bool init_sws(ULONG in_color, ULONG in_w, ULONG in_h) {
+        AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
+        AVPixelFormat out_pix_fmt = qcap2_to_ffmpeg_pix_fmt(p->out_color_space);
+        if (in_pix_fmt == AV_PIX_FMT_NONE || out_pix_fmt == AV_PIX_FMT_NONE) {
+            return false;
+        }
+
+        int src_w = in_w;
+        int src_h = in_h;
+        if (p->crop_w > 0 && p->crop_h > 0) {
+            src_w = p->crop_w;
+            src_h = p->crop_h;
+        }
+
+        sws_ctx = sws_getCachedContext(sws_ctx,
+                                          src_w, src_h, in_pix_fmt,
+                                          p->out_width, p->out_height, out_pix_fmt,
+                                          SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_ctx) {
+            return false;
+        }
+
+        cached_in_color = in_color;
+        cached_in_w = in_w;
+        cached_in_h = in_h;
+        return true;
     }
 
-    AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
-    AVPixelFormat out_pix_fmt = qcap2_to_ffmpeg_pix_fmt(p->out_color_space);
-    if (in_pix_fmt == AV_PIX_FMT_NONE || out_pix_fmt == AV_PIX_FMT_NONE) {
-        return false;
+public:
+    qcap2_sws_video_scaler_backend_t(qcap2_video_scaler_priv_t* owner) 
+        : p(owner), sws_ctx(nullptr), cached_in_color(0), cached_in_w(0), cached_in_h(0) {}
+
+    ~qcap2_sws_video_scaler_backend_t() override {
+        if (sws_ctx) {
+            sws_freeContext(sws_ctx);
+        }
     }
 
-    p->filter_graph = avfilter_graph_alloc();
-    if (!p->filter_graph) return false;
+    QRESULT scale(qcap2_rcbuffer_t* src, qcap2_rcbuffer_t* dst, ULONG in_color, ULONG in_w, ULONG in_h, int64_t nPTS, double dSampleTime, int nFieldType, uint8_t* in_ptrs[4], int in_strides[4]) override {
+        (void)src;
+        if (!sws_ctx || cached_in_color != in_color || cached_in_w != in_w || cached_in_h != in_h) {
+            if (!init_sws(in_color, in_w, in_h)) {
+                return QCAP_RS_ERROR_GENERAL;
+            }
+        }
 
-    const AVFilter* src_filter = avfilter_get_by_name("buffer");
-    const AVFilter* sink_filter = avfilter_get_by_name("buffersink");
-    if (!src_filter || !sink_filter) return false;
+        uint8_t* src_ptrs[4];
+        int src_strides[4];
+        for (int i = 0; i < 4; ++i) {
+            src_ptrs[i] = in_ptrs[i];
+            src_strides[i] = in_strides[i];
+        }
 
-    char args[512];
-    snprintf(args, sizeof(args),
-             "video_size=%lux%lu:pix_fmt=%d:time_base=1/90000:pixel_aspect=1/1",
-             in_w, in_h, (int)in_pix_fmt);
+        if (in_color == QCAP_COLORSPACE_TYPE_YV12 || in_color == QCAP_COLORSPACE_TYPE_YV24) {
+            std::swap(src_ptrs[1], src_ptrs[2]);
+            std::swap(src_strides[1], src_strides[2]);
+        }
 
-    int ret = avfilter_graph_create_filter(&p->src_ctx, src_filter, "in", args, nullptr, p->filter_graph);
-    if (ret < 0) return false;
+        int src_h = in_h;
+        if (p->crop_w > 0 && p->crop_h > 0) {
+            src_h = p->crop_h;
+            AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
+            if (in_pix_fmt != AV_PIX_FMT_NONE) {
+                if (in_pix_fmt == AV_PIX_FMT_RGB24 || in_pix_fmt == AV_PIX_FMT_BGR24) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 3;
+                } else if (in_pix_fmt == AV_PIX_FMT_ARGB || in_pix_fmt == AV_PIX_FMT_ABGR) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 4;
+                } else if (in_pix_fmt == AV_PIX_FMT_YUYV422 || in_pix_fmt == AV_PIX_FMT_UYVY422) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 2;
+                } else if (in_pix_fmt == AV_PIX_FMT_GRAY8) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
+                } else if (in_pix_fmt == AV_PIX_FMT_YUV420P) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
+                    src_ptrs[1] += (p->crop_y / 2) * src_strides[1] + (p->crop_x / 2);
+                    src_ptrs[2] += (p->crop_y / 2) * src_strides[2] + (p->crop_x / 2);
+                } else if (in_pix_fmt == AV_PIX_FMT_YUV444P) {
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
+                    src_ptrs[1] += p->crop_y * src_strides[1] + p->crop_x;
+                    src_ptrs[2] += p->crop_y * src_strides[2] + p->crop_x;
+                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE || in_pix_fmt == AV_PIX_FMT_P210LE) {
+                    int bpp = (in_pix_fmt == AV_PIX_FMT_NV12) ? 1 : 2;
+                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * bpp;
+                    int chroma_y_div = (in_pix_fmt == AV_PIX_FMT_P210LE) ? 1 : 2;
+                    src_ptrs[1] += (p->crop_y / chroma_y_div) * src_strides[1] + p->crop_x * 2;
+                }
+            }
+        }
 
-    ret = avfilter_graph_create_filter(&p->sink_ctx, sink_filter, "out", nullptr, nullptr, p->filter_graph);
-    if (ret < 0) return false;
+        PVOID out_data = qcap2_rcbuffer_lock_data(dst);
+        if (!out_data) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
 
-    enum AVPixelFormat pix_fmts[] = { out_pix_fmt, AV_PIX_FMT_NONE };
-    ret = av_opt_set_int_list(p->sink_ctx, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
-    if (ret < 0) return false;
+        qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
+        uint8_t* out_ptrs[4] = { nullptr };
+        int out_strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(out_frame, out_ptrs, out_strides);
 
-    AVFilterInOut* outputs = avfilter_inout_alloc();
-    AVFilterInOut* inputs = avfilter_inout_alloc();
-    if (!outputs || !inputs) {
+        uint8_t* dst_ptrs[4];
+        int dst_strides[4];
+        for (int i = 0; i < 4; ++i) {
+            dst_ptrs[i] = out_ptrs[i];
+            dst_strides[i] = out_strides[i];
+        }
+
+        if (p->out_color_space == QCAP_COLORSPACE_TYPE_YV12 || p->out_color_space == QCAP_COLORSPACE_TYPE_YV24) {
+            std::swap(dst_ptrs[1], dst_ptrs[2]);
+            std::swap(dst_strides[1], dst_strides[2]);
+        }
+
+        int ret = sws_scale(sws_ctx, src_ptrs, src_strides, 0, src_h, dst_ptrs, dst_strides);
+        if (ret < 0) {
+            qcap2_rcbuffer_unlock_data(dst);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        qcap2_av_frame_set_pts(out_frame, nPTS);
+        qcap2_av_frame_set_sample_time(out_frame, dSampleTime);
+        qcap2_av_frame_set_field_type(out_frame, nFieldType);
+
+        qcap2_rcbuffer_unlock_data(dst);
+        return QCAP_RS_SUCCESSFUL;
+    }
+};
+
+class qcap2_filter_video_scaler_backend_t : public qcap2_video_scaler_backend_t {
+private:
+    qcap2_video_scaler_priv_t* p;
+    AVFilterGraph* filter_graph;
+    AVFilterContext* src_ctx;
+    AVFilterContext* sink_ctx;
+    ULONG filter_in_color;
+    ULONG filter_in_w;
+    ULONG filter_in_h;
+
+    bool init_filter_graph(ULONG in_color, ULONG in_w, ULONG in_h) {
+        if (filter_graph) {
+            avfilter_graph_free(&filter_graph);
+            filter_graph = nullptr;
+            src_ctx = nullptr;
+            sink_ctx = nullptr;
+        }
+
+        AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
+        AVPixelFormat out_pix_fmt = qcap2_to_ffmpeg_pix_fmt(p->out_color_space);
+        if (in_pix_fmt == AV_PIX_FMT_NONE || out_pix_fmt == AV_PIX_FMT_NONE) {
+            return false;
+        }
+
+        filter_graph = avfilter_graph_alloc();
+        if (!filter_graph) return false;
+
+        const AVFilter* src_filter = avfilter_get_by_name("buffer");
+        const AVFilter* sink_filter = avfilter_get_by_name("buffersink");
+        if (!src_filter || !sink_filter) return false;
+
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "video_size=%lux%lu:pix_fmt=%d:time_base=1/90000:pixel_aspect=1/1",
+                 in_w, in_h, (int)in_pix_fmt);
+
+        int ret = avfilter_graph_create_filter(&src_ctx, src_filter, "in", args, nullptr, filter_graph);
+        if (ret < 0) return false;
+
+        ret = avfilter_graph_create_filter(&sink_ctx, sink_filter, "out", nullptr, nullptr, filter_graph);
+        if (ret < 0) return false;
+
+        enum AVPixelFormat pix_fmts[] = { out_pix_fmt, AV_PIX_FMT_NONE };
+        ret = av_opt_set_int_list(sink_ctx, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+        if (ret < 0) return false;
+
+        AVFilterInOut* outputs = avfilter_inout_alloc();
+        AVFilterInOut* inputs = avfilter_inout_alloc();
+        if (!outputs || !inputs) {
+            avfilter_inout_free(&outputs);
+            avfilter_inout_free(&inputs);
+            return false;
+        }
+
+        outputs->name = av_strdup("in");
+        outputs->filter_ctx = src_ctx;
+        outputs->pad_idx = 0;
+        outputs->next = nullptr;
+
+        inputs->name = av_strdup("out");
+        inputs->filter_ctx = sink_ctx;
+        inputs->pad_idx = 0;
+        inputs->next = nullptr;
+
+        ret = avfilter_graph_parse_ptr(filter_graph, p->filter_graph_str.c_str(), &inputs, &outputs, nullptr);
         avfilter_inout_free(&outputs);
         avfilter_inout_free(&inputs);
-        return false;
+        if (ret < 0) return false;
+
+        ret = avfilter_graph_config(filter_graph, nullptr);
+        if (ret < 0) return false;
+
+        filter_in_color = in_color;
+        filter_in_w = in_w;
+        filter_in_h = in_h;
+        return true;
     }
 
-    outputs->name = av_strdup("in");
-    outputs->filter_ctx = p->src_ctx;
-    outputs->pad_idx = 0;
-    outputs->next = nullptr;
+public:
+    qcap2_filter_video_scaler_backend_t(qcap2_video_scaler_priv_t* owner)
+        : p(owner), filter_graph(nullptr), src_ctx(nullptr), sink_ctx(nullptr), filter_in_color(0), filter_in_w(0), filter_in_h(0) {}
 
-    inputs->name = av_strdup("out");
-    inputs->filter_ctx = p->sink_ctx;
-    inputs->pad_idx = 0;
-    inputs->next = nullptr;
-
-    ret = avfilter_graph_parse_ptr(p->filter_graph, p->filter_graph_str.c_str(), &inputs, &outputs, nullptr);
-    avfilter_inout_free(&outputs);
-    avfilter_inout_free(&inputs);
-    if (ret < 0) return false;
-
-    ret = avfilter_graph_config(p->filter_graph, nullptr);
-    if (ret < 0) return false;
-
-    p->filter_in_color = in_color;
-    p->filter_in_w = in_w;
-    p->filter_in_h = in_h;
-    return true;
-}
-
-static bool init_sws(qcap2_video_scaler_priv_t* p, ULONG in_color, ULONG in_w, ULONG in_h) {
-    AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
-    AVPixelFormat out_pix_fmt = qcap2_to_ffmpeg_pix_fmt(p->out_color_space);
-    if (in_pix_fmt == AV_PIX_FMT_NONE || out_pix_fmt == AV_PIX_FMT_NONE) {
-        return false;
+    ~qcap2_filter_video_scaler_backend_t() override {
+        if (filter_graph) {
+            avfilter_graph_free(&filter_graph);
+        }
     }
 
-    int src_w = in_w;
-    int src_h = in_h;
-    if (p->crop_w > 0 && p->crop_h > 0) {
-        src_w = p->crop_w;
-        src_h = p->crop_h;
-    }
+    QRESULT scale(qcap2_rcbuffer_t* src, qcap2_rcbuffer_t* dst, ULONG in_color, ULONG in_w, ULONG in_h, int64_t nPTS, double dSampleTime, int nFieldType, uint8_t* in_ptrs[4], int in_strides[4]) override {
+        (void)src;
+        if (!filter_graph || filter_in_color != in_color || filter_in_w != in_w || filter_in_h != in_h) {
+            if (!init_filter_graph(in_color, in_w, in_h)) {
+                return QCAP_RS_ERROR_GENERAL;
+            }
+        }
 
-    p->sws_ctx = sws_getCachedContext(p->sws_ctx,
-                                      src_w, src_h, in_pix_fmt,
-                                      p->out_width, p->out_height, out_pix_fmt,
-                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!p->sws_ctx) {
-        return false;
-    }
+        AVFrame* f = av_frame_alloc();
+        if (!f) {
+            return QCAP_RS_ERROR_OUT_OF_MEMORY;
+        }
 
-    p->cached_in_color = in_color;
-    p->cached_in_w = in_w;
-    p->cached_in_h = in_h;
-    return true;
-}
+        f->width = in_w;
+        f->height = in_h;
+        f->format = qcap2_to_ffmpeg_pix_fmt(in_color);
+        for (int i = 0; i < 4; ++i) {
+            f->data[i] = in_ptrs[i];
+            f->linesize[i] = in_strides[i];
+        }
+        f->pts = nPTS;
+
+        int ret = av_buffersrc_add_frame_flags(src_ctx, f, AV_BUFFERSRC_FLAG_KEEP_REF);
+        av_frame_free(&f);
+
+        if (ret < 0) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        AVFrame* filtered_frame = av_frame_alloc();
+        if (!filtered_frame) return QCAP_RS_ERROR_OUT_OF_MEMORY;
+
+        ret = av_buffersink_get_frame(sink_ctx, filtered_frame);
+        if (ret < 0) {
+            av_frame_free(&filtered_frame);
+            return QCAP_RS_SUCCESSFUL;
+        }
+
+        PVOID out_data = qcap2_rcbuffer_lock_data(dst);
+        if (!out_data) {
+            av_frame_free(&filtered_frame);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
+        uint8_t* out_ptrs[4] = { nullptr };
+        int out_strides[4] = { 0 };
+        qcap2_av_frame_get_buffer1(out_frame, out_ptrs, out_strides);
+
+        for (int i = 0; i < 4 && filtered_frame->data[i]; ++i) {
+            int copy_h = (i == 0) ? filtered_frame->height : (filtered_frame->height + 1) / 2;
+            if (filtered_frame->format == AV_PIX_FMT_RGB24 || filtered_frame->format == AV_PIX_FMT_BGR24 ||
+                filtered_frame->format == AV_PIX_FMT_ARGB || filtered_frame->format == AV_PIX_FMT_ABGR) {
+                copy_h = filtered_frame->height;
+            } else if (filtered_frame->format == AV_PIX_FMT_YUV444P) {
+                copy_h = filtered_frame->height;
+            }
+            int line_bytes = std::min(filtered_frame->linesize[i], out_strides[i]);
+            for (int r = 0; r < copy_h; ++r) {
+                memcpy(out_ptrs[i] + r * out_strides[i], filtered_frame->data[i] + r * filtered_frame->linesize[i], line_bytes);
+            }
+        }
+
+        qcap2_av_frame_set_pts(out_frame, filtered_frame->pts);
+        qcap2_av_frame_set_sample_time(out_frame, dSampleTime);
+        qcap2_av_frame_set_field_type(out_frame, nFieldType);
+        qcap2_av_frame_set_video_property(out_frame, p->out_color_space, filtered_frame->width, filtered_frame->height);
+
+        qcap2_rcbuffer_unlock_data(dst);
+        av_frame_free(&filtered_frame);
+        return QCAP_RS_SUCCESSFUL;
+    }
+};
 
 static qcap2_rcbuffer_t* get_output_buffer(qcap2_video_scaler_priv_t* p) {
     if (!p->registered_buffers.empty()) {
@@ -1717,7 +1895,6 @@ qcap2_video_scaler_t* qcap2_video_scaler_new() {
 
 void qcap2_video_scaler_delete(qcap2_video_scaler_t* pThis) {
     if (pThis) {
-        qcap2_video_scaler_stop(pThis);
         qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
         delete p;
     }
@@ -1728,13 +1905,13 @@ void qcap2_video_scaler_set_video_format(qcap2_video_scaler_t* pThis, qcap2_vide
         qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
         std::lock_guard<std::mutex> lock(*(p->mtx));
         ULONG color = 0, w = 0, h = 0;
-        BOOL inter = FALSE;
+        BOOL interleaved = FALSE;
         double fps = 0.0;
-        qcap2_video_format_get_property(pVideoFormat, &color, &w, &h, &inter, &fps);
+        qcap2_video_format_get_property(pVideoFormat, &color, &w, &h, &interleaved, &fps);
         p->out_color_space = color;
         p->out_width = w;
         p->out_height = h;
-        p->out_interleaved = inter;
+        p->out_interleaved = interleaved;
         p->out_fps = fps;
     }
 }
@@ -1812,9 +1989,9 @@ void qcap2_video_scaler_set_buffers(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_
         }
         p->registered_buffers.clear();
         if (pBuffers) {
-            for (int i = 0; pBuffers[i] != nullptr; ++i) {
-                qcap2_rcbuffer_add_ref(pBuffers[i]);
+            for (int i = 0; pBuffers[i]; ++i) {
                 p->registered_buffers.push_back(pBuffers[i]);
+                qcap2_rcbuffer_add_ref(pBuffers[i]);
             }
         }
     }
@@ -1888,24 +2065,35 @@ void qcap2_video_scaler_set_filter_graph(qcap2_video_scaler_t* pThis, const char
 }
 
 QRESULT qcap2_video_scaler_start(qcap2_video_scaler_t* pThis) {
-    if (pThis) {
-        qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->running = true;
-        return QCAP_RS_SUCCESSFUL;
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (p->running) return QCAP_RS_SUCCESSFUL;
+
+    if (!p->backend) {
+        if (!p->filter_graph_str.empty()) {
+            p->backend = new (std::nothrow) qcap2_filter_video_scaler_backend_t(p);
+        } else {
+            p->backend = new (std::nothrow) qcap2_sws_video_scaler_backend_t(p);
+        }
     }
-    return QCAP_RS_ERROR_GENERAL;
+
+    if (!p->backend) return QCAP_RS_ERROR_GENERAL;
+
+    p->running = true;
+    return QCAP_RS_SUCCESSFUL;
 }
 
 QRESULT qcap2_video_scaler_stop(qcap2_video_scaler_t* pThis) {
-    if (pThis) {
-        qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->running = false;
-        p->cleanup();
-        return QCAP_RS_SUCCESSFUL;
-    }
-    return QCAP_RS_ERROR_GENERAL;
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    p->running = false;
+    p->cv->notify_all();
+    p->cleanup();
+    return QCAP_RS_SUCCESSFUL;
 }
 
 QRESULT qcap2_video_scaler_run(qcap2_video_scaler_t* pThis) {
@@ -1937,200 +2125,44 @@ QRESULT qcap2_video_scaler_push(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* p
     int nFieldType = 0;
     qcap2_av_frame_get_field_type(pFrame, &nFieldType);
 
-    std::lock_guard<std::mutex> lock(*(p->mtx));
+    std::unique_lock<std::mutex> lock(*(p->mtx));
     if (!p->running) {
         qcap2_rcbuffer_unlock_data(pRCBuffer);
         return QCAP_RS_ERROR_GENERAL;
     }
 
-    if (!p->filter_graph_str.empty()) {
-        // --- Filter Graph Mode ---
-        if (!p->filter_graph || p->filter_in_color != in_color || p->filter_in_w != in_w || p->filter_in_h != in_h) {
-            if (!init_filter_graph(p, in_color, in_w, in_h)) {
-                qcap2_rcbuffer_unlock_data(pRCBuffer);
-                return QCAP_RS_ERROR_GENERAL;
-            }
+    if (!p->backend) {
+        if (!p->filter_graph_str.empty()) {
+            p->backend = new (std::nothrow) qcap2_filter_video_scaler_backend_t(p);
+        } else {
+            p->backend = new (std::nothrow) qcap2_sws_video_scaler_backend_t(p);
         }
+    }
 
-        AVFrame* f = av_frame_alloc();
-        if (!f) {
-            qcap2_rcbuffer_unlock_data(pRCBuffer);
-            return QCAP_RS_ERROR_OUT_OF_MEMORY;
-        }
-
-        f->width = in_w;
-        f->height = in_h;
-        f->format = qcap2_to_ffmpeg_pix_fmt(in_color);
-        for (int i = 0; i < 4; ++i) {
-            f->data[i] = in_ptrs[i];
-            f->linesize[i] = in_strides[i];
-        }
-        f->pts = nPTS;
-
-        int ret = av_buffersrc_add_frame_flags(p->src_ctx, f, AV_BUFFERSRC_FLAG_KEEP_REF);
-        av_frame_free(&f);
+    if (!p->backend) {
         qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
 
-        if (ret < 0) {
-            return QCAP_RS_ERROR_GENERAL;
-        }
-
-        AVFrame* filtered_frame = av_frame_alloc();
-        if (!filtered_frame) return QCAP_RS_ERROR_OUT_OF_MEMORY;
-
-        ret = av_buffersink_get_frame(p->sink_ctx, filtered_frame);
-        if (ret < 0) {
-            av_frame_free(&filtered_frame);
-            return QCAP_RS_SUCCESSFUL;
-        }
-
-        qcap2_rcbuffer_t* out_rc = get_output_buffer(p);
-        if (!out_rc) {
-            av_frame_free(&filtered_frame);
-            return QCAP_RS_ERROR_GENERAL;
-        }
-
-        PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
-        if (!out_data) {
-            qcap2_rcbuffer_release(out_rc);
-            av_frame_free(&filtered_frame);
-            return QCAP_RS_ERROR_GENERAL;
-        }
-
-        qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
-        uint8_t* out_ptrs[4] = { nullptr };
-        int out_strides[4] = { 0 };
-        qcap2_av_frame_get_buffer1(out_frame, out_ptrs, out_strides);
-
-        for (int i = 0; i < 4 && filtered_frame->data[i]; ++i) {
-            int copy_h = (i == 0) ? filtered_frame->height : (filtered_frame->height + 1) / 2;
-            if (filtered_frame->format == AV_PIX_FMT_RGB24 || filtered_frame->format == AV_PIX_FMT_BGR24 ||
-                filtered_frame->format == AV_PIX_FMT_ARGB || filtered_frame->format == AV_PIX_FMT_ABGR) {
-                copy_h = filtered_frame->height;
-            } else if (filtered_frame->format == AV_PIX_FMT_YUV444P) {
-                copy_h = filtered_frame->height;
-            }
-            int line_bytes = std::min(filtered_frame->linesize[i], out_strides[i]);
-            for (int r = 0; r < copy_h; ++r) {
-                memcpy(out_ptrs[i] + r * out_strides[i], filtered_frame->data[i] + r * filtered_frame->linesize[i], line_bytes);
-            }
-        }
-
-        qcap2_av_frame_set_pts(out_frame, filtered_frame->pts);
-        qcap2_av_frame_set_sample_time(out_frame, dSampleTime);
-        qcap2_av_frame_set_field_type(out_frame, nFieldType);
-        qcap2_av_frame_set_video_property(out_frame, p->out_color_space, filtered_frame->width, filtered_frame->height);
-
-        qcap2_rcbuffer_unlock_data(out_rc);
-        av_frame_free(&filtered_frame);
-
-        p->output_queue.push(out_rc);
-        p->cv->notify_all();
-
-        if (p->event) {
-            qcap2_event_notify(p->event);
-        }
-
-    } else {
-        // --- Direct swscale Mode ---
-        if (!p->sws_ctx || p->cached_in_color != in_color || p->cached_in_w != in_w || p->cached_in_h != in_h) {
-            if (!init_sws(p, in_color, in_w, in_h)) {
-                qcap2_rcbuffer_unlock_data(pRCBuffer);
-                return QCAP_RS_ERROR_GENERAL;
-            }
-        }
-
-        uint8_t* src_ptrs[4];
-        int src_strides[4];
-        for (int i = 0; i < 4; ++i) {
-            src_ptrs[i] = in_ptrs[i];
-            src_strides[i] = in_strides[i];
-        }
-
-        // Swap U and V planes for YV12 and YV24
-        if (in_color == QCAP_COLORSPACE_TYPE_YV12 || in_color == QCAP_COLORSPACE_TYPE_YV24) {
-            std::swap(src_ptrs[1], src_ptrs[2]);
-            std::swap(src_strides[1], src_strides[2]);
-        }
-
-        int src_h = in_h;
-        if (p->crop_w > 0 && p->crop_h > 0) {
-            src_h = p->crop_h;
-            AVPixelFormat in_pix_fmt = qcap2_to_ffmpeg_pix_fmt(in_color);
-            if (in_pix_fmt != AV_PIX_FMT_NONE) {
-                if (in_pix_fmt == AV_PIX_FMT_RGB24 || in_pix_fmt == AV_PIX_FMT_BGR24) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 3;
-                } else if (in_pix_fmt == AV_PIX_FMT_ARGB || in_pix_fmt == AV_PIX_FMT_ABGR) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 4;
-                } else if (in_pix_fmt == AV_PIX_FMT_YUYV422 || in_pix_fmt == AV_PIX_FMT_UYVY422) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * 2;
-                } else if (in_pix_fmt == AV_PIX_FMT_GRAY8) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
-                } else if (in_pix_fmt == AV_PIX_FMT_YUV420P) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
-                    src_ptrs[1] += (p->crop_y / 2) * src_strides[1] + (p->crop_x / 2);
-                    src_ptrs[2] += (p->crop_y / 2) * src_strides[2] + (p->crop_x / 2);
-                } else if (in_pix_fmt == AV_PIX_FMT_YUV444P) {
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
-                    src_ptrs[1] += p->crop_y * src_strides[1] + p->crop_x;
-                    src_ptrs[2] += p->crop_y * src_strides[2] + p->crop_x;
-                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE || in_pix_fmt == AV_PIX_FMT_P210LE) {
-                    int bpp = (in_pix_fmt == AV_PIX_FMT_NV12) ? 1 : 2;
-                    src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * bpp;
-                    int chroma_y_div = (in_pix_fmt == AV_PIX_FMT_P210LE) ? 1 : 2;
-                    src_ptrs[1] += (p->crop_y / chroma_y_div) * src_strides[1] + p->crop_x * 2;
-                }
-            }
-        }
-
-        qcap2_rcbuffer_t* out_rc = get_output_buffer(p);
+    qcap2_rcbuffer_t* out_rc = get_output_buffer(p);
+    if (!out_rc) {
         qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
 
-        if (!out_rc) return QCAP_RS_ERROR_GENERAL;
+    QRESULT qres = p->backend->scale(pRCBuffer, out_rc, in_color, in_w, in_h, nPTS, dSampleTime, nFieldType, in_ptrs, in_strides);
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
 
-        PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
-        if (!out_data) {
-            qcap2_rcbuffer_release(out_rc);
-            return QCAP_RS_ERROR_GENERAL;
-        }
+    if (qres != QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(out_rc);
+        return qres;
+    }
 
-        qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
-        uint8_t* out_ptrs[4] = { nullptr };
-        int out_strides[4] = { 0 };
-        qcap2_av_frame_get_buffer1(out_frame, out_ptrs, out_strides);
+    p->output_queue.push(out_rc);
+    p->cv->notify_all();
 
-        uint8_t* dst_ptrs[4];
-        int dst_strides[4];
-        for (int i = 0; i < 4; ++i) {
-            dst_ptrs[i] = out_ptrs[i];
-            dst_strides[i] = out_strides[i];
-        }
-
-        // Swap U and V planes for YV12 and YV24 target outputs
-        if (p->out_color_space == QCAP_COLORSPACE_TYPE_YV12 || p->out_color_space == QCAP_COLORSPACE_TYPE_YV24) {
-            std::swap(dst_ptrs[1], dst_ptrs[2]);
-            std::swap(dst_strides[1], dst_strides[2]);
-        }
-
-        int ret = sws_scale(p->sws_ctx, src_ptrs, src_strides, 0, src_h, dst_ptrs, dst_strides);
-        if (ret < 0) {
-            qcap2_rcbuffer_unlock_data(out_rc);
-            qcap2_rcbuffer_release(out_rc);
-            return QCAP_RS_ERROR_GENERAL;
-        }
-
-        qcap2_av_frame_set_pts(out_frame, nPTS);
-        qcap2_av_frame_set_sample_time(out_frame, dSampleTime);
-        qcap2_av_frame_set_field_type(out_frame, nFieldType);
-
-        qcap2_rcbuffer_unlock_data(out_rc);
-
-        p->output_queue.push(out_rc);
-        p->cv->notify_all();
-
-        if (p->event) {
-            qcap2_event_notify(p->event);
-        }
+    if (p->event) {
+        qcap2_event_notify(p->event);
     }
 
     return QCAP_RS_SUCCESSFUL;

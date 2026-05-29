@@ -1,0 +1,6 @@
+#ifndef PYLONC_PYLONC_H
+#define PYLONC_PYLONC_H
+
+typedef void* PYLON_DEVICE_HANDLE;
+
+#endif // PYLONC_PYLONC_H

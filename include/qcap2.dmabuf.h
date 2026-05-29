@@ -18,15 +18,15 @@ struct qcap2_dmabuf_t {
 extern "C" {
 #endif /* __cplusplus */
 
-// qcap2_rcbuffer_t
-QRESULT qcap2_rcbuffer_set_qdmabuf(qcap2_rcbuffer_t* pRCBuffer, qcap2_dmabuf_t* pDMABuf);
-QRESULT qcap2_rcbuffer_get_qdmabuf(qcap2_rcbuffer_t* pRCBuffer, qcap2_dmabuf_t** ppDMABuf);
-QRESULT qcap2_rcbuffer_alloc_qdmabuf(qcap2_rcbuffer_t* pRCBuffer, int nSize, int nProt);
-QRESULT qcap2_rcbuffer_free_qdmabuf(qcap2_rcbuffer_t* pRCBuffer);
-QRESULT qcap2_rcbuffer_map_qdmabuf(qcap2_rcbuffer_t* pRCBuffer, int nProt);
-QRESULT qcap2_rcbuffer_unmap_qdmabuf(qcap2_rcbuffer_t* pRCBuffer);
-QRESULT qcap2_rcbuffer_alloc_mapped_qdmabuf(qcap2_rcbuffer_t* pRCBuffer, int nSize, int nProt);
-QRESULT qcap2_rcbuffer_free_mapped_qdmabuf(qcap2_rcbuffer_t* pRCBuffer);
+// qcap2_av_frame_t
+QRESULT qcap2_av_frame_set_dmabuf(qcap2_av_frame_t* pFrame, qcap2_dmabuf_t* pDMABuf);
+QRESULT qcap2_av_frame_get_dmabuf(qcap2_av_frame_t* pFrame, qcap2_dmabuf_t** ppDMABuf);
+QRESULT qcap2_av_frame_alloc_dmabuf(qcap2_av_frame_t* pFrame, int nSize, int nProt);
+QRESULT qcap2_av_frame_free_dmabuf(qcap2_av_frame_t* pFrame);
+QRESULT qcap2_av_frame_map_dmabuf(qcap2_av_frame_t* pFrame, int nProt);
+QRESULT qcap2_av_frame_unmap_dmabuf(qcap2_av_frame_t* pFrame);
+QRESULT qcap2_av_frame_alloc_mapped_dmabuf(qcap2_av_frame_t* pFrame, int nSize, int nProt);
+QRESULT qcap2_av_frame_free_mapped_dmabuf(qcap2_av_frame_t* pFrame);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 #include "qcap2.devices_priv.h"
 #include "qcap2.buffer.h"
 #include "qcap2.formats.h"
+#include "qcap2.dmabuf.h"
 #include <new>
 #include <vector>
 #include <mutex>
@@ -42,9 +43,7 @@ static uint32_t qcap_colorspace_to_v4l2(ULONG colorspace) {
     }
 }
 
-static void qcap2_v4l2_buffer_on_free(PVOID pData) {
-    (void)pData;
-}
+static void qcap2_v4l2_buffer_on_free(PVOID pData);
 
 struct qcap2_tpg_buffer_slot_t {
     uint8_t* raw_buffer;
@@ -286,6 +285,7 @@ struct qcap2_v4l2_buffer_slot_t {
     qcap2_av_frame_t frame;
     qcap2_rcbuffer_t* rcbuf;
     class qcap2_v4l2_video_source_backend_t* pSource;
+    bool bIsQueued;
 };
 
 class qcap2_v4l2_video_source_backend_t : public qcap2_video_source_backend_t {
@@ -307,6 +307,10 @@ private:
                 }
                 if (slot->pUserPtr) {
                     free(slot->pUserPtr);
+                }
+                qcap2_dmabuf_t* pDMABuf = nullptr;
+                if (qcap2_av_frame_get_dmabuf(&slot->frame, &pDMABuf) == QCAP_RS_SUCCESSFUL && pDMABuf) {
+                    free(pDMABuf);
                 }
                 if (slot->dma_fd >= 0) {
                     close(slot->dma_fd);
@@ -352,11 +356,10 @@ private:
                 if (buf.index < (uint32_t)self->slot_count) {
                     qcap2_v4l2_buffer_slot_t* slot = &self->slots[buf.index];
                     slot->v4l2_buf = buf;
+                    slot->bIsQueued = false;
 
                     qcap2_av_frame_set_pts(&slot->frame, buf.timestamp.tv_sec * 1000000LL + buf.timestamp.tv_usec);
                     qcap2_av_frame_set_sample_time(&slot->frame, buf.timestamp.tv_sec + buf.timestamp.tv_usec / 1000000.0);
-
-                    qcap2_rcbuffer_add_ref(slot->rcbuf);
 
                     QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, slot->rcbuf);
                     if (qres != QCAP_RS_SUCCESSFUL) {
@@ -450,6 +453,7 @@ public:
             slot->pUserPtr = nullptr;
             slot->dma_fd = -1;
             slot->nLength = buffer_size;
+            slot->bIsQueued = false;
             qcap2_av_frame_init(&slot->frame);
 
             memset(&slot->v4l2_buf, 0, sizeof(slot->v4l2_buf));
@@ -526,6 +530,17 @@ public:
                 qcap2_av_frame_set_buffer(&slot->frame, (uint8_t*)slot->pMappedMemory, stride);
             }
 
+            if (slot->dma_fd >= 0) {
+                qcap2_dmabuf_t* pDMABuf = (qcap2_dmabuf_t*)calloc(1, sizeof(qcap2_dmabuf_t));
+                if (pDMABuf) {
+                    pDMABuf->fd = slot->dma_fd;
+                    pDMABuf->dmabuf_size = slot->nLength;
+                    pDMABuf->pVirAddr = slot->pMappedMemory;
+                    pDMABuf->nSize = slot->nLength;
+                    qcap2_av_frame_set_dmabuf(&slot->frame, pDMABuf);
+                }
+            }
+
             slot->rcbuf = qcap2_rcbuffer_new(&slot->frame, qcap2_v4l2_buffer_on_free);
         }
 
@@ -547,6 +562,7 @@ public:
                 cleanup_slots(slot_count);
                 return QCAP_RS_ERROR_GENERAL;
             }
+            slots[i].bIsQueued = true;
         }
 
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -583,6 +599,32 @@ public:
         return QCAP_RS_SUCCESSFUL;
     }
 
+    void requeue_slot(qcap2_v4l2_buffer_slot_t* slot) {
+        if (!slot->bIsQueued) {
+            if (fd >= 0) {
+                struct v4l2_buffer buf;
+                memset(&buf, 0, sizeof(buf));
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory = p->v4l2_memory_val;
+                buf.index = slot->index;
+
+                if (buf.memory == V4L2_MEMORY_USERPTR) {
+                    buf.m.userptr = (unsigned long)slot->pUserPtr;
+                    buf.length = slot->nLength;
+                } else if (buf.memory == V4L2_MEMORY_DMABUF) {
+                    buf.m.fd = slot->dma_fd;
+                    buf.length = slot->nLength;
+                }
+
+                ioctl(fd, VIDIOC_QBUF, &buf);
+            }
+            slot->bIsQueued = true;
+        }
+
+        // Recreate the rcbuf since the previous one was deleted
+        slot->rcbuf = qcap2_rcbuffer_new(&slot->frame, qcap2_v4l2_buffer_on_free);
+    }
+
     QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override {
         PVOID pData = qcap2_rcbuffer_get_data(pRCBuffer);
         if (!pData) return QCAP_RS_ERROR_GENERAL;
@@ -594,30 +636,40 @@ public:
             return QCAP_RS_ERROR_GENERAL;
         }
 
-        if (fd >= 0) {
-            struct v4l2_buffer buf;
-            memset(&buf, 0, sizeof(buf));
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = p->v4l2_memory_val;
-            buf.index = slot->index;
+        if (!slot->bIsQueued) {
+            if (fd >= 0) {
+                struct v4l2_buffer buf;
+                memset(&buf, 0, sizeof(buf));
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory = p->v4l2_memory_val;
+                buf.index = slot->index;
 
-            if (buf.memory == V4L2_MEMORY_USERPTR) {
-                buf.m.userptr = (unsigned long)slot->pUserPtr;
-                buf.length = slot->nLength;
-            } else if (buf.memory == V4L2_MEMORY_DMABUF) {
-                buf.m.fd = slot->dma_fd;
-                buf.length = slot->nLength;
-            }
+                if (buf.memory == V4L2_MEMORY_USERPTR) {
+                    buf.m.userptr = (unsigned long)slot->pUserPtr;
+                    buf.length = slot->nLength;
+                } else if (buf.memory == V4L2_MEMORY_DMABUF) {
+                    buf.m.fd = slot->dma_fd;
+                    buf.length = slot->nLength;
+                }
 
-            if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-                return QCAP_RS_ERROR_GENERAL;
+                if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                    return QCAP_RS_ERROR_GENERAL;
+                }
             }
+            slot->bIsQueued = true;
         }
 
         qcap2_rcbuffer_release(pRCBuffer);
         return QCAP_RS_SUCCESSFUL;
     }
 };
+
+static void qcap2_v4l2_buffer_on_free(PVOID pData) {
+    if (!pData) return;
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+    qcap2_v4l2_buffer_slot_t* slot = qcap2_container_of(pFrame, qcap2_v4l2_buffer_slot_t, frame);
+    slot->pSource->requeue_slot(slot);
+}
 
 // qcap2_video_source_t implementation
 qcap2_video_source_t* qcap2_video_source_new() {

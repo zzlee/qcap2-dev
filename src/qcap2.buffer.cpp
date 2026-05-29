@@ -1,10 +1,14 @@
 #include "qcap2.buffer.h"
 #include "qcap2.user.h"
+#include "qcap2.dmabuf.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <atomic>
 #include <new>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +45,9 @@ typedef struct _qcap2_av_frame_priv_t {
     uint8_t* pBuffer[4];
     int pStride[4];
     bool bOwnsBuffer;
+
+    qcap2_dmabuf_t* pDMABuf;
+    bool bOwnsDMABuf;
 } qcap2_av_frame_priv_t;
 
 typedef struct _qcap2_av_packet_priv_t {
@@ -470,6 +477,7 @@ bool qcap2_av_frame_alloc_buffer(qcap2_av_frame_t* pFrame, int align, int valign
 void qcap2_av_frame_free_buffer(qcap2_av_frame_t* pFrame) {
     if (!pFrame) return;
     qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+    qcap2_av_frame_free_mapped_dmabuf(pFrame);
     if (p->bOwnsBuffer && p->pBuffer[0]) {
         free(p->pBuffer[0]);
     }
@@ -684,6 +692,133 @@ qcap2_rcbuffer_t* qcap2_rcbuffer_new_av_packet() {
         delete pOwner;
     }
     return pRCBuffer;
+}
+
+QRESULT qcap2_av_frame_set_dmabuf(qcap2_av_frame_t* pFrame, qcap2_dmabuf_t* pDMABuf) {
+    if (!pFrame) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+
+    if (p->pDMABuf) {
+        qcap2_av_frame_free_mapped_dmabuf(pFrame);
+    }
+
+    p->pDMABuf = pDMABuf;
+    p->bOwnsDMABuf = false;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_get_dmabuf(qcap2_av_frame_t* pFrame, qcap2_dmabuf_t** ppDMABuf) {
+    if (!pFrame || !ppDMABuf) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+    *ppDMABuf = p->pDMABuf;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_alloc_dmabuf(qcap2_av_frame_t* pFrame, int nSize, int nProt) {
+    (void)nProt;
+    if (!pFrame || nSize <= 0) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+
+    if (p->pDMABuf) {
+        qcap2_av_frame_free_dmabuf(pFrame);
+    }
+
+    qcap2_dmabuf_t* pDMABuf = (qcap2_dmabuf_t*)calloc(1, sizeof(qcap2_dmabuf_t));
+    if (!pDMABuf) return QCAP_RS_ERROR_OUT_OF_MEMORY;
+
+    char pathTemplate[] = "/tmp/qcap2-dmabuf-XXXXXX";
+    int fd = mkstemp(pathTemplate);
+    if (fd < 0) {
+        free(pDMABuf);
+        return QCAP_RS_ERROR_OUT_OF_RESOURCE;
+    }
+    unlink(pathTemplate);
+
+    if (ftruncate(fd, nSize) < 0) {
+        close(fd);
+        free(pDMABuf);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    pDMABuf->fd = fd;
+    pDMABuf->dmabuf_size = nSize;
+    pDMABuf->pVirAddr = nullptr;
+    pDMABuf->nPhyAddr = 0;
+    pDMABuf->nSize = nSize;
+
+    p->pDMABuf = pDMABuf;
+    p->bOwnsDMABuf = true;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_free_dmabuf(qcap2_av_frame_t* pFrame) {
+    if (!pFrame) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+    if (!p->pDMABuf) return QCAP_RS_SUCCESSFUL;
+
+    if (p->pDMABuf->pVirAddr) {
+        qcap2_av_frame_unmap_dmabuf(pFrame);
+    }
+
+    if (p->pDMABuf->fd >= 0) {
+        close(p->pDMABuf->fd);
+        p->pDMABuf->fd = -1;
+    }
+
+    if (p->bOwnsDMABuf) {
+        free(p->pDMABuf);
+    }
+
+    p->pDMABuf = nullptr;
+    p->bOwnsDMABuf = false;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_map_dmabuf(qcap2_av_frame_t* pFrame, int nProt) {
+    if (!pFrame) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+    if (!p->pDMABuf || p->pDMABuf->fd < 0) return QCAP_RS_ERROR_GENERAL;
+
+    if (p->pDMABuf->pVirAddr) return QCAP_RS_SUCCESSFUL;
+
+    void* addr = mmap(nullptr, p->pDMABuf->dmabuf_size, nProt, MAP_SHARED, p->pDMABuf->fd, 0);
+    if (addr == MAP_FAILED) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    p->pDMABuf->pVirAddr = addr;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_unmap_dmabuf(qcap2_av_frame_t* pFrame) {
+    if (!pFrame) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_av_frame_priv_t* p = (qcap2_av_frame_priv_t*)pFrame;
+    if (!p->pDMABuf) return QCAP_RS_SUCCESSFUL;
+    if (!p->pDMABuf->pVirAddr) return QCAP_RS_SUCCESSFUL;
+
+    if (munmap(p->pDMABuf->pVirAddr, p->pDMABuf->dmabuf_size) < 0) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    p->pDMABuf->pVirAddr = nullptr;
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_alloc_mapped_dmabuf(qcap2_av_frame_t* pFrame, int nSize, int nProt) {
+    QRESULT res = qcap2_av_frame_alloc_dmabuf(pFrame, nSize, nProt);
+    if (res != QCAP_RS_SUCCESSFUL) return res;
+
+    res = qcap2_av_frame_map_dmabuf(pFrame, nProt);
+    if (res != QCAP_RS_SUCCESSFUL) {
+        qcap2_av_frame_free_dmabuf(pFrame);
+        return res;
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_av_frame_free_mapped_dmabuf(qcap2_av_frame_t* pFrame) {
+    return qcap2_av_frame_free_dmabuf(pFrame);
 }
 
 #ifdef __cplusplus

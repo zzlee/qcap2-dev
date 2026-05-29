@@ -1,11 +1,13 @@
 #include "qcap2.buffer.h"
 #include "qcap2.user.h"
+#include "qcap2.dmabuf.h"
 #include <stdio.h>
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 void test_qcap2_av_frame() {
     qcap2_av_frame_t frame;
@@ -300,6 +302,68 @@ void test_qcap2_rcbuffer_new_av_packet() {
     qcap2_rcbuffer_release(rcbuf);
 }
 
+void test_qcap2_av_frame_dmabuf() {
+    qcap2_av_frame_t frame;
+    qcap2_av_frame_init(&frame);
+
+    QRESULT res = qcap2_av_frame_alloc_dmabuf(&frame, 1024, PROT_READ | PROT_WRITE);
+    assert(res == QCAP_RS_SUCCESSFUL);
+
+    qcap2_dmabuf_t* dmabuf = NULL;
+    res = qcap2_av_frame_get_dmabuf(&frame, &dmabuf);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    assert(dmabuf != NULL);
+    assert(dmabuf->fd >= 0);
+    assert(dmabuf->dmabuf_size == 1024);
+    assert(dmabuf->nSize == 1024);
+    assert(dmabuf->pVirAddr == NULL);
+
+    res = qcap2_av_frame_map_dmabuf(&frame, PROT_READ | PROT_WRITE);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    assert(dmabuf->pVirAddr != NULL);
+
+    uint8_t* ptr = (uint8_t*)dmabuf->pVirAddr;
+    ptr[0] = 0xAA;
+    ptr[1023] = 0x55;
+    assert(ptr[0] == 0xAA);
+    assert(ptr[1023] == 0x55);
+
+    res = qcap2_av_frame_unmap_dmabuf(&frame);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    assert(dmabuf->pVirAddr == NULL);
+
+    res = qcap2_av_frame_free_dmabuf(&frame);
+    assert(res == QCAP_RS_SUCCESSFUL);
+
+    res = qcap2_av_frame_alloc_mapped_dmabuf(&frame, 512, PROT_READ | PROT_WRITE);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    res = qcap2_av_frame_get_dmabuf(&frame, &dmabuf);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    assert(dmabuf != NULL);
+    assert(dmabuf->pVirAddr != NULL);
+    assert(dmabuf->dmabuf_size == 512);
+
+    qcap2_av_frame_free_buffer(&frame);
+
+    qcap2_av_frame_t frame2;
+    qcap2_av_frame_init(&frame2);
+    qcap2_dmabuf_t external_dmabuf;
+    memset(&external_dmabuf, 0, sizeof(external_dmabuf));
+    external_dmabuf.fd = 9999;
+    external_dmabuf.dmabuf_size = 256;
+
+    res = qcap2_av_frame_set_dmabuf(&frame2, &external_dmabuf);
+    assert(res == QCAP_RS_SUCCESSFUL);
+
+    qcap2_dmabuf_t* retrieved = NULL;
+    res = qcap2_av_frame_get_dmabuf(&frame2, &retrieved);
+    assert(res == QCAP_RS_SUCCESSFUL);
+    assert(retrieved == &external_dmabuf);
+    assert(retrieved->fd == 9999);
+
+    qcap2_av_frame_free_buffer(&frame2);
+}
+
 int main() {
     test_qcap2_av_frame();
     test_qcap2_av_frame_copy();
@@ -310,6 +374,7 @@ int main() {
     test_qcap2_rcbuffer_embedded_av_frame_free_callback();
     test_qcap2_rcbuffer_new_av_frame();
     test_qcap2_rcbuffer_new_av_packet();
+    test_qcap2_av_frame_dmabuf();
     printf("All tests passed!\n");
     return 0;
 }

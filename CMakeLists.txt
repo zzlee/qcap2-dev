@@ -67,6 +67,21 @@ if(AVFORMAT_LIB AND AVCODEC_LIB AND AVUTIL_LIB)
     qcap2_add_module(qcap2_demuxer qcap2.demuxer src/qcap2.demuxer.cpp)
     target_link_libraries(qcap2_demuxer PUBLIC
         qcap2_devices
+        qcap2_processing
+        qcap2_sync
+        qcap2_buffer
+        qcap2_formats
+        Threads::Threads
+        ${AVFORMAT_LIB}
+        ${AVCODEC_LIB}
+        ${AVUTIL_LIB}
+    )
+
+    message(STATUS "FFmpeg avformat/avcodec/avutil found. Building libqcap2.muxer.so.")
+    qcap2_add_module(qcap2_muxer qcap2.muxer src/qcap2.muxer.cpp)
+    target_link_libraries(qcap2_muxer PUBLIC
+        qcap2_devices
+        qcap2_processing
         qcap2_sync
         qcap2_buffer
         qcap2_formats
@@ -76,7 +91,7 @@ if(AVFORMAT_LIB AND AVCODEC_LIB AND AVUTIL_LIB)
         ${AVUTIL_LIB}
     )
 else()
-    message(WARNING "FFmpeg avformat/avcodec/avutil NOT found. Skipping libqcap2.demuxer.so and test_qcap2_demuxer.")
+    message(WARNING "FFmpeg avformat/avcodec/avutil NOT found. Skipping libqcap2.demuxer.so/muxer.so and tests.")
 endif()
 
 if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB AND AVCODEC_LIB)
@@ -126,9 +141,18 @@ qcap2_add_test(test_qcap2_buffer qcap2_buffer)
 qcap2_add_test(test_qcap2_formats qcap2_formats)
 qcap2_add_test(test_qcap2_utils qcap2_utils qcap2_buffer)
 qcap2_add_test(test_qcap2_sync qcap2_sync qcap2_devices qcap2_formats qcap2_buffer Threads::Threads)
+qcap2_add_test(test_qcap2_audio_sink qcap2_devices qcap2_formats qcap2_buffer Threads::Threads)
 
 if(TARGET qcap2_demuxer)
-    qcap2_add_test(test_qcap2_demuxer qcap2_demuxer qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+    qcap2_add_test(test_qcap2_demuxer qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+endif()
+
+if(TARGET qcap2_muxer)
+    qcap2_add_test(test_qcap2_muxer qcap2_muxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+endif()
+
+if(TARGET qcap2_demuxer AND TARGET qcap2_muxer)
+    qcap2_add_test(test_qcap2_demux_mux qcap2_muxer qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
 endif()
 
 if(TARGET qcap2_processing)

@@ -326,55 +326,7 @@ static enum AVCodecID qcap2_audio_format_to_ffmpeg_codec_id(ULONG nEncoderFormat
     }
 }
 
-typedef struct qcap2_audio_encoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    qcap2_audio_encoder_property_t* property;
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    int max_frames;
-    int packet_count;
-    bool multithread;
-    qcap2_event_t* event;
-
-    AVCodecContext* avctx;
-    bool running;
-
-    qcap2_audio_encoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        property = qcap2_audio_encoder_property_new();
-        extra_data = nullptr;
-        extra_data_size = 0;
-        max_frames = 0;
-        packet_count = 0;
-        multithread = false;
-        event = nullptr;
-        avctx = nullptr;
-        running = false;
-    }
-
-    ~qcap2_audio_encoder_priv_t() {
-        if (property) {
-            qcap2_audio_encoder_property_delete(property);
-        }
-        if (extra_data) {
-            delete[] extra_data;
-        }
-        if (avctx) {
-            avcodec_free_context(&avctx);
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        delete cv;
-        delete mtx;
-    }
-} qcap2_audio_encoder_priv_t;
+#include "qcap2.processing_priv.h"
 
 qcap2_audio_encoder_t* qcap2_audio_encoder_new() {
     qcap2_audio_encoder_priv_t* p = new qcap2_audio_encoder_priv_t;
@@ -688,57 +640,7 @@ QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t**
 // qcap2_audio_decoder_t Implementation
 // ==============================================================================
 
-typedef struct qcap2_audio_decoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    qcap2_audio_encoder_property_t* property;
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    int max_frames;
-    int packet_count;
-    bool multithread;
-    qcap2_event_t* event;
-
-    int payload_type;
-    AVCodecContext* avctx;
-    bool running;
-
-    qcap2_audio_decoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        property = qcap2_audio_encoder_property_new();
-        extra_data = nullptr;
-        extra_data_size = 0;
-        max_frames = 0;
-        packet_count = 0;
-        multithread = false;
-        event = nullptr;
-        payload_type = 0;
-        avctx = nullptr;
-        running = false;
-    }
-
-    ~qcap2_audio_decoder_priv_t() {
-        if (property) {
-            qcap2_audio_encoder_property_delete(property);
-        }
-        if (extra_data) {
-            delete[] extra_data;
-        }
-        if (avctx) {
-            avcodec_free_context(&avctx);
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        delete cv;
-        delete mtx;
-    }
-} qcap2_audio_decoder_priv_t;
+// qcap2_audio_decoder_priv_t moved to qcap2.processing_priv.h
 
 qcap2_audio_decoder_t* qcap2_audio_decoder_new() {
     qcap2_audio_decoder_priv_t* p = new qcap2_audio_decoder_priv_t;
@@ -853,6 +755,11 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
+    if (p->bypass_decoding) {
+        p->running = true;
+        return QCAP_RS_SUCCESSFUL;
+    }
+
     ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
     qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
 
@@ -904,6 +811,10 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
         qcap2_rcbuffer_release(p->output_queue.front());
         p->output_queue.pop();
     }
+    while (!p->input_queue.empty()) {
+        qcap2_rcbuffer_release(p->input_queue.front());
+        p->input_queue.pop();
+    }
     p->cv->notify_all();
     return QCAP_RS_SUCCESSFUL;
 }
@@ -911,6 +822,22 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
 QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+
+    if (p->bypass_decoding) {
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (!p->running) return QCAP_RS_ERROR_GENERAL;
+        qcap2_rcbuffer_add_ref(pRCBuffer);
+        p->input_queue.push(pRCBuffer);
+        p->cv->notify_all();
+        if (p->notify_cv) {
+            std::lock_guard<std::mutex> lock2(*p->notify_mtx);
+            p->notify_cv->notify_all();
+        }
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
     if (!pData) return QCAP_RS_ERROR_GENERAL;
@@ -2232,104 +2159,7 @@ static enum AVCodecID qcap2_encoder_format_to_codec_id(ULONG nEncoderFormat) {
     }
 }
 
-typedef struct qcap2_video_encoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    // Encoder property (owned reference)
-    qcap2_video_encoder_property_t* enc_prop;
-
-    // Dynamic property (owned reference)
-    qcap2_video_encoder_dynamic_property_t* dyn_prop;
-
-    // Extra data
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    // Configuration
-    int frame_count;
-    int frame_align;
-    int frame_valign;
-    int packet_count;
-    int max_packet_size;
-    bool multithread;
-    qcap2_event_t* event;
-    int num_cores;
-    bool native_buffer;
-    std::atomic<bool> request_idr;
-
-    // FFmpeg encoder context
-    const AVCodec* codec;
-    AVCodecContext* codec_ctx;
-    SwsContext* sws_ctx; // for input pixel format conversion if needed
-
-    // Running state
-    bool running;
-    int64_t frame_counter;
-
-    // Cached input format for sws reinitialization
-    ULONG cached_in_color;
-    ULONG cached_in_w;
-    ULONG cached_in_h;
-
-    qcap2_video_encoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        enc_prop = nullptr;
-        dyn_prop = nullptr;
-        extra_data = nullptr;
-        extra_data_size = 0;
-        frame_count = 4;
-        frame_align = 16;
-        frame_valign = 1;
-        packet_count = 8;
-        max_packet_size = 0;
-        multithread = false;
-        event = nullptr;
-        num_cores = 0;
-        native_buffer = false;
-        request_idr.store(false);
-        codec = nullptr;
-        codec_ctx = nullptr;
-        sws_ctx = nullptr;
-        running = false;
-        frame_counter = 0;
-        cached_in_color = 0;
-        cached_in_w = 0;
-        cached_in_h = 0;
-    }
-
-    ~qcap2_video_encoder_priv_t() {
-        cleanup();
-        if (enc_prop) { qcap2_video_encoder_property_delete(enc_prop); enc_prop = nullptr; }
-        if (dyn_prop) { qcap2_video_encoder_dynamic_property_delete(dyn_prop); dyn_prop = nullptr; }
-        if (extra_data) { free(extra_data); extra_data = nullptr; }
-        delete cv;
-        delete mtx;
-    }
-
-    void cleanup() {
-        if (codec_ctx) {
-            avcodec_free_context(&codec_ctx);
-            codec_ctx = nullptr;
-        }
-        codec = nullptr;
-        if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-            sws_ctx = nullptr;
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_t* buf = output_queue.front();
-            output_queue.pop();
-            qcap2_rcbuffer_release(buf);
-        }
-        frame_counter = 0;
-        cached_in_color = 0;
-        cached_in_w = 0;
-        cached_in_h = 0;
-    }
-} qcap2_video_encoder_priv_t;
+// qcap2_video_encoder_priv_t moved to qcap2.processing_priv.h
 
 static bool init_encoder(qcap2_video_encoder_priv_t* p) {
     if (!p->enc_prop) return false;
@@ -3047,114 +2877,7 @@ static enum AVCodecID qcap2_decoder_format_to_codec_id(ULONG nEncoderFormat) {
     }
 }
 
-struct qcap2_video_decoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    // Decoder property (owned copy of encoder properties defining output/stream properties)
-    qcap2_video_encoder_property_t* dec_prop;
-
-    // Extra data (SPS/PPS/VPS)
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    // Configuration / Hints
-    int frame_count;
-    int frame_align;
-    int frame_valign;
-    int packet_count;
-    int max_packet_size;
-    bool multithread;
-    qcap2_event_t* event;
-    int payload_type;
-
-    // Registered output buffers for recycling
-    std::vector<qcap2_rcbuffer_t*> registered_buffers;
-
-    // FFmpeg decoder context
-    const AVCodec* codec;
-    AVCodecContext* codec_ctx;
-    SwsContext* sws_ctx; // for output format conversion/scaling if needed
-
-    // Running state
-    bool running;
-
-    // Target properties (resolution/colorspace we want to convert the decoded frame into)
-    ULONG target_color;
-    ULONG target_width;
-    ULONG target_height;
-
-    // Sws conversion state
-    ULONG sws_src_color;
-    ULONG sws_src_w;
-    ULONG sws_src_h;
-
-    qcap2_video_decoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        dec_prop = nullptr;
-        extra_data = nullptr;
-        extra_data_size = 0;
-        frame_count = 4;
-        frame_align = 16;
-        frame_valign = 1;
-        packet_count = 8;
-        max_packet_size = 0;
-        multithread = false;
-        event = nullptr;
-        payload_type = 0;
-        codec = nullptr;
-        codec_ctx = nullptr;
-        sws_ctx = nullptr;
-        running = false;
-
-        target_color = QCAP_COLORSPACE_TYPE_I420; // default output colorspace
-        target_width = 0;
-        target_height = 0;
-
-        sws_src_color = 0;
-        sws_src_w = 0;
-        sws_src_h = 0;
-    }
-
-    ~qcap2_video_decoder_priv_t() {
-        cleanup();
-        if (dec_prop) {
-            qcap2_video_encoder_property_delete(dec_prop);
-            dec_prop = nullptr;
-        }
-        if (extra_data) {
-            free(extra_data);
-            extra_data = nullptr;
-        }
-        for (auto buf : registered_buffers) {
-            qcap2_rcbuffer_release(buf);
-        }
-        registered_buffers.clear();
-        delete cv;
-        delete mtx;
-    }
-
-    void cleanup() {
-        if (codec_ctx) {
-            avcodec_free_context(&codec_ctx);
-            codec_ctx = nullptr;
-        }
-        codec = nullptr;
-        if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-            sws_ctx = nullptr;
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        sws_src_color = 0;
-        sws_src_w = 0;
-        sws_src_h = 0;
-    }
-};
+// qcap2_video_decoder_priv_t moved to qcap2.processing_priv.h
 
 static bool init_decoder(qcap2_video_decoder_priv_t* p) {
     if (!p->dec_prop) return false;
@@ -3595,6 +3318,11 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
+    if (p->bypass_decoding) {
+        p->running = true;
+        return QCAP_RS_SUCCESSFUL;
+    }
+
     if (!init_decoder(p)) {
         return QCAP_RS_ERROR_GENERAL;
     }
@@ -3609,6 +3337,16 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    if (p->bypass_decoding) {
+        p->running = false;
+        while (!p->input_queue.empty()) {
+            qcap2_rcbuffer_release(p->input_queue.front());
+            p->input_queue.pop();
+        }
+        p->cv->notify_all();
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     // Flush the decoder
     if (p->codec_ctx) {
@@ -3625,6 +3363,22 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
 QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+
+    if (p->bypass_decoding) {
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (!p->running) return QCAP_RS_ERROR_GENERAL;
+        qcap2_rcbuffer_add_ref(pRCBuffer);
+        p->input_queue.push(pRCBuffer);
+        p->cv->notify_all();
+        if (p->notify_cv) {
+            std::lock_guard<std::mutex> lock2(*p->notify_mtx);
+            p->notify_cv->notify_all();
+        }
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
     if (!pData) return QCAP_RS_ERROR_GENERAL;

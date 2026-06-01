@@ -364,6 +364,80 @@ void test_qcap2_av_frame_dmabuf() {
     qcap2_av_frame_free_buffer(&frame2);
 }
 
+struct MockV4L2Slot {
+    int index;
+    int dma_fd;
+    bool bIsQueued;
+    qcap2_av_frame_t frame;
+    qcap2_rcbuffer_t* rcbuf;
+    int requeue_count;
+
+    MockV4L2Slot() : index(0), dma_fd(-1), bIsQueued(false), rcbuf(nullptr), requeue_count(0) {
+        qcap2_av_frame_init(&frame);
+    }
+};
+
+static void mock_v4l2_buffer_on_free(PVOID pData);
+
+void mock_requeue_slot(MockV4L2Slot* slot) {
+    if (!slot->bIsQueued) {
+        slot->bIsQueued = true;
+        slot->requeue_count++;
+    }
+    slot->rcbuf = qcap2_rcbuffer_new(&slot->frame, mock_v4l2_buffer_on_free);
+}
+
+static void mock_v4l2_buffer_on_free(PVOID pData) {
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+    MockV4L2Slot* slot = qcap2_container_of(pFrame, MockV4L2Slot, frame);
+    mock_requeue_slot(slot);
+}
+
+void test_v4l2_reference_counting_and_pinning() {
+    MockV4L2Slot slot;
+    slot.index = 0;
+    slot.dma_fd = 100;
+    slot.bIsQueued = true;
+
+    slot.rcbuf = qcap2_rcbuffer_new(&slot.frame, mock_v4l2_buffer_on_free);
+    assert(slot.rcbuf != nullptr);
+    assert(qcap2_rcbuffer_use_count(slot.rcbuf) == 1);
+    assert(qcap2_rcbuffer_res_count(slot.rcbuf) == 1);
+
+    slot.bIsQueued = false; 
+
+    qcap2_rcbuffer_release(slot.rcbuf);
+
+    assert(slot.bIsQueued == true);
+    assert(slot.requeue_count == 1);
+    assert(slot.rcbuf != nullptr);
+    assert(qcap2_rcbuffer_use_count(slot.rcbuf) == 1); 
+
+    slot.bIsQueued = false;
+    qcap2_rcbuffer_t* active_rcbuf = slot.rcbuf;
+
+    void* payload = qcap2_rcbuffer_lock_data(active_rcbuf);
+    assert(payload == &slot.frame);
+    assert(qcap2_rcbuffer_use_count(active_rcbuf) == 1);
+    assert(qcap2_rcbuffer_res_count(active_rcbuf) == 2);
+
+    qcap2_rcbuffer_release(active_rcbuf);
+
+    assert(slot.bIsQueued == false);
+    assert(slot.requeue_count == 1);
+    assert(qcap2_rcbuffer_use_count(active_rcbuf) == 0);
+    assert(qcap2_rcbuffer_res_count(active_rcbuf) == 1);
+
+    qcap2_rcbuffer_unlock_data(active_rcbuf);
+
+    assert(slot.bIsQueued == true);
+    assert(slot.requeue_count == 2);
+    assert(slot.rcbuf != active_rcbuf);
+    assert(qcap2_rcbuffer_use_count(slot.rcbuf) == 1);
+
+    qcap2_rcbuffer_release(slot.rcbuf);
+}
+
 int main() {
     test_qcap2_av_frame();
     test_qcap2_av_frame_copy();
@@ -375,6 +449,7 @@ int main() {
     test_qcap2_rcbuffer_new_av_frame();
     test_qcap2_rcbuffer_new_av_packet();
     test_qcap2_av_frame_dmabuf();
+    test_v4l2_reference_counting_and_pinning();
     printf("All tests passed!\n");
     return 0;
 }

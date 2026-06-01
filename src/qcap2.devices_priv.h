@@ -106,4 +106,50 @@ struct qcap2_audio_source_priv_t {
     ~qcap2_audio_source_priv_t();
 };
 
+class qcap2_audio_sink_backend_t {
+public:
+    virtual ~qcap2_audio_sink_backend_t() = default;
+    virtual QRESULT start() = 0;
+    virtual QRESULT stop() = 0;
+    virtual QRESULT push(qcap2_rcbuffer_t* pRCBuffer) = 0;
+};
+
+struct qcap2_audio_sink_priv_t {
+    qcap2_rcbuffer_queue_t* queue;
+
+    // Configuration
+    int backend_type;
+    int card;
+    int device;
+    int period_time;
+    int buffer_time;
+
+    // Audio format properties
+    ULONG channels;
+    ULONG sample_fmt;
+    ULONG sample_frequency;
+    ULONG frame_size;
+
+    qcap2_audio_sink_backend_t* backend;
+
+    qcap2_audio_sink_priv_t() {
+        queue = qcap2_rcbuffer_queue_new();
+        if (queue) {
+            qcap2_rcbuffer_queue_start(queue);
+        }
+        backend_type = 0;
+        card = 0;
+        device = 0;
+        period_time = 0;
+        buffer_time = 0;
+        channels = 0;
+        sample_fmt = 0;
+        sample_frequency = 0;
+        frame_size = 0;
+        backend = nullptr;
+    }
+
+    ~qcap2_audio_sink_priv_t();
+};
+
 #endif // QCAP2_DEVICES_PRIV_H

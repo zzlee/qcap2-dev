@@ -1194,6 +1194,108 @@ QRESULT qcap2_audio_source_pop(qcap2_audio_source_t* pThis, qcap2_rcbuffer_t** p
     return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
 }
 
+class qcap2_alsa_audio_sink_backend_t : public qcap2_audio_sink_backend_t {
+private:
+    qcap2_audio_sink_priv_t* p;
+    int fd;
+    std::thread* playback_thread;
+    std::atomic<bool> thread_running;
+
+    static void playback_thread_func(qcap2_alsa_audio_sink_backend_t* self) {
+        while (self->thread_running.load(std::memory_order_acquire)) {
+            qcap2_rcbuffer_t* rcbuf = nullptr;
+            QRESULT qres = qcap2_rcbuffer_queue_pop(self->p->queue, &rcbuf);
+            if (qres == QCAP_RS_SUCCESSFUL && rcbuf) {
+                PVOID pData = qcap2_rcbuffer_lock_data(rcbuf);
+                if (pData) {
+                    qcap2_av_frame_t* frame = (qcap2_av_frame_t*)pData;
+                    uint8_t* pBuf = nullptr;
+                    int nSize = 0;
+                    qcap2_av_frame_get_buffer(frame, &pBuf, &nSize);
+                    if (pBuf && nSize > 0) {
+                        ssize_t bytes_written = write(self->fd, pBuf, nSize);
+                        (void)bytes_written;
+                    }
+                    qcap2_rcbuffer_unlock_data(rcbuf);
+                }
+                qcap2_rcbuffer_release(rcbuf);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+    }
+
+public:
+    qcap2_alsa_audio_sink_backend_t(qcap2_audio_sink_priv_t* owner)
+        : p(owner), fd(-1), playback_thread(nullptr) {
+        thread_running.store(false);
+    }
+
+    ~qcap2_alsa_audio_sink_backend_t() override {
+        stop();
+    }
+
+    QRESULT start() override {
+        if (thread_running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        char dev_path[64];
+        snprintf(dev_path, sizeof(dev_path), "/dev/snd/pcmC%dD%dp", p->card, p->device);
+
+        fd = open(dev_path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        thread_running.store(true, std::memory_order_release);
+        playback_thread = new (std::nothrow) std::thread(playback_thread_func, this);
+        if (!playback_thread) {
+            close(fd);
+            fd = -1;
+            thread_running.store(false);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        if (!thread_running.load(std::memory_order_acquire)) return QCAP_RS_SUCCESSFUL;
+
+        thread_running.store(false, std::memory_order_release);
+        
+        qcap2_rcbuffer_queue_stop(p->queue);
+
+        if (playback_thread && playback_thread->joinable()) {
+            playback_thread->join();
+            delete playback_thread;
+            playback_thread = nullptr;
+        }
+
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override {
+        return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer);
+    }
+};
+
+qcap2_audio_sink_priv_t::~qcap2_audio_sink_priv_t() {
+    qcap2_audio_sink_stop(reinterpret_cast<qcap2_audio_sink_t*>(this));
+    if (backend) {
+        delete backend;
+        backend = nullptr;
+    }
+    if (queue) {
+        qcap2_rcbuffer_queue_delete(queue);
+        queue = nullptr;
+    }
+}
+
 extern "C" {
 
 // V4L2 APIs
@@ -1260,6 +1362,125 @@ const char* qcap2_video_source_get_v4l2_sg_name(qcap2_video_source_t* pThis, int
         return priv->v4l2_sg_names[index];
     }
     return nullptr;
+}
+
+// ==============================================================================
+// qcap2_audio_sink_t C APIs
+// ==============================================================================
+
+qcap2_audio_sink_t* qcap2_audio_sink_new() {
+    qcap2_audio_sink_priv_t* priv = new (std::nothrow) qcap2_audio_sink_priv_t();
+    return reinterpret_cast<qcap2_audio_sink_t*>(priv);
+}
+
+void qcap2_audio_sink_delete(qcap2_audio_sink_t* pThis) {
+    if (pThis) {
+        delete reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+    }
+}
+
+void qcap2_audio_sink_set_backend_type(qcap2_audio_sink_t* pThis, int nBackendType) {
+    if (pThis) {
+        reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis)->backend_type = nBackendType;
+    }
+}
+
+void qcap2_audio_sink_set_audio_format(qcap2_audio_sink_t* pThis, qcap2_audio_format_t* pAudioFormat) {
+    if (pThis && pAudioFormat) {
+        qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+        ULONG channels = 0, bits = 0, freq = 0;
+        qcap2_audio_format_get_property(pAudioFormat, &channels, &bits, &freq);
+        priv->channels = channels;
+        priv->sample_fmt = bits;
+        priv->sample_frequency = freq;
+    }
+}
+
+void qcap2_audio_sink_set_period_time(qcap2_audio_sink_t* pThis, int nPeriodTime) {
+    if (pThis) {
+        reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis)->period_time = nPeriodTime;
+    }
+}
+
+void qcap2_audio_sink_set_buffer_time(qcap2_audio_sink_t* pThis, int nBufferTime) {
+    if (pThis) {
+        reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis)->buffer_time = nBufferTime;
+    }
+}
+
+void qcap2_audio_sink_set_card(qcap2_audio_sink_t* pThis, int nCard) {
+    if (pThis) {
+        reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis)->card = nCard;
+    }
+}
+
+void qcap2_audio_sink_set_device(qcap2_audio_sink_t* pThis, int nDevice) {
+    if (pThis) {
+        reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis)->device = nDevice;
+    }
+}
+
+QRESULT qcap2_audio_sink_start(qcap2_audio_sink_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+    
+    if (priv->backend) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_start(priv->queue);
+
+    if (priv->backend_type == QCAP2_AUDIO_SINK_BACKEND_TYPE_ALSA) {
+        priv->backend = new (std::nothrow) qcap2_alsa_audio_sink_backend_t(priv);
+        if (!priv->backend) return QCAP_RS_ERROR_OUT_OF_MEMORY;
+        QRESULT qr = priv->backend->start();
+        if (qr != QCAP_RS_SUCCESSFUL) {
+            delete priv->backend;
+            priv->backend = nullptr;
+            return qr;
+        }
+    } else {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_sink_stop(qcap2_audio_sink_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+
+    qcap2_rcbuffer_queue_stop(priv->queue);
+
+    if (priv->backend) {
+        priv->backend->stop();
+        delete priv->backend;
+        priv->backend = nullptr;
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_sink_pop(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+    return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_sink_push(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
+    if (priv->backend) {
+        return priv->backend->push(pRCBuffer);
+    }
+    return qcap2_rcbuffer_queue_push(priv->queue, pRCBuffer);
+}
+
+// alsa.h specific audio sink APIs
+void qcap2_audio_sink_set_alsa_card(qcap2_audio_sink_t* pThis, int nCard) {
+    qcap2_audio_sink_set_card(pThis, nCard);
+}
+
+void qcap2_audio_sink_set_alsa_device(qcap2_audio_sink_t* pThis, int nDevice) {
+    qcap2_audio_sink_set_device(pThis, nDevice);
 }
 
 }

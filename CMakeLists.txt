@@ -142,9 +142,11 @@ qcap2_add_test(test_qcap2_formats qcap2_formats)
 qcap2_add_test(test_qcap2_utils qcap2_utils qcap2_buffer)
 qcap2_add_test(test_qcap2_sync qcap2_sync qcap2_devices qcap2_formats qcap2_buffer Threads::Threads)
 qcap2_add_test(test_qcap2_audio_sink qcap2_devices qcap2_formats qcap2_buffer Threads::Threads)
+qcap2_add_test(test_qcap2_video_sink qcap2_devices qcap2_formats qcap2_buffer Threads::Threads)
 
 if(TARGET qcap2_demuxer)
     qcap2_add_test(test_qcap2_demuxer qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+    qcap2_add_test(test_qcap2_demuxer_rtsp qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
 endif()
 
 if(TARGET qcap2_muxer)

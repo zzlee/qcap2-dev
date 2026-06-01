@@ -149,6 +149,12 @@ qcap2_program_info_t* qcap2_demuxer_get_program_info(qcap2_demuxer_t* pThis, int
 QRESULT qcap2_demuxer_play(qcap2_demuxer_t* pThis);
 QRESULT qcap2_demuxer_update(qcap2_demuxer_t* pThis); // to sync status (progs, vsrc, asrc, venc, aenc)
 
+// RTSP-specific demuxer configuration (only valid when type is QCAP2_DEMUXER_TYPE_RTSP)
+void qcap2_demuxer_set_rtsp_timeout(qcap2_demuxer_t* pThis, int nTimeoutMs);
+void qcap2_demuxer_set_rtsp_reconnect(qcap2_demuxer_t* pThis, int nMaxAttempts, int nDelayMs);
+void qcap2_demuxer_set_rtsp_user_agent(qcap2_demuxer_t* pThis, const char* strUserAgent);
+void qcap2_demuxer_set_rtsp_keep_alive(qcap2_demuxer_t* pThis, int nIntervalMs);
+
 // qcap2_muxer_t
 qcap2_muxer_t* qcap2_muxer_new();
 void qcap2_muxer_delete(qcap2_muxer_t* pThis);

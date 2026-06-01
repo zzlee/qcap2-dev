@@ -152,4 +152,75 @@ struct qcap2_audio_sink_priv_t {
     ~qcap2_audio_sink_priv_t();
 };
 
+class qcap2_video_sink_backend_t {
+public:
+    virtual ~qcap2_video_sink_backend_t() = default;
+    virtual QRESULT start() = 0;
+    virtual QRESULT stop() = 0;
+    virtual QRESULT push(qcap2_rcbuffer_t* pRCBuffer) = 0;
+};
+
+struct qcap2_video_sink_priv_t {
+    qcap2_rcbuffer_queue_t* queue;
+
+    // Configuration
+    int backend_type;
+    int frame_count;
+    bool multithread;
+    uintptr_t native_handle;
+    bool low_bandwidth;
+    int display_system;
+    int graphic_window_system;
+    bool gpu_direct;
+    ULONG scale_style;
+    int device_index;
+    int src_ss_type;
+    int dst_ss_type;
+
+    // Video format properties
+    ULONG color_space;
+    ULONG width;
+    ULONG height;
+    double frame_rate;
+
+    // V4L2 properties
+    char v4l2_name[256];
+    int v4l2_buf_type_val;
+    int v4l2_memory_val;
+
+    qcap2_video_sink_backend_t* backend;
+
+    qcap2_video_sink_priv_t() {
+        queue = qcap2_rcbuffer_queue_new();
+        if (queue) {
+            qcap2_rcbuffer_queue_start(queue);
+        }
+        backend_type = 0;
+        frame_count = 0;
+        multithread = false;
+        native_handle = 0;
+        low_bandwidth = false;
+        display_system = 0;
+        graphic_window_system = 0;
+        gpu_direct = false;
+        scale_style = 0;
+        device_index = 0;
+        src_ss_type = 0;
+        dst_ss_type = 0;
+
+        color_space = 0;
+        width = 0;
+        height = 0;
+        frame_rate = 0.0;
+
+        memset(v4l2_name, 0, sizeof(v4l2_name));
+        v4l2_buf_type_val = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        v4l2_memory_val = V4L2_MEMORY_MMAP;
+
+        backend = nullptr;
+    }
+
+    ~qcap2_video_sink_priv_t();
+};
+
 #endif // QCAP2_DEVICES_PRIV_H

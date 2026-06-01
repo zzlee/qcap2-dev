@@ -78,11 +78,21 @@ This document tracks the implementation status of all backend types defined in `
 ---
 
 ## 5. Video Sink Module (`qcap2_video_sink_t`)
-**Implementation File**: **[NOT IMPLEMENTED]** (Header declarations in [include/qcap2.devices.h](file:///home/zzlee/docker/qcap2-dev/include/qcap2.devices.h))
-**Status Summary**: The entire Video Sink module is a stub.
-- [ ] **`qcap2_video_sink_t` Struct & APIs** — **[TOTAL TODO]**
-  - *TODO*: Implement structure and all public `qcap2_video_sink_xxx` C APIs.
-  - *TODO*: Implement backends: `DAVMF`, `GSTREAMER`, `VITIS`, `V4L2CAP`, `XLNX`, `L4T`, `LBLRD`, `NVT_HDAL`, `V4L2`.
+**Implementation File**: [src/qcap2.devices.cpp](file:///home/zzlee/docker/qcap2-dev/src/qcap2.devices.cpp)
+**Status Summary**: Standard V4L2 output backend is fully implemented. Specific proprietary/embedded hardware platform backends remain unimplemented.
+
+- [x] **`QCAP2_VIDEO_SINK_BACKEND_TYPE_V4L2`** — **[FULLY IMPLEMENTED]**
+  - Thread-safe, asynchronous V4L2 playback backend writing video frames directly to Linux `/dev/video%d` or custom configured V4L2 device nodes.
+- [ ] **Proprietary & Platform-Specific Video Sink Backends** — **[UNIMPLEMENTED]**
+  - *TODO*: Implement hardware-specific drivers and lifecycle interfaces.
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_DAVMF`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_GSTREAMER`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_VITIS`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_V4L2CAP`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_XLNX`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_L4T`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_LBLRD`
+  - [ ] `QCAP2_VIDEO_SINK_BACKEND_TYPE_NVT_HDAL`
 
 ---
 

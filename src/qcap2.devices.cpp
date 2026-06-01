@@ -1483,4 +1483,548 @@ void qcap2_audio_sink_set_alsa_device(qcap2_audio_sink_t* pThis, int nDevice) {
     qcap2_audio_sink_set_device(pThis, nDevice);
 }
 
+#include "qcap2.v4l2.ioctl.h"
+
+// qcap2_video_sink_priv_t destructor
+qcap2_video_sink_priv_t::~qcap2_video_sink_priv_t() {
+    qcap2_video_sink_stop(reinterpret_cast<qcap2_video_sink_t*>(this));
+    if (queue) {
+        qcap2_rcbuffer_queue_delete(queue);
+    }
+}
+
+class qcap2_v4l2_video_sink_backend_t : public qcap2_video_sink_backend_t {
+private:
+    qcap2_video_sink_priv_t* p;
+    int fd;
+    bool running;
+    std::thread* playback_thread;
+    std::atomic<bool> thread_running;
+    
+    struct sink_slot_t {
+        int index;
+        void* pMappedMemory;
+        void* pUserPtr;
+        int dma_fd;
+        size_t nLength;
+    };
+    sink_slot_t* slots;
+    int slot_count;
+
+    void cleanup_slots() {
+        if (slots) {
+            for (int i = 0; i < slot_count; ++i) {
+                sink_slot_t* slot = &slots[i];
+                if (slot->pMappedMemory && slot->pMappedMemory != MAP_FAILED) {
+                    munmap(slot->pMappedMemory, slot->nLength);
+                }
+                if (slot->pUserPtr) {
+                    free(slot->pUserPtr);
+                }
+                if (slot->dma_fd >= 0) {
+                    close(slot->dma_fd);
+                }
+            }
+            delete[] slots;
+            slots = nullptr;
+        }
+        slot_count = 0;
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+
+    static void playback_thread_func(qcap2_v4l2_video_sink_backend_t* self) {
+        int queued_count = 0;
+        bool stream_on = false;
+        
+        while (self->thread_running.load(std::memory_order_acquire)) {
+            qcap2_rcbuffer_t* rcbuf = nullptr;
+            QRESULT qr = qcap2_rcbuffer_queue_pop(self->p->queue, &rcbuf);
+            if (qr != QCAP_RS_SUCCESSFUL || !rcbuf) {
+                continue;
+            }
+
+            PVOID pFrameData = qcap2_rcbuffer_lock_data(rcbuf);
+            if (!pFrameData) {
+                qcap2_rcbuffer_release(rcbuf);
+                continue;
+            }
+
+            qcap2_av_frame_t* pFrame = reinterpret_cast<qcap2_av_frame_t*>(pFrameData);
+            
+            uint8_t* pSrcBuf = nullptr;
+            int nSrcStride = 0;
+            qcap2_av_frame_get_buffer(pFrame, &pSrcBuf, &nSrcStride);
+            
+            ULONG nWidth = 0, nHeight = 0, nColorSpace = 0;
+            qcap2_av_frame_get_video_property(pFrame, &nColorSpace, &nWidth, &nHeight);
+
+            enum v4l2_memory mem_type = static_cast<enum v4l2_memory>(self->p->v4l2_memory_val);
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = self->p->v4l2_buf_type_val;
+            buf.memory = mem_type;
+
+            int target_slot_index = -1;
+
+            if (queued_count < self->slot_count) {
+                target_slot_index = queued_count;
+                buf.index = target_slot_index;
+            } else {
+                struct pollfd pfd;
+                pfd.fd = self->fd;
+                pfd.events = POLLOUT;
+
+                int poll_ret = poll(&pfd, 1, 50);
+                if (poll_ret <= 0) {
+                    qcap2_rcbuffer_unlock_data(rcbuf);
+                    qcap2_rcbuffer_release(rcbuf);
+                    continue;
+                }
+
+                if (ioctl(self->fd, VIDIOC_DQBUF, &buf) < 0) {
+                    qcap2_rcbuffer_unlock_data(rcbuf);
+                    qcap2_rcbuffer_release(rcbuf);
+                    continue;
+                }
+                target_slot_index = buf.index;
+            }
+
+            if (target_slot_index >= 0 && target_slot_index < self->slot_count) {
+                sink_slot_t* slot = &self->slots[target_slot_index];
+                
+                if (mem_type == V4L2_MEMORY_MMAP) {
+                    if (slot->pMappedMemory && pSrcBuf) {
+                        size_t copy_size = std::min(slot->nLength, (size_t)(nWidth * nHeight * 3));
+                        memcpy(slot->pMappedMemory, pSrcBuf, copy_size);
+                    }
+                } else if (mem_type == V4L2_MEMORY_USERPTR) {
+                    if (slot->pUserPtr && pSrcBuf) {
+                        size_t copy_size = std::min(slot->nLength, (size_t)(nWidth * nHeight * 3));
+                        memcpy(slot->pUserPtr, pSrcBuf, copy_size);
+                    }
+                    buf.m.userptr = (unsigned long)slot->pUserPtr;
+                    buf.length = slot->nLength;
+                } else if (mem_type == V4L2_MEMORY_DMABUF) {
+                    if (slot->pMappedMemory && pSrcBuf) {
+                        size_t copy_size = std::min(slot->nLength, (size_t)(nWidth * nHeight * 3));
+                        memcpy(slot->pMappedMemory, pSrcBuf, copy_size);
+                    }
+                    buf.m.fd = slot->dma_fd;
+                    buf.length = slot->nLength;
+                }
+
+                buf.index = target_slot_index;
+                
+                double dSampleTime = 0.0;
+                qcap2_av_frame_get_sample_time(pFrame, &dSampleTime);
+                buf.timestamp.tv_sec = (time_t)dSampleTime;
+                buf.timestamp.tv_usec = (suseconds_t)((dSampleTime - buf.timestamp.tv_sec) * 1000000.0);
+
+                if (ioctl(self->fd, VIDIOC_QBUF, &buf) >= 0) {
+                    if (queued_count < self->slot_count) {
+                        queued_count++;
+                    }
+                }
+            }
+
+            qcap2_rcbuffer_unlock_data(rcbuf);
+            qcap2_rcbuffer_release(rcbuf);
+
+            if (queued_count == self->slot_count && !stream_on) {
+                enum v4l2_buf_type type = static_cast<enum v4l2_buf_type>(self->p->v4l2_buf_type_val);
+                if (ioctl(self->fd, VIDIOC_STREAMON, &type) >= 0) {
+                    stream_on = true;
+                }
+            }
+        }
+
+        if (stream_on) {
+            enum v4l2_buf_type type = static_cast<enum v4l2_buf_type>(self->p->v4l2_buf_type_val);
+            ioctl(self->fd, VIDIOC_STREAMOFF, &type);
+        }
+    }
+
+public:
+    qcap2_v4l2_video_sink_backend_t(qcap2_video_sink_priv_t* owner)
+        : p(owner), fd(-1), running(false), playback_thread(nullptr), slots(nullptr), slot_count(0) {
+        thread_running.store(false);
+    }
+
+    ~qcap2_v4l2_video_sink_backend_t() override {
+        stop();
+    }
+
+    QRESULT start() override {
+        if (running) return QCAP_RS_SUCCESSFUL;
+
+        char dev_path[256];
+        if (p->v4l2_name[0] != '\0') {
+            strncpy(dev_path, p->v4l2_name, sizeof(dev_path) - 1);
+            dev_path[sizeof(dev_path) - 1] = '\0';
+        } else {
+            snprintf(dev_path, sizeof(dev_path), "/dev/video%d", p->device_index);
+        }
+
+        fd = open(dev_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        struct v4l2_capability cap;
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+            close(fd);
+            fd = -1;
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        if (!(cap.capabilities & V4L2_CAP_VIDEO_OUTPUT) || !(cap.capabilities & V4L2_CAP_STREAMING)) {
+            close(fd);
+            fd = -1;
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        struct v4l2_format fmt;
+        memset(&fmt, 0, sizeof(fmt));
+        fmt.type = p->v4l2_buf_type_val;
+        fmt.fmt.pix.width = p->width > 0 ? p->width : 640;
+        fmt.fmt.pix.height = p->height > 0 ? p->height : 480;
+        fmt.fmt.pix.pixelformat = qcap_colorspace_to_v4l2(p->color_space);
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;
+
+        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+            close(fd);
+            fd = -1;
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        p->width = fmt.fmt.pix.width;
+        p->height = fmt.fmt.pix.height;
+        size_t buffer_size = fmt.fmt.pix.sizeimage;
+
+        enum v4l2_memory mem_type = static_cast<enum v4l2_memory>(p->v4l2_memory_val);
+
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = p->frame_count > 0 ? p->frame_count : 4;
+        req.type = p->v4l2_buf_type_val;
+        req.memory = mem_type;
+
+        if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+            close(fd);
+            fd = -1;
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        slot_count = req.count;
+        slots = new (std::nothrow) sink_slot_t[slot_count];
+        if (!slots) {
+            close(fd);
+            fd = -1;
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+        for (int i = 0; i < slot_count; ++i) {
+            sink_slot_t* slot = &slots[i];
+            slot->index = i;
+            slot->pMappedMemory = nullptr;
+            slot->pUserPtr = nullptr;
+            slot->dma_fd = -1;
+            slot->nLength = buffer_size;
+
+            struct v4l2_buffer vbuf;
+            memset(&vbuf, 0, sizeof(vbuf));
+            vbuf.type = p->v4l2_buf_type_val;
+            vbuf.memory = mem_type;
+            vbuf.index = i;
+
+            if (mem_type == V4L2_MEMORY_MMAP) {
+                if (ioctl(fd, VIDIOC_QUERYBUF, &vbuf) < 0) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                slot->nLength = vbuf.length;
+                slot->pMappedMemory = mmap(NULL, slot->nLength, PROT_READ | PROT_WRITE, MAP_SHARED, fd, vbuf.m.offset);
+                if (slot->pMappedMemory == MAP_FAILED) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+            } else if (mem_type == V4L2_MEMORY_USERPTR) {
+                void* ptr = nullptr;
+                if (posix_memalign(&ptr, 4096, buffer_size) != 0) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                slot->pUserPtr = ptr;
+            } else if (mem_type == V4L2_MEMORY_DMABUF) {
+                char temp_path[] = "/tmp/mock_sink_dmabuf_XXXXXX";
+                slot->dma_fd = mkstemp(temp_path);
+                if (slot->dma_fd < 0) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                unlink(temp_path);
+                if (ftruncate(slot->dma_fd, buffer_size) < 0) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+                slot->pMappedMemory = mmap(NULL, slot->nLength, PROT_READ | PROT_WRITE, MAP_SHARED, slot->dma_fd, 0);
+                if (slot->pMappedMemory == MAP_FAILED) {
+                    cleanup_slots();
+                    return QCAP_RS_ERROR_GENERAL;
+                }
+            }
+        }
+
+        running = true;
+        thread_running.store(true, std::memory_order_release);
+        playback_thread = new std::thread(playback_thread_func, this);
+
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT stop() override {
+        if (!running) return QCAP_RS_SUCCESSFUL;
+
+        thread_running.store(false, std::memory_order_release);
+        
+        qcap2_rcbuffer_queue_stop(p->queue);
+
+        if (playback_thread) {
+            if (playback_thread->joinable()) {
+                playback_thread->join();
+            }
+            delete playback_thread;
+            playback_thread = nullptr;
+        }
+
+        cleanup_slots();
+        running = false;
+        return QCAP_RS_SUCCESSFUL;
+    }
+
+    QRESULT push(qcap2_rcbuffer_t* pRCBuffer) override {
+        if (!pRCBuffer) return QCAP_RS_ERROR_INVALID_PARAMETER;
+        return qcap2_rcbuffer_queue_push(p->queue, pRCBuffer);
+    }
+
+    int get_fd() const { return fd; }
+};
+
+// qcap2_video_sink_t C APIs
+qcap2_video_sink_t* qcap2_video_sink_new() {
+    qcap2_video_sink_priv_t* priv = new (std::nothrow) qcap2_video_sink_priv_t();
+    return reinterpret_cast<qcap2_video_sink_t*>(priv);
+}
+
+void qcap2_video_sink_delete(qcap2_video_sink_t* pThis) {
+    if (pThis) {
+        delete reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+    }
+}
+
+void qcap2_video_sink_set_backend_type(qcap2_video_sink_t* pThis, int nBackendType) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->backend_type = nBackendType;
+    }
+}
+
+void qcap2_video_sink_set_video_format(qcap2_video_sink_t* pThis, qcap2_video_format_t* pVideoFormat) {
+    if (pThis && pVideoFormat) {
+        qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+        ULONG color_space = 0, width = 0, height = 0;
+        BOOL interleaved = FALSE;
+        double frame_rate = 0.0;
+        qcap2_video_format_get_property(pVideoFormat, &color_space, &width, &height, &interleaved, &frame_rate);
+        priv->color_space = color_space;
+        priv->width = width;
+        priv->height = height;
+        priv->frame_rate = frame_rate;
+    }
+}
+
+void qcap2_video_sink_set_frame_count(qcap2_video_sink_t* pThis, int nFrameCount) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->frame_count = nFrameCount;
+    }
+}
+
+void qcap2_video_sink_set_multithread(qcap2_video_sink_t* pThis, bool bMultiThread) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->multithread = bMultiThread;
+    }
+}
+
+void qcap2_video_sink_set_native_handle(qcap2_video_sink_t* pThis, uintptr_t nHandle) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->native_handle = nHandle;
+    }
+}
+
+void qcap2_video_sink_set_low_bandwidth(qcap2_video_sink_t* pThis, bool bLowBandwidth) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->low_bandwidth = bLowBandwidth;
+    }
+}
+
+void qcap2_video_sink_set_display_system(qcap2_video_sink_t* pThis, int nDisplaySystem) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->display_system = nDisplaySystem;
+    }
+}
+
+void qcap2_video_sink_set_graphic_window_system(qcap2_video_sink_t* pThis, int nGraphicWindowSystem) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->graphic_window_system = nGraphicWindowSystem;
+    }
+}
+
+void qcap2_video_sink_set_gpu_direct(qcap2_video_sink_t* pThis, bool bGPUDirect) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->gpu_direct = bGPUDirect;
+    }
+}
+
+void qcap2_video_sink_set_scale_style(qcap2_video_sink_t* pThis, ULONG nScaleStyle) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->scale_style = nScaleStyle;
+    }
+}
+
+void qcap2_video_sink_set_device_index(qcap2_video_sink_t* pThis, int nDeviceIndex) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->device_index = nDeviceIndex;
+    }
+}
+
+void qcap2_video_sink_set_src_ss_type(qcap2_video_sink_t* pThis, int nSrcSSType) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->src_ss_type = nSrcSSType;
+    }
+}
+
+void qcap2_video_sink_set_dst_ss_type(qcap2_video_sink_t* pThis, int nDstSSType) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->dst_ss_type = nDstSSType;
+    }
+}
+
+QRESULT qcap2_video_sink_start(qcap2_video_sink_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+
+    if (priv->backend) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_start(priv->queue);
+
+    if (priv->backend_type == QCAP2_VIDEO_SINK_BACKEND_TYPE_V4L2) {
+        priv->backend = new (std::nothrow) qcap2_v4l2_video_sink_backend_t(priv);
+        if (!priv->backend) return QCAP_RS_ERROR_OUT_OF_MEMORY;
+        QRESULT qr = priv->backend->start();
+        if (qr != QCAP_RS_SUCCESSFUL) {
+            delete priv->backend;
+            priv->backend = nullptr;
+            return qr;
+        }
+    } else {
+        return QCAP_RS_ERROR_NON_SUPPORT;
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_sink_stop(qcap2_video_sink_t* pThis) {
+    if (!pThis) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+
+    qcap2_rcbuffer_queue_stop(priv->queue);
+
+    if (priv->backend) {
+        priv->backend->stop();
+        delete priv->backend;
+        priv->backend = nullptr;
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_sink_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+    return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_sink_push(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+    if (priv->backend) {
+        return priv->backend->push(pRCBuffer);
+    }
+    return qcap2_rcbuffer_queue_push(priv->queue, pRCBuffer);
+}
+
+// v4l2.h specific video sink APIs
+void qcap2_video_sink_set_v4l2_name(qcap2_video_sink_t* pThis, const char* strName) {
+    if (pThis) {
+        qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+        if (strName) {
+            strncpy(priv->v4l2_name, strName, sizeof(priv->v4l2_name) - 1);
+            priv->v4l2_name[sizeof(priv->v4l2_name) - 1] = '\0';
+        }
+    }
+}
+
+const char* qcap2_video_sink_get_v4l2_name(qcap2_video_sink_t* pThis) {
+    if (pThis) {
+        qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+        return priv->v4l2_name;
+    }
+    return nullptr;
+}
+
+void qcap2_video_sink_set_buf_type(qcap2_video_sink_t* pThis, enum v4l2_buf_type nBufType) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->v4l2_buf_type_val = nBufType;
+    }
+}
+
+void qcap2_video_sink_set_memory(qcap2_video_sink_t* pThis, enum v4l2_memory nMemory) {
+    if (pThis) {
+        reinterpret_cast<qcap2_video_sink_priv_t*>(pThis)->v4l2_memory_val = nMemory;
+    }
+}
+
+QRESULT qcap2_video_sink_get_fd(qcap2_video_sink_t* pThis, int* pFd) {
+    if (pThis && pFd) {
+        qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
+        if (priv->backend) {
+            auto* v4l2_back = static_cast<qcap2_v4l2_video_sink_backend_t*>(priv->backend);
+            *pFd = v4l2_back->get_fd();
+            return QCAP_RS_SUCCESSFUL;
+        }
+        *pFd = -1;
+        return QCAP_RS_SUCCESSFUL;
+    }
+    return QCAP_RS_ERROR_INVALID_PARAMETER;
+}
+
+// DRM and other platform stubs to satisfy compiler linking
+void qcap2_video_sink_set_connector_id(qcap2_video_sink_t* pThis, uint32_t nConnectorId) { (void)pThis; (void)nConnectorId; }
+void qcap2_video_sink_set_crtc_id(qcap2_video_sink_t* pThis, uint32_t nCrtcId) { (void)pThis; (void)nCrtcId; }
+int qcap2_get_drm_fd() { return -1; }
+void qcap2_put_drm_fd(int fd) { (void)fd; }
+
+void qcap2_video_sink_set_gst_sink_name(qcap2_video_sink_t* pThis, const char* strGstSinkName) { (void)pThis; (void)strGstSinkName; }
+void qcap2_video_sink_set_nvbuf(qcap2_video_sink_t* pThis, bool bNVBuf) { (void)pThis; (void)bNVBuf; }
+void qcap2_video_sink_set_vout_id(qcap2_video_sink_t* pThis, int nVoutId) { (void)pThis; (void)nVoutId; }
+
+int qcap2_video_sink_set_panel(int nFd, qcap2_v4l2_ctrl_mdin_panel_t* pParams) { (void)nFd; (void)pParams; return -1; }
+int qcap2_video_sink_get_panel(int nFd, qcap2_v4l2_ctrl_mdin_panel_t* pParams) { (void)nFd; (void)pParams; return -1; }
+int qcap2_video_sink_set_pip(int nFd, qcap2_v4l2_ctrl_mdin_pip_t* pParams) { (void)nFd; (void)pParams; return -1; }
+int qcap2_video_sink_get_pip(int nFd, qcap2_v4l2_ctrl_mdin_pip_t* pParams) { (void)nFd; (void)pParams; return -1; }
+int qcap2_video_sink_set_key(int nFd, qcap2_v4l2_ctrl_mdin_key_t* pParams) { (void)nFd; (void)pParams; return -1; }
+int qcap2_video_sink_get_key(int nFd, qcap2_v4l2_ctrl_mdin_key_t* pParams) { (void)nFd; (void)pParams; return -1; }
+
 }

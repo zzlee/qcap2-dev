@@ -467,6 +467,7 @@ void test_qcap2_video_source_t() {
 
     // Push the buffer back to recycle it
     assert(qcap2_video_source_push(vsrc, popped) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(popped);
 
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
@@ -522,12 +523,13 @@ void test_qcap2_video_source_backends() {
     assert(custom_rcbuf != NULL);
 
     assert(qcap2_video_source_push(vsrc, custom_rcbuf) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(custom_rcbuf);
 
     qcap2_rcbuffer_t* user_popped = NULL;
     assert(qcap2_video_source_pop(vsrc, &user_popped) == QCAP_RS_SUCCESSFUL);
     assert(user_popped == custom_rcbuf);
 
-    qcap2_rcbuffer_release(custom_rcbuf);
+    qcap2_rcbuffer_release(user_popped);
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
     // 4. Test V4L2 memory modes (MMAP, USERPTR, DMABUF) fail-safe start & cleanup

@@ -107,12 +107,12 @@ private:
                 self->frame_index++;
 
                 // Push to the user queue (increases ref count)
-                qcap2_rcbuffer_add_ref(rcbuf);
                 QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
                 if (qres != QCAP_RS_SUCCESSFUL) {
-                    qcap2_rcbuffer_release(rcbuf);
                     std::lock_guard<std::mutex> lock(self->mtx);
                     self->idle_buffers.push_back(rcbuf);
+                } else {
+                    qcap2_rcbuffer_release(rcbuf);
                 }
             }
         }
@@ -199,13 +199,15 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(mtx);
+            for (auto buf : idle_buffers) {
+                qcap2_rcbuffer_release(buf);
+            }
             idle_buffers.clear();
         }
 
         if (slots) {
             for (int i = 0; i < slot_count; ++i) {
                 delete[] slots[i].raw_buffer;
-                qcap2_rcbuffer_delete(slots[i].rcbuf);
             }
             delete[] slots;
             slots = nullptr;
@@ -242,11 +244,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx);
             if (std::find(idle_buffers.begin(), idle_buffers.end(), pRCBuffer) == idle_buffers.end()) {
+                qcap2_rcbuffer_add_ref(pRCBuffer);
                 idle_buffers.push_back(pRCBuffer);
             }
         }
 
-        qcap2_rcbuffer_release(pRCBuffer);
         return QCAP_RS_SUCCESSFUL;
     }
 };
@@ -361,10 +363,8 @@ private:
                     qcap2_av_frame_set_pts(&slot->frame, buf.timestamp.tv_sec * 1000000LL + buf.timestamp.tv_usec);
                     qcap2_av_frame_set_sample_time(&slot->frame, buf.timestamp.tv_sec + buf.timestamp.tv_usec / 1000000.0);
 
-                    QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, slot->rcbuf);
-                    if (qres != QCAP_RS_SUCCESSFUL) {
-                        qcap2_rcbuffer_release(slot->rcbuf);
-                    }
+                    qcap2_rcbuffer_queue_push(self->p->queue, slot->rcbuf);
+                    qcap2_rcbuffer_release(slot->rcbuf);
                 }
             }
         }
@@ -659,7 +659,6 @@ public:
             slot->bIsQueued = true;
         }
 
-        qcap2_rcbuffer_release(pRCBuffer);
         return QCAP_RS_SUCCESSFUL;
     }
 };
@@ -896,10 +895,8 @@ private:
                 });
 
                 if (rcbuf) {
-                    QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
-                    if (qres != QCAP_RS_SUCCESSFUL) {
-                        qcap2_rcbuffer_release(rcbuf);
-                    }
+                    qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
+                    qcap2_rcbuffer_release(rcbuf);
                 }
             }
         }
@@ -1021,10 +1018,8 @@ private:
             });
 
             if (rcbuf) {
-                QRESULT qres = qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
-                if (qres != QCAP_RS_SUCCESSFUL) {
-                    qcap2_rcbuffer_release(rcbuf);
-                }
+                qcap2_rcbuffer_queue_push(self->p->queue, rcbuf);
+                qcap2_rcbuffer_release(rcbuf);
             }
         }
     }

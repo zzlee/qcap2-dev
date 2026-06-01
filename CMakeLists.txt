@@ -151,10 +151,12 @@ endif()
 
 if(TARGET qcap2_muxer)
     qcap2_add_test(test_qcap2_muxer qcap2_muxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+    qcap2_add_test(test_qcap2_muxer_rtsp qcap2_muxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
 endif()
 
 if(TARGET qcap2_demuxer AND TARGET qcap2_muxer)
     qcap2_add_test(test_qcap2_demux_mux qcap2_muxer qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
+    qcap2_add_test(test_qcap2_sdp qcap2_muxer qcap2_demuxer qcap2_processing qcap2_devices qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
 endif()
 
 if(TARGET qcap2_processing)

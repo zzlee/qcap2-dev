@@ -849,12 +849,18 @@ QRESULT qcap2_demuxer_start(qcap2_demuxer_t* pThis) {
     }
 
     AVDictionary* options = nullptr;
-    if (priv->tcp) av_dict_set(&options, "rtsp_transport", "tcp", 0);
-    if (priv->multicast) av_dict_set(&options, "rtsp_transport", "udp_multicast", 0);
-
     const AVInputFormat* input_format = nullptr;
-    if (!priv->format_name.empty()) {
-        input_format = av_find_input_format(priv->format_name.c_str());
+
+    if (priv->type == QCAP2_DEMUXER_TYPE_SDP) {
+        input_format = av_find_input_format("sdp");
+        av_dict_set(&options, "protocol_whitelist", "file,rtp,udp", 0);
+        priv->live_source = true;
+    } else {
+        if (!priv->format_name.empty()) {
+            input_format = av_find_input_format(priv->format_name.c_str());
+        }
+        if (priv->tcp) av_dict_set(&options, "rtsp_transport", "tcp", 0);
+        if (priv->multicast) av_dict_set(&options, "rtsp_transport", "udp_multicast", 0);
     }
 
     int ret = avformat_open_input(&priv->format_context, priv->url.c_str(), input_format, &options);

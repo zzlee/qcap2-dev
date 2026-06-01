@@ -13,6 +13,7 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <fstream>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -21,9 +22,16 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-// Dummy/Placeholder for sinks since they are only declared but not used in our test cases
-typedef struct qcap2_video_sink_t qcap2_video_sink_t;
-typedef struct qcap2_audio_sink_t qcap2_audio_sink_t;
+struct qcap2_muxer_user_t {
+    std::string account;
+    std::string password;
+};
+
+struct qcap2_muxer_rtp_ctx_t {
+    AVFormatContext* format_context;
+    int stream_index;
+    bool is_video;
+};
 
 struct qcap2_muxer_priv_t {
     int type;
@@ -34,6 +42,7 @@ struct qcap2_muxer_priv_t {
     bool ssl;
     std::string cert_file;
     std::string key_file;
+    std::vector<qcap2_muxer_user_t> users;
     
     std::vector<qcap2_program_info_t*> programs;
     std::vector<qcap2_video_decoder_t*> video_decoders;
@@ -42,6 +51,10 @@ struct qcap2_muxer_priv_t {
     std::vector<qcap2_audio_sink_t*> audio_sinks;
 
     AVFormatContext* format_context;
+    std::vector<qcap2_muxer_rtp_ctx_t> rtp_contexts;
+    std::unordered_map<qcap2_video_decoder_t*, AVFormatContext*> video_rtp_map;
+    std::unordered_map<qcap2_audio_decoder_t*, AVFormatContext*> audio_rtp_map;
+    
     std::thread write_thread;
     std::atomic<bool> thread_running;
 
@@ -177,28 +190,49 @@ static void muxer_write_thread(qcap2_muxer_priv_t* priv) {
                 qcap2_av_packet_get_pts(pkt, &input_pts);
                 qcap2_av_packet_get_dts(pkt, &input_dts);
 
-                int ffmpeg_stream_idx = -1;
-                if (is_video) {
-                    qcap2_video_decoder_t* vd = priv->video_decoders[selected_decoder_index];
-                    auto it = priv->video_stream_map.find(vd);
-                    if (it != priv->video_stream_map.end()) {
-                        ffmpeg_stream_idx = it->second;
+                AVFormatContext* target_ctx = nullptr;
+                int target_stream_idx = -1;
+
+                if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+                    if (is_video) {
+                        qcap2_video_decoder_t* vd = priv->video_decoders[selected_decoder_index];
+                        auto it = priv->video_rtp_map.find(vd);
+                        if (it != priv->video_rtp_map.end()) {
+                            target_ctx = it->second;
+                            target_stream_idx = 0;
+                        }
+                    } else {
+                        qcap2_audio_decoder_t* ad = priv->audio_decoders[selected_decoder_index];
+                        auto it = priv->audio_rtp_map.find(ad);
+                        if (it != priv->audio_rtp_map.end()) {
+                            target_ctx = it->second;
+                            target_stream_idx = 0;
+                        }
                     }
                 } else {
-                    qcap2_audio_decoder_t* ad = priv->audio_decoders[selected_decoder_index];
-                    auto it = priv->audio_stream_map.find(ad);
-                    if (it != priv->audio_stream_map.end()) {
-                        ffmpeg_stream_idx = it->second;
+                    target_ctx = priv->format_context;
+                    if (is_video) {
+                        qcap2_video_decoder_t* vd = priv->video_decoders[selected_decoder_index];
+                        auto it = priv->video_stream_map.find(vd);
+                        if (it != priv->video_stream_map.end()) {
+                            target_stream_idx = it->second;
+                        }
+                    } else {
+                        qcap2_audio_decoder_t* ad = priv->audio_decoders[selected_decoder_index];
+                        auto it = priv->audio_stream_map.find(ad);
+                        if (it != priv->audio_stream_map.end()) {
+                            target_stream_idx = it->second;
+                        }
                     }
                 }
 
-                if (ffmpeg_stream_idx >= 0) {
-                    AVStream* stream = priv->format_context->streams[ffmpeg_stream_idx];
+                if (target_ctx && target_stream_idx >= 0) {
+                    AVStream* stream = target_ctx->streams[target_stream_idx];
                     AVPacket* av_pkt = av_packet_alloc();
                     if (av_pkt) {
                         av_pkt->data = pBuf;
                         av_pkt->size = nSize;
-                        av_pkt->stream_index = ffmpeg_stream_idx;
+                        av_pkt->stream_index = target_stream_idx;
 
                         // Calculate correct timestamp ratios relative to output container stream timebase
                         int64_t diff = input_pts - input_dts;
@@ -215,7 +249,7 @@ static void muxer_write_thread(qcap2_muxer_priv_t* priv) {
                             av_pkt->flags |= AV_PKT_FLAG_KEY;
                         }
 
-                        av_interleaved_write_frame(priv->format_context, av_pkt);
+                        av_interleaved_write_frame(target_ctx, av_pkt);
                         av_packet_free(&av_pkt);
                     }
                 }
@@ -326,9 +360,10 @@ void qcap2_muxer_set_private_key_file(qcap2_muxer_t* pThis, const char* strPriva
 }
 
 void qcap2_muxer_add_user(qcap2_muxer_t* pThis, const char* strAccount, const char* strPassword) {
-    (void)pThis;
-    (void)strAccount;
-    (void)strPassword;
+    if (pThis) {
+        qcap2_muxer_priv_t* priv = reinterpret_cast<qcap2_muxer_priv_t*>(pThis);
+        priv->users.push_back({strAccount ? strAccount : "", strPassword ? strPassword : ""});
+    }
 }
 
 void qcap2_muxer_add_program_info(qcap2_muxer_t* pThis, qcap2_program_info_t* pProgramInfo) {
@@ -342,17 +377,50 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
     if (!pThis) return QCAP_RS_ERROR_GENERAL;
     qcap2_muxer_priv_t* priv = reinterpret_cast<qcap2_muxer_priv_t*>(pThis);
 
-    if (priv->format_context) {
+    if (priv->format_context || !priv->rtp_contexts.empty()) {
         return QCAP_RS_SUCCESSFUL;
     }
 
-    int ret = avformat_alloc_output_context2(&priv->format_context, nullptr, nullptr, priv->ip.c_str());
-    if (ret < 0 || !priv->format_context) {
-        return QCAP_RS_ERROR_GENERAL;
+    std::string url = priv->ip;
+    if (priv->type == QCAP2_MUXER_TYPE_RTSP) {
+        if (url.find("rtsp://") != 0 && url.find("rtsps://") != 0) {
+            std::string proto = priv->ssl ? "rtsps://" : "rtsp://";
+            std::string creds = "";
+            if (!priv->users.empty()) {
+                creds = priv->users[0].account + ":" + priv->users[0].password + "@";
+            }
+            std::string host = priv->ip.empty() ? "127.0.0.1" : priv->ip;
+            std::string port_str = (priv->port > 0) ? ":" + std::to_string(priv->port) : "";
+            std::string path = "/live/stream";
+            if (host.find('/') != std::string::npos) {
+                url = proto + creds + host;
+            } else {
+                url = proto + creds + host + port_str + path;
+            }
+        }
     }
 
     priv->video_stream_map.clear();
     priv->audio_stream_map.clear();
+    priv->video_rtp_map.clear();
+    priv->audio_rtp_map.clear();
+    priv->rtp_contexts.clear();
+
+    std::string sdp_filepath = priv->ip.empty() ? "stream.sdp" : priv->ip;
+    int base_port = priv->port > 0 ? priv->port : 5004;
+    int current_port = base_port;
+
+    if (priv->type != QCAP2_MUXER_TYPE_SDP) {
+        int ret;
+        if (priv->type == QCAP2_MUXER_TYPE_RTSP) {
+            ret = avformat_alloc_output_context2(&priv->format_context, nullptr, "rtsp", url.c_str());
+        } else {
+            ret = avformat_alloc_output_context2(&priv->format_context, nullptr, nullptr, priv->ip.c_str());
+        }
+        if (ret < 0 || !priv->format_context) {
+            return QCAP_RS_ERROR_GENERAL;
+        }
+    }
 
     // Set up target streams
     for (auto prog : priv->programs) {
@@ -365,12 +433,28 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
                 if (vd) {
                     qcap2_video_decoder_priv_t* vd_priv = (qcap2_video_decoder_priv_t*)vd;
                     
-                    AVStream* stream = avformat_new_stream(priv->format_context, nullptr);
+                    AVFormatContext* target_ctx = nullptr;
+                    if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+                        std::string rtp_url = "rtp://127.0.0.1:" + std::to_string(current_port);
+                        int r = avformat_alloc_output_context2(&target_ctx, nullptr, "rtp", rtp_url.c_str());
+                        if (r < 0 || !target_ctx) {
+                            return QCAP_RS_ERROR_GENERAL;
+                        }
+                        priv->rtp_contexts.push_back({target_ctx, idx, true});
+                        priv->video_rtp_map[vd] = target_ctx;
+                        current_port += 2;
+                    } else {
+                        target_ctx = priv->format_context;
+                    }
+
+                    AVStream* stream = avformat_new_stream(target_ctx, nullptr);
                     if (!stream) {
                         return QCAP_RS_ERROR_OUT_OF_MEMORY;
                     }
 
-                    priv->video_stream_map[vd] = stream->index;
+                    if (priv->type != QCAP2_MUXER_TYPE_SDP) {
+                        priv->video_stream_map[vd] = stream->index;
+                    }
 
                     ULONG nEncoderType = 0, nEncoderFormat = 0, nColorSpaceType = 0, nWidth = 0, nHeight = 0;
                     double dFrameRate = 0.0;
@@ -428,12 +512,28 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
                 if (ad) {
                     qcap2_audio_decoder_priv_t* ad_priv = (qcap2_audio_decoder_priv_t*)ad;
 
-                    AVStream* stream = avformat_new_stream(priv->format_context, nullptr);
+                    AVFormatContext* target_ctx = nullptr;
+                    if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+                        std::string rtp_url = "rtp://127.0.0.1:" + std::to_string(current_port);
+                        int r = avformat_alloc_output_context2(&target_ctx, nullptr, "rtp", rtp_url.c_str());
+                        if (r < 0 || !target_ctx) {
+                            return QCAP_RS_ERROR_GENERAL;
+                        }
+                        priv->rtp_contexts.push_back({target_ctx, idx, false});
+                        priv->audio_rtp_map[ad] = target_ctx;
+                        current_port += 2;
+                    } else {
+                        target_ctx = priv->format_context;
+                    }
+
+                    AVStream* stream = avformat_new_stream(target_ctx, nullptr);
                     if (!stream) {
                         return QCAP_RS_ERROR_OUT_OF_MEMORY;
                     }
 
-                    priv->audio_stream_map[ad] = stream->index;
+                    if (priv->type != QCAP2_MUXER_TYPE_SDP) {
+                        priv->audio_stream_map[ad] = stream->index;
+                    }
 
                     ULONG nEncoderType = 0, nEncoderFormat = 0, nChannels = 0, nBitsPerSample = 0, nSampleFrequency = 0, nBitRate = 0;
                     
@@ -479,23 +579,87 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
         }
     }
 
-    if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&priv->format_context->pb, priv->ip.c_str(), AVIO_FLAG_WRITE);
+    if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+        for (auto& rtp : priv->rtp_contexts) {
+            int ret_open = avio_open(&rtp.format_context->pb, rtp.format_context->url, AVIO_FLAG_WRITE);
+            if (ret_open < 0) {
+                for (auto& rtp_cleanup : priv->rtp_contexts) {
+                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
+                    avformat_free_context(rtp_cleanup.format_context);
+                }
+                priv->rtp_contexts.clear();
+                priv->video_rtp_map.clear();
+                priv->audio_rtp_map.clear();
+                return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
+            }
+
+            int ret_hdr = avformat_write_header(rtp.format_context, nullptr);
+            if (ret_hdr < 0) {
+                for (auto& rtp_cleanup : priv->rtp_contexts) {
+                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
+                    avformat_free_context(rtp_cleanup.format_context);
+                }
+                priv->rtp_contexts.clear();
+                priv->video_rtp_map.clear();
+                priv->audio_rtp_map.clear();
+                return QCAP_RS_ERROR_GENERAL;
+            }
+        }
+
+        std::vector<AVFormatContext*> ctx_array;
+        for (auto& rtp : priv->rtp_contexts) {
+            ctx_array.push_back(rtp.format_context);
+        }
+
+        char sdp_buf[8192];
+        memset(sdp_buf, 0, sizeof(sdp_buf));
+        int ret_sdp = av_sdp_create(ctx_array.data(), ctx_array.size(), sdp_buf, sizeof(sdp_buf));
+        if (ret_sdp >= 0) {
+            std::ofstream sdp_file(sdp_filepath);
+            if (sdp_file.is_open()) {
+                sdp_file << sdp_buf;
+                sdp_file.close();
+            } else {
+                for (auto& rtp_cleanup : priv->rtp_contexts) {
+                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
+                    avformat_free_context(rtp_cleanup.format_context);
+                }
+                priv->rtp_contexts.clear();
+                priv->video_rtp_map.clear();
+                priv->audio_rtp_map.clear();
+                return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
+            }
+        } else {
+            for (auto& rtp_cleanup : priv->rtp_contexts) {
+                if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
+                avformat_free_context(rtp_cleanup.format_context);
+            }
+            priv->rtp_contexts.clear();
+            priv->video_rtp_map.clear();
+            priv->audio_rtp_map.clear();
+            return QCAP_RS_ERROR_GENERAL;
+        }
+
+    } else {
+        int ret;
+        if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
+            ret = avio_open(&priv->format_context->pb, url.c_str(), AVIO_FLAG_WRITE);
+            if (ret < 0) {
+                avformat_free_context(priv->format_context);
+                priv->format_context = nullptr;
+                return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
+            }
+        }
+
+        ret = avformat_write_header(priv->format_context, nullptr);
         if (ret < 0) {
+            if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
+                avio_closep(&priv->format_context->pb);
+            }
             avformat_free_context(priv->format_context);
             priv->format_context = nullptr;
-            return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
+            return (priv->type == QCAP2_MUXER_TYPE_RTSP) ? QCAP_RS_ERROR_NETWORK_ACCESS_FAIL : QCAP_RS_ERROR_GENERAL;
         }
-    }
-
-    ret = avformat_write_header(priv->format_context, nullptr);
-    if (ret < 0) {
-        if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&priv->format_context->pb);
-        }
-        avformat_free_context(priv->format_context);
-        priv->format_context = nullptr;
-        return QCAP_RS_ERROR_GENERAL;
     }
 
     // Start all decoders in bypass mode
@@ -526,8 +690,14 @@ QRESULT qcap2_muxer_stop(qcap2_muxer_t* pThis) {
     if (!pThis) return QCAP_RS_ERROR_GENERAL;
     qcap2_muxer_priv_t* priv = reinterpret_cast<qcap2_muxer_priv_t*>(pThis);
 
-    if (!priv->format_context) {
-        return QCAP_RS_SUCCESSFUL;
+    if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+        if (priv->rtp_contexts.empty()) {
+            return QCAP_RS_SUCCESSFUL;
+        }
+    } else {
+        if (!priv->format_context) {
+            return QCAP_RS_SUCCESSFUL;
+        }
     }
 
     priv->thread_running = false;
@@ -536,14 +706,25 @@ QRESULT qcap2_muxer_stop(qcap2_muxer_t* pThis) {
         priv->write_thread.join();
     }
 
-    av_write_trailer(priv->format_context);
+    if (priv->type == QCAP2_MUXER_TYPE_SDP) {
+        for (auto& rtp : priv->rtp_contexts) {
+            av_write_trailer(rtp.format_context);
+            if (rtp.format_context->pb) avio_closep(&rtp.format_context->pb);
+            avformat_free_context(rtp.format_context);
+        }
+        priv->rtp_contexts.clear();
+        priv->video_rtp_map.clear();
+        priv->audio_rtp_map.clear();
+    } else {
+        av_write_trailer(priv->format_context);
 
-    if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
-        avio_closep(&priv->format_context->pb);
+        if (!(priv->format_context->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&priv->format_context->pb);
+        }
+
+        avformat_free_context(priv->format_context);
+        priv->format_context = nullptr;
     }
-
-    avformat_free_context(priv->format_context);
-    priv->format_context = nullptr;
 
     // Stop decoders
     for (auto prog : priv->programs) {

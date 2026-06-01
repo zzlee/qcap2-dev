@@ -131,6 +131,8 @@ This document tracks the implementation status of all backend types defined in `
   - Features stream extra-data extraction and propagation.
   - Features thread-safe reference-counted packet queue pushing and delivery.
   - Features highly responsive steady-clock pacing via interruptible condition variables.
+- [x] **`QCAP2_DEMUXER_TYPE_RTSP`** — **[FULLY IMPLEMENTED]**
+  - Advanced RTSP streaming client backend with keep-alive, auto-reconnection, customizable timeout/buffer/transport settings, low-latency pacing, and support for media types H264, H265, AAC, PCMA, and PCMU.
 - [ ] **Proprietary & Custom Demuxer Backends** — **[UNIMPLEMENTED]**
   - *TODO*: Implement hardware or proprietary demuxers.
   - [ ] `QCAP2_DEMUXER_TYPE_PYLON`
@@ -154,10 +156,11 @@ This document tracks the implementation status of all backend types defined in `
   - Features dynamic video/audio decoder auto-creation and stream mappings.
   - Features stream codec parameters and extra-data (SPS/PPS, AudioSpecificConfig) propagation.
   - Features reactive background DTS-interleaved multiplexer thread with precise timebase conversion.
+- [x] **`QCAP2_MUXER_TYPE_RTSP`** — **[FULLY IMPLEMENTED]**
+  - RTSP media streaming publication backend supporting TLS/SSL encryption, authentication credentials addition, transport configuration, and real-time DTS-paced bypass multiplexing.
 - [ ] **Proprietary & Streaming Muxer Backends** — **[UNIMPLEMENTED]**
   - *TODO*: Implement RTSP/JSRTSP or platform-specific muxer types.
   - [ ] `QCAP2_MUXER_TYPE_JSRTSP`
-  - [ ] `QCAP2_MUXER_TYPE_RTSP`
 
 ---
 

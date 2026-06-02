@@ -406,6 +406,18 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
     priv->audio_rtp_map.clear();
     priv->rtp_contexts.clear();
 
+    auto cleanup_rtp_contexts = [priv]() {
+        for (auto& rtp : priv->rtp_contexts) {
+            if (rtp.format_context) {
+                if (rtp.format_context->pb) avio_closep(&rtp.format_context->pb);
+                avformat_free_context(rtp.format_context);
+            }
+        }
+        priv->rtp_contexts.clear();
+        priv->video_rtp_map.clear();
+        priv->audio_rtp_map.clear();
+    };
+
     std::string sdp_filepath = priv->ip.empty() ? "stream.sdp" : priv->ip;
     int base_port = priv->port > 0 ? priv->port : 5004;
     int current_port = base_port;
@@ -438,6 +450,7 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
                         std::string rtp_url = "rtp://127.0.0.1:" + std::to_string(current_port);
                         int r = avformat_alloc_output_context2(&target_ctx, nullptr, "rtp", rtp_url.c_str());
                         if (r < 0 || !target_ctx) {
+                            cleanup_rtp_contexts();
                             return QCAP_RS_ERROR_GENERAL;
                         }
                         priv->rtp_contexts.push_back({target_ctx, idx, true});
@@ -449,6 +462,7 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
 
                     AVStream* stream = avformat_new_stream(target_ctx, nullptr);
                     if (!stream) {
+                        cleanup_rtp_contexts();
                         return QCAP_RS_ERROR_OUT_OF_MEMORY;
                     }
 
@@ -517,6 +531,7 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
                         std::string rtp_url = "rtp://127.0.0.1:" + std::to_string(current_port);
                         int r = avformat_alloc_output_context2(&target_ctx, nullptr, "rtp", rtp_url.c_str());
                         if (r < 0 || !target_ctx) {
+                            cleanup_rtp_contexts();
                             return QCAP_RS_ERROR_GENERAL;
                         }
                         priv->rtp_contexts.push_back({target_ctx, idx, false});
@@ -528,6 +543,7 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
 
                     AVStream* stream = avformat_new_stream(target_ctx, nullptr);
                     if (!stream) {
+                        cleanup_rtp_contexts();
                         return QCAP_RS_ERROR_OUT_OF_MEMORY;
                     }
 
@@ -583,25 +599,13 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
         for (auto& rtp : priv->rtp_contexts) {
             int ret_open = avio_open(&rtp.format_context->pb, rtp.format_context->url, AVIO_FLAG_WRITE);
             if (ret_open < 0) {
-                for (auto& rtp_cleanup : priv->rtp_contexts) {
-                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
-                    avformat_free_context(rtp_cleanup.format_context);
-                }
-                priv->rtp_contexts.clear();
-                priv->video_rtp_map.clear();
-                priv->audio_rtp_map.clear();
+                cleanup_rtp_contexts();
                 return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
             }
 
             int ret_hdr = avformat_write_header(rtp.format_context, nullptr);
             if (ret_hdr < 0) {
-                for (auto& rtp_cleanup : priv->rtp_contexts) {
-                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
-                    avformat_free_context(rtp_cleanup.format_context);
-                }
-                priv->rtp_contexts.clear();
-                priv->video_rtp_map.clear();
-                priv->audio_rtp_map.clear();
+                cleanup_rtp_contexts();
                 return QCAP_RS_ERROR_GENERAL;
             }
         }
@@ -620,23 +624,11 @@ QRESULT qcap2_muxer_start(qcap2_muxer_t* pThis) {
                 sdp_file << sdp_buf;
                 sdp_file.close();
             } else {
-                for (auto& rtp_cleanup : priv->rtp_contexts) {
-                    if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
-                    avformat_free_context(rtp_cleanup.format_context);
-                }
-                priv->rtp_contexts.clear();
-                priv->video_rtp_map.clear();
-                priv->audio_rtp_map.clear();
+                cleanup_rtp_contexts();
                 return QCAP_RS_ERROR_FILE_ACCESS_FAIL;
             }
         } else {
-            for (auto& rtp_cleanup : priv->rtp_contexts) {
-                if (rtp_cleanup.format_context->pb) avio_closep(&rtp_cleanup.format_context->pb);
-                avformat_free_context(rtp_cleanup.format_context);
-            }
-            priv->rtp_contexts.clear();
-            priv->video_rtp_map.clear();
-            priv->audio_rtp_map.clear();
+            cleanup_rtp_contexts();
             return QCAP_RS_ERROR_GENERAL;
         }
 

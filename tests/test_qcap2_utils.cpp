@@ -1,5 +1,6 @@
 #include "qcap2.utils.h"
 #include "qcap2.buffer.h"
+#include "qcap2.formats.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -68,6 +69,19 @@ void test_utils() {
 
     qcap2_rcbuffer_release(pRCBuffer);
     free(dummy_buffer);
+
+    // Add simple test to test picture loading
+    qcap2_av_frame_t frame2;
+    qcap2_av_frame_init(&frame2);
+    qcap2_rcbuffer_t* pRCBuffer2 = qcap2_rcbuffer_new(&frame2, NULL);
+    QRESULT result = qcap2_load_picture(pRCBuffer2, "test_pic.jpg");
+    assert(result == QCAP_RS_ERROR_GENERAL); // Should fail as test_pic.jpg doesn't exist
+    qcap2_rcbuffer_release(pRCBuffer2);
+
+    qcap2_video_format_t* pFmt = qcap2_video_format_new();
+    result = qcap2_get_picture_info("test_pic.jpg", pFmt);
+    assert(result == QCAP_RS_ERROR_GENERAL); // Should fail as test_pic.jpg doesn't exist
+    qcap2_video_format_delete(pFmt);
 
     printf("All test_utils passed!\n");
 }

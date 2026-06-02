@@ -60,7 +60,7 @@ qcap2_add_module(qcap2_utils qcap2.utils src/qcap2.utils.cpp)
 target_link_libraries(qcap2_formats PUBLIC qcap2_buffer)
 target_link_libraries(qcap2_sync PUBLIC qcap2_buffer Threads::Threads)
 target_link_libraries(qcap2_devices PUBLIC qcap2_sync qcap2_buffer qcap2_formats Threads::Threads)
-target_link_libraries(qcap2_utils PUBLIC qcap2_buffer)
+target_link_libraries(qcap2_utils PUBLIC qcap2_buffer qcap2_formats)
 
 if(AVFORMAT_LIB AND AVCODEC_LIB AND AVUTIL_LIB)
     message(STATUS "FFmpeg avformat/avcodec/avutil found. Building libqcap2.demuxer.so.")

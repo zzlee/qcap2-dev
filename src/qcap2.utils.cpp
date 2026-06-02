@@ -1,8 +1,12 @@
 #include "qcap2.utils.h"
 #include "qcap2.buffer.h"
+#include "qcap2.formats.h"
 #include <time.h>
 #include <string.h>
 #include <stdio.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -125,14 +129,51 @@ QRESULT qcap2_fill_video_test_pattern(qcap2_rcbuffer_t* pRCBuffer, int nType) {
 
 QRESULT qcap2_load_picture(qcap2_rcbuffer_t* pRCBuffer, const char* strFilePath) {
     if (!pRCBuffer || !strFilePath) return QCAP_RS_ERROR_GENERAL;
-    // Mock implementation of loading a picture
+    int x, y, comp;
+    unsigned char *data = stbi_load(strFilePath, &x, &y, &comp, 3); // Force RGB
+    if (!data) return QCAP_RS_ERROR_GENERAL;
+
+    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
+    if (!pData) {
+        stbi_image_free(data);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+    qcap2_av_frame_set_video_property(pFrame, QCAP_COLORSPACE_TYPE_RGB24, x, y);
+
+    uint8_t* pBuffer = NULL;
+    int nStride = 0;
+    qcap2_av_frame_get_buffer(pFrame, &pBuffer, &nStride);
+    if (!pBuffer) {
+        if (!qcap2_av_frame_alloc_buffer(pFrame, 1, 1)) {
+            qcap2_rcbuffer_unlock_data(pRCBuffer);
+            stbi_image_free(data);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+        qcap2_av_frame_get_buffer(pFrame, &pBuffer, &nStride);
+    }
+
+    if (pBuffer) {
+        int copy_stride = x * 3;
+        for (int i = 0; i < y; i++) {
+            memcpy(pBuffer + i * nStride, data + i * copy_stride, copy_stride);
+        }
+    }
+
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
+    stbi_image_free(data);
     return QCAP_RS_SUCCESSFUL;
 }
 
 QRESULT qcap2_get_picture_info(const char* strFilePath, qcap2_video_format_t* pVideoFormat) {
     if (!strFilePath || !pVideoFormat) return QCAP_RS_ERROR_GENERAL;
-    // Mock implementation
-    return QCAP_RS_SUCCESSFUL;
+    int x, y, comp;
+    if (stbi_info(strFilePath, &x, &y, &comp)) {
+        qcap2_video_format_set_property(pVideoFormat, QCAP_COLORSPACE_TYPE_RGB24, x, y, FALSE, 0.0);
+        return QCAP_RS_SUCCESSFUL;
+    }
+    return QCAP_RS_ERROR_GENERAL;
 }
 
 const char* qcap2_get_pix_fmt_name(int nFormat) {

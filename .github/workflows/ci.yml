@@ -1,0 +1,27 @@
+name: QCAP2 CI/CD
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  build-and-test:
+    name: Build and Test in Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        run: |
+          docker build -t qcap2-build-env .
+
+      - name: Run Tests inside Docker
+        run: |
+          docker run --rm qcap2-build-env

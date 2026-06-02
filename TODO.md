@@ -173,3 +173,25 @@ This document tracks the implementation status of all backend types defined in `
   - Supports all audio format properties, channel layouts, sampling frequencies, and frame sizes conversion.
   - Fully supports thread-safe packet queueing, pushing, and polling.
 
+
+---
+
+## 11. Core Infrastructure & Tooling
+**Status Summary**: Issues with build stability and test infrastructure.
+- [ ] Fix Docker build rate limiting issues for `ubuntu:24.04` base image or document a workaround.
+- [ ] Migrate testing framework from simple `assert()` statements to a structured framework like GTest or Catch2 to improve reporting.
+- [ ] Introduce dependency management via vcpkg or Conan to simplify local builds and reduce global installation requirements.
+
+---
+
+## 12. Known Bugs & Code Adjustments
+**Status Summary**: Identified issues in the current implementation.
+- [ ] `qcap2_save_raw_video_frame` (in `src/qcap2.utils.cpp`): Currently implements a simplified `stride * height` file write. Needs correct buffer size calculation for planar color spaces (like YUV420P where size is `stride * height * 1.5`).
+- [ ] `qcap2_load_picture` & `qcap2_get_picture_info` (in `src/qcap2.utils.cpp`): Replace mock implementations with actual image decoding/metadata parsing.
+- [ ] Investigate the DirectShow Video Mixing Renderer bug patch impact (referenced in `qcap.system.h`) and document its initialization delay behavior in the wiki.
+
+---
+
+## 13. Architectural Improvements
+**Status Summary**: Long-term structural updates to improve codebase health.
+- [ ] Improve error reporting by moving beyond simple `QRESULT` codes. Consider an extended error API that can return context-rich string messages for debugging failures.

@@ -188,6 +188,13 @@ struct qcap2_video_sink_priv_t {
     int v4l2_buf_type_val;
     int v4l2_memory_val;
 
+    // DRM properties
+    uint32_t connector_id;
+    uint32_t crtc_id;
+    uint32_t plane_id;
+    uint64_t drm_modifier;
+    uint32_t drm_format;
+
     qcap2_video_sink_backend_t* backend;
 
     qcap2_video_sink_priv_t() {
@@ -216,6 +223,12 @@ struct qcap2_video_sink_priv_t {
         memset(v4l2_name, 0, sizeof(v4l2_name));
         v4l2_buf_type_val = V4L2_BUF_TYPE_VIDEO_OUTPUT;
         v4l2_memory_val = V4L2_MEMORY_MMAP;
+
+        connector_id = 0;
+        crtc_id = 0;
+        plane_id = 0;
+        drm_modifier = 0;
+        drm_format = 0;
 
         backend = nullptr;
     }

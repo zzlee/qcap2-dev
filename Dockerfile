@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavfilter-dev \
     libfreetype-dev \
     libharfbuzz-dev \
+    libdrm-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

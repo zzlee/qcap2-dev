@@ -23,6 +23,21 @@ extern "C" {
 // ============================================================================
 // RTSP-specific private data
 // ============================================================================
+
+// ============================================================================
+// Mock Demuxer Private Data
+// ============================================================================
+struct qcap2_demuxer_mock_priv_t {
+    int format_version; // 0, 1, 2, ...
+    int frame_count;
+    int video_width;
+    int video_height;
+    int audio_samplerate;
+    std::mutex mtx;
+
+    qcap2_demuxer_mock_priv_t() : format_version(0), frame_count(0), video_width(640), video_height(480), audio_samplerate(44100) {}
+};
+
 struct qcap2_demuxer_rtsp_priv_t {
     std::string user_agent;
     std::string username;
@@ -86,6 +101,7 @@ struct qcap2_demuxer_priv_t {
 
     // RTSP-specific state (valid only when type == QCAP2_DEMUXER_TYPE_RTSP)
     qcap2_demuxer_rtsp_priv_t* rtsp;
+    qcap2_demuxer_mock_priv_t* mock;
     std::thread keep_alive_thread;
     std::atomic<bool> keep_alive_running;
     std::mutex rtsp_mtx;
@@ -103,9 +119,14 @@ struct qcap2_demuxer_priv_t {
           format_context(nullptr),
           thread_running(false),
           rtsp(nullptr),
+          mock(nullptr),
           keep_alive_running(false) {}
 
     ~qcap2_demuxer_priv_t() {
+        if (mock) {
+            delete mock;
+            mock = nullptr;
+        }
         if (rtsp) {
             delete rtsp;
             rtsp = nullptr;
@@ -148,6 +169,12 @@ static void demuxer_read_thread(qcap2_demuxer_priv_t* priv);
 static void demuxer_rtsp_read_thread(qcap2_demuxer_priv_t* priv);
 static void demuxer_rtsp_keep_alive_thread(qcap2_demuxer_priv_t* priv);
 static QRESULT demuxer_rtsp_do_start(qcap2_demuxer_priv_t* priv);
+
+static QRESULT demuxer_mock_do_start(qcap2_demuxer_priv_t* priv);
+static QRESULT demuxer_mock_do_play(qcap2_demuxer_priv_t* priv);
+static QRESULT demuxer_mock_do_stop(qcap2_demuxer_priv_t* priv);
+static void demuxer_mock_read_thread(qcap2_demuxer_priv_t* priv);
+
 static QRESULT demuxer_rtsp_do_play(qcap2_demuxer_priv_t* priv);
 static QRESULT demuxer_rtsp_do_stop(qcap2_demuxer_priv_t* priv);
 
@@ -839,6 +866,10 @@ QRESULT qcap2_demuxer_start(qcap2_demuxer_t* pThis) {
 
     qcap2_demuxer_priv_t* priv = reinterpret_cast<qcap2_demuxer_priv_t*>(pThis);
 
+    if (priv->type == QCAP2_DEMUXER_TYPE_MOCK) {
+        return demuxer_mock_do_start(priv);
+    }
+
     if (priv->type == QCAP2_DEMUXER_TYPE_RTSP) {
         return demuxer_rtsp_do_start(priv);
     }
@@ -894,6 +925,10 @@ QRESULT qcap2_demuxer_play(qcap2_demuxer_t* pThis) {
     if (!pThis) return QCAP_RS_ERROR_INVALID_PARAMETER;
     qcap2_demuxer_priv_t* priv = reinterpret_cast<qcap2_demuxer_priv_t*>(pThis);
 
+    if (priv->type == QCAP2_DEMUXER_TYPE_MOCK) {
+        return demuxer_mock_do_play(priv);
+    }
+
     if (priv->type == QCAP2_DEMUXER_TYPE_RTSP) {
         return demuxer_rtsp_do_play(priv);
     }
@@ -914,6 +949,10 @@ QRESULT qcap2_demuxer_stop(qcap2_demuxer_t* pThis) {
     if (!pThis) return QCAP_RS_ERROR_INVALID_PARAMETER;
 
     qcap2_demuxer_priv_t* priv = reinterpret_cast<qcap2_demuxer_priv_t*>(pThis);
+
+    if (priv->type == QCAP2_DEMUXER_TYPE_MOCK) {
+        return demuxer_mock_do_stop(priv);
+    }
 
     if (priv->type == QCAP2_DEMUXER_TYPE_RTSP) {
         return demuxer_rtsp_do_stop(priv);
@@ -1120,6 +1159,234 @@ qcap2_program_info_t* qcap2_demuxer_get_program_info(qcap2_demuxer_t* pThis, int
     return nullptr;
 }
 
+
 QRESULT qcap2_demuxer_update(qcap2_demuxer_t* pThis) {
-    (void)pThis; return QCAP_RS_SUCCESSFUL;
+    if (!pThis) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_demuxer_priv_t* priv = reinterpret_cast<qcap2_demuxer_priv_t*>(pThis);
+
+    if (priv->type == QCAP2_DEMUXER_TYPE_MOCK && priv->mock) {
+        std::lock_guard<std::mutex> lock(priv->mock->mtx);
+
+        // Update Video Encoder
+        if (!priv->video_encoders.empty()) {
+            auto venc = priv->video_encoders[0];
+            auto venc_priv = reinterpret_cast<qcap2_video_encoder_priv_t*>(venc);
+            if (venc_priv->enc_prop) {
+                qcap2_video_encoder_property_set_resolution(venc_priv->enc_prop, priv->mock->video_width, priv->mock->video_height);
+
+            }
+        }
+
+        // Update Audio Encoder
+        if (!priv->audio_encoders.empty()) {
+            auto aenc = priv->audio_encoders[0];
+            auto aenc_priv = reinterpret_cast<qcap2_audio_encoder_priv_t*>(aenc);
+            if (aenc_priv->property) {
+                qcap2_audio_encoder_property_set_property(aenc_priv->property, 0, QCAP_ENCODER_FORMAT_AAC, 2, 16, priv->mock->audio_samplerate);
+            }
+        }
+    }
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+
+
+// ============================================================================
+// Mock Demuxer Backend
+// ============================================================================
+static void demuxer_mock_read_thread(qcap2_demuxer_priv_t* priv) {
+    while (priv->thread_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40)); // ~25fps
+
+        if (!priv->thread_running) break;
+
+        std::unique_lock<std::mutex> lock(priv->mock->mtx);
+        priv->mock->frame_count++;
+
+        // Simulate a format change every 10 frames
+        if (priv->mock->frame_count % 10 == 0) {
+            priv->mock->format_version++;
+            if (priv->mock->format_version % 2 == 1) {
+                priv->mock->video_width = 1280;
+                priv->mock->video_height = 720;
+                priv->mock->audio_samplerate = 48000;
+            } else {
+                priv->mock->video_width = 640;
+                priv->mock->video_height = 480;
+                priv->mock->audio_samplerate = 44100;
+            }
+
+            lock.unlock();
+
+            // Notify event handlers that format has changed
+            if (priv->event) {
+                qcap2_event_notify(priv->event);
+            }
+
+            // Wait for app to call update() or we might just pause pushing slightly
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue; // Skip pushing this time to simulate change pause
+        }
+        lock.unlock();
+
+        // Push dummy video packet (H264)
+        if (priv->video_sources.size() > 0 && priv->video_encoders.size() > 0) {
+            qcap2_av_packet_t* v_pkt = new qcap2_av_packet_t;
+            qcap2_av_packet_init(v_pkt);
+            uint8_t dummy_v_payload[] = { 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84 };
+            if (qcap2_av_packet_alloc_buffer(v_pkt, sizeof(dummy_v_payload))) {
+                uint8_t* pBuf = nullptr;
+                int nSize = 0;
+                qcap2_av_packet_get_buffer(v_pkt, &pBuf, &nSize);
+                if (pBuf) memcpy(pBuf, dummy_v_payload, sizeof(dummy_v_payload));
+                qcap2_av_packet_set_pts(v_pkt, priv->mock->frame_count * 40000);
+                qcap2_av_packet_set_dts(v_pkt, priv->mock->frame_count * 40000);
+                qcap2_av_packet_set_sample_time(v_pkt, priv->mock->frame_count * 0.04);
+                qcap2_av_packet_set_property(v_pkt, 0, TRUE); // keyframe
+            }
+            qcap2_rcbuffer_t* enc_rcbuf = qcap2_rcbuffer_new(v_pkt, [](PVOID pData) {
+                qcap2_av_packet_t* p = (qcap2_av_packet_t*)pData;
+                if (p) {
+                    qcap2_av_packet_free_buffer(p);
+                    delete p;
+                }
+            });
+
+            auto venc = priv->video_encoders[0];
+            auto venc_priv = reinterpret_cast<qcap2_video_encoder_priv_t*>(venc);
+            std::lock_guard<std::mutex> elock(*(venc_priv->mtx));
+            if (venc_priv->running) {
+                qcap2_rcbuffer_add_ref(enc_rcbuf);
+                venc_priv->output_queue.push(enc_rcbuf);
+                venc_priv->cv->notify_all();
+                if (venc_priv->event) qcap2_event_notify(venc_priv->event);
+            }
+            qcap2_rcbuffer_release(enc_rcbuf);
+        }
+
+        // Push dummy audio packet (AAC)
+        if (priv->audio_sources.size() > 0 && priv->audio_encoders.size() > 0) {
+            qcap2_av_packet_t* a_pkt = new qcap2_av_packet_t;
+            qcap2_av_packet_init(a_pkt);
+            uint8_t dummy_a_payload[] = { 0xff, 0xf1, 0x4c, 0x80 }; // ADTS header
+            if (qcap2_av_packet_alloc_buffer(a_pkt, sizeof(dummy_a_payload))) {
+                uint8_t* pBuf = nullptr;
+                int nSize = 0;
+                qcap2_av_packet_get_buffer(a_pkt, &pBuf, &nSize);
+                if (pBuf) memcpy(pBuf, dummy_a_payload, sizeof(dummy_a_payload));
+                qcap2_av_packet_set_pts(a_pkt, priv->mock->frame_count * 1024);
+                qcap2_av_packet_set_dts(a_pkt, priv->mock->frame_count * 1024);
+                qcap2_av_packet_set_sample_time(a_pkt, priv->mock->frame_count * (1024.0 / 44100.0));
+                qcap2_av_packet_set_property(a_pkt, 1, TRUE);
+            }
+            qcap2_rcbuffer_t* enc_rcbuf = qcap2_rcbuffer_new(a_pkt, [](PVOID pData) {
+                qcap2_av_packet_t* p = (qcap2_av_packet_t*)pData;
+                if (p) {
+                    qcap2_av_packet_free_buffer(p);
+                    delete p;
+                }
+            });
+
+            auto aenc = priv->audio_encoders[0];
+            auto aenc_priv = reinterpret_cast<qcap2_audio_encoder_priv_t*>(aenc);
+            std::lock_guard<std::mutex> elock(*(aenc_priv->mtx));
+            if (aenc_priv->running) {
+                qcap2_rcbuffer_add_ref(enc_rcbuf);
+                aenc_priv->output_queue.push(enc_rcbuf);
+                aenc_priv->cv->notify_all();
+                if (aenc_priv->event) qcap2_event_notify(aenc_priv->event);
+            }
+            qcap2_rcbuffer_release(enc_rcbuf);
+        }
+    }
+
+    // Signal EOF
+    for (auto venc : priv->video_encoders) {
+        auto venc_priv = reinterpret_cast<qcap2_video_encoder_priv_t*>(venc);
+        std::lock_guard<std::mutex> lock(*(venc_priv->mtx));
+        venc_priv->running = false;
+        venc_priv->cv->notify_all();
+        if (venc_priv->event) qcap2_event_notify(venc_priv->event);
+    }
+    for (auto aenc : priv->audio_encoders) {
+        auto aenc_priv = reinterpret_cast<qcap2_audio_encoder_priv_t*>(aenc);
+        std::lock_guard<std::mutex> lock(*(aenc_priv->mtx));
+        aenc_priv->running = false;
+        aenc_priv->cv->notify_all();
+        if (aenc_priv->event) qcap2_event_notify(aenc_priv->event);
+    }
+}
+
+static QRESULT demuxer_mock_do_start(qcap2_demuxer_priv_t* priv) {
+    if (!priv->mock) {
+        priv->mock = new qcap2_demuxer_mock_priv_t();
+    }
+
+    // Create initial sources and programs directly
+    priv->cleanup_sources();
+
+    // Video Source
+    qcap2_video_source_t* vs = qcap2_video_source_new();
+    qcap2_video_source_set_stream_index(vs, 0);
+    priv->video_sources.push_back(vs);
+
+    qcap2_video_encoder_t* venc = qcap2_video_encoder_new();
+    auto venc_priv = reinterpret_cast<qcap2_video_encoder_priv_t*>(venc);
+    venc_priv->running = true;
+    venc_priv->enc_prop = qcap2_video_encoder_property_new();
+    qcap2_video_encoder_property_set_format(venc_priv->enc_prop, QCAP_ENCODER_FORMAT_H264);
+    qcap2_video_encoder_property_set_resolution(venc_priv->enc_prop, priv->mock->video_width, priv->mock->video_height);
+
+
+
+    priv->video_encoders.push_back(venc);
+
+    // Audio Source
+    qcap2_audio_source_t* as = qcap2_audio_source_new();
+    reinterpret_cast<qcap2_audio_source_priv_t*>(as)->stream_index = 1;
+    priv->audio_sources.push_back(as);
+
+    qcap2_audio_encoder_t* aenc = qcap2_audio_encoder_new();
+    auto aenc_priv = reinterpret_cast<qcap2_audio_encoder_priv_t*>(aenc);
+    aenc_priv->running = true;
+    aenc_priv->property = qcap2_audio_encoder_property_new();
+
+    qcap2_audio_encoder_property_set_property(aenc_priv->property, 0, QCAP_ENCODER_FORMAT_AAC, 2, 16, priv->mock->audio_samplerate);
+
+    priv->audio_encoders.push_back(aenc);
+
+    // Program
+    qcap2_program_info_t* prog = qcap2_program_info_new();
+    qcap2_program_info_set_id(prog, 1);
+    qcap2_program_info_set_number(prog, 1);
+    qcap2_program_info_set_video_source_count(prog, 1);
+    qcap2_program_info_set_video_source_index(prog, 0, 0);
+    qcap2_program_info_set_video_encoder_count(prog, 1);
+    qcap2_program_info_set_video_encoder_index(prog, 0, 0);
+    qcap2_program_info_set_audio_source_count(prog, 1);
+    qcap2_program_info_set_audio_source_index(prog, 0, 1);
+    qcap2_program_info_set_audio_encoder_count(prog, 1);
+    qcap2_program_info_set_audio_encoder_index(prog, 0, 1);
+    priv->programs.push_back(prog);
+
+    return QCAP_RS_SUCCESSFUL;
+}
+
+static QRESULT demuxer_mock_do_play(qcap2_demuxer_priv_t* priv) {
+    if (priv->thread_running) return QCAP_RS_SUCCESSFUL;
+    priv->thread_running = true;
+    priv->reader_thread = std::thread(demuxer_mock_read_thread, priv);
+    return QCAP_RS_SUCCESSFUL;
+}
+
+static QRESULT demuxer_mock_do_stop(qcap2_demuxer_priv_t* priv) {
+    if (priv->thread_running) {
+        priv->thread_running = false;
+        if (priv->reader_thread.joinable()) {
+            priv->reader_thread.join();
+        }
+    }
+    priv->cleanup_sources();
+    return QCAP_RS_SUCCESSFUL;
 }

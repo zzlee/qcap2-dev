@@ -24,8 +24,8 @@ void qcap2_get_build_config(qcap2_build_config_t* pBuildConfig) {
     pBuildConfig->qcap_patch = 0;
     pBuildConfig->build_date = __DATE__;
     pBuildConfig->build_time = __TIME__;
-    pBuildConfig->branch = "main";
-    pBuildConfig->commit = "unknown";
+    pBuildConfig->branch = QCAP2_BUILD_BRANCH;
+    pBuildConfig->commit = QCAP2_BUILD_COMMIT;
     pBuildConfig->mods = "";
 }
 

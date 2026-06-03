@@ -8,11 +8,54 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Compile options
 add_compile_options(-Wall -Wextra -g)
 
+# ==============================================================================
+# Git build info (injected at configure time)
+# ==============================================================================
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_SHORT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+execute_process(
+    COMMAND git branch --show-current
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_BRANCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+# Fallback to CI environment variables
+if(NOT GIT_COMMIT_SHORT)
+    if(DEFINED ENV{CI_COMMIT_SHORT_SHA})
+        set(GIT_COMMIT_SHORT $ENV{CI_COMMIT_SHORT_SHA})
+    elseif(DEFINED ENV{GITHUB_SHA})
+        string(SUBSTRING $ENV{GITHUB_SHA} 0 7 GIT_COMMIT_SHORT)
+    else()
+        set(GIT_COMMIT_SHORT "unknown")
+    endif()
+endif()
+if(NOT GIT_BRANCH OR GIT_BRANCH STREQUAL "HEAD")
+    if(DEFINED ENV{CI_COMMIT_BRANCH})
+        set(GIT_BRANCH $ENV{CI_COMMIT_BRANCH})
+    elseif(DEFINED ENV{CI_COMMIT_TAG})
+        set(GIT_BRANCH $ENV{CI_COMMIT_TAG})
+    elseif(DEFINED ENV{GITHUB_REF_NAME})
+        set(GIT_BRANCH $ENV{GITHUB_REF_NAME})
+    else()
+        set(GIT_BRANCH "unknown")
+    endif()
+endif()
+message(STATUS "Build info: branch=${GIT_BRANCH}  commit=${GIT_COMMIT_SHORT}")
+
 # Includes
 set(QCAP2_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Thread dependency
 find_package(Threads REQUIRED)
+
+# The git build info compile definitions are injected after qcap2_utils is defined
+# (see below: "Git build info injection")
 
 # Optional dependencies
 find_package(PkgConfig QUIET)
@@ -60,6 +103,12 @@ qcap2_add_module(qcap2_formats qcap2.formats src/qcap2.formats.cpp)
 qcap2_add_module(qcap2_sync qcap2.sync src/qcap2.sync.cpp)
 qcap2_add_module(qcap2_devices qcap2.devices src/qcap2.devices.cpp)
 qcap2_add_module(qcap2_utils qcap2.utils src/qcap2.utils.cpp)
+
+# Git build info injection (target must exist first)
+target_compile_definitions(qcap2_utils PRIVATE
+    "QCAP2_BUILD_BRANCH=\"${GIT_BRANCH}\""
+    "QCAP2_BUILD_COMMIT=\"${GIT_COMMIT_SHORT}\""
+)
 
 target_link_libraries(qcap2_formats PUBLIC qcap2_buffer)
 target_link_libraries(qcap2_sync PUBLIC qcap2_buffer Threads::Threads)
@@ -176,3 +225,57 @@ endif()
 if(TARGET qcap2_graphics)
     qcap2_add_test(test_qcap2_graphics qcap2_graphics qcap2_buffer qcap2_utils Threads::Threads)
 endif()
+
+# ==============================================================================
+# Install rules
+# ==============================================================================
+
+# Collect all built modules (targets may not exist if deps were missing)
+set(QCAP2_MODULES
+    qcap2_buffer qcap2_formats qcap2_sync
+    qcap2_devices qcap2_utils
+    qcap2_processing qcap2_demuxer qcap2_muxer
+    qcap2_graphics
+)
+
+foreach(mod ${QCAP2_MODULES})
+    if(TARGET ${mod})
+        install(TARGETS ${mod}
+            LIBRARY DESTINATION lib/qcap2
+        )
+    endif()
+endforeach()
+
+# Install public headers
+install(DIRECTORY include/
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# ==============================================================================
+# CPack configuration (DEB + TGZ)
+# ==============================================================================
+set(CPACK_PACKAGE_NAME "qcap2")
+set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "QCAP2 - Multimedia capture and processing library")
+set(CPACK_PACKAGE_VENDOR "Bill Yuan")
+set(CPACK_PACKAGE_CONTACT "bill@yuan.com.tw")
+
+set(CPACK_GENERATOR "DEB;TGZ")
+
+# Package filename with commit signature postfix
+set(CPACK_PACKAGE_FILE_NAME
+    "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${GIT_COMMIT_SHORT}-${CMAKE_SYSTEM_NAME}")
+
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "libavcodec-dev, libavformat-dev, libavutil-dev,
+     libswscale-dev, libavfilter-dev, libswresample-dev,
+     libfreetype-dev, libharfbuzz-dev"
+)
+set(CPACK_DEBIAN_PACKAGE_SECTION "libs")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+
+set(CPACK_STRIP_FILES TRUE)
+set(CPACK_SET_DESTDIR TRUE)
+
+include(CPack)

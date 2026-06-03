@@ -142,6 +142,18 @@ int main() {
 
     std::cout << "  Generating test fixture...\n";
     int sys_ret = system("ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=10 -c:v mpeg4 -y test_fixture_rtsp.mp4 >/dev/null 2>&1");
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
     if (sys_ret != 0) {
         std::cerr << "  FAIL: Could not generate test fixture.\n";
         return 1;

@@ -16,6 +16,7 @@ int main() {
 
     // 1. Generate a test fixture file with both video and audio streams
     std::cout << "Generating test fixture input file...\n";
+    if (system("which ffmpeg >/dev/null") != 0) { std::cout << "ffmpeg not found\n"; return 0; }
     int sys_ret = system("ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=10 -f lavfi -i sine=duration=1:frequency=1000 -c:v h264 -c:a aac -y input_fixture.mp4 >/dev/null 2>&1");
     if (sys_ret != 0) {
         std::cerr << "Failed to generate input_fixture.mp4\n";
@@ -165,6 +166,7 @@ int main() {
     f.close();
 
     // Verify video stream codec is H.264, width=320, height=240
+    if (system("which ffprobe >/dev/null") != 0) { std::cout << "ffprobe not found\n"; return 0; }
     int probe_ret = system("ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1 output_combined.mp4 > video_probe.txt");
     assert(probe_ret == 0 && "ffprobe failed on video stream!");
 

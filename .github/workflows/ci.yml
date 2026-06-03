@@ -132,6 +132,7 @@ jobs:
         run: |
           mkdir -p build
           docker run --rm \
+            -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 \
             -e GITHUB_SHA="${{ github.sha }}" \
             -e GITHUB_REF_NAME="${{ github.ref_name }}" \
             -v "$PWD:/workspace" \

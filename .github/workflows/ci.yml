@@ -1,0 +1,63 @@
+name: QCAP2 CI/CD
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  # Build and test on native amd64
+  test-amd64:
+    name: Test AMD64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t qcap2-build-env .
+
+      - name: Run tests
+        run: |
+          docker run --rm qcap2-build-env
+
+  # Cross-compile for xlnk2_arm64 and export build artifacts
+  build-xlnk2:
+    name: Cross-compile xlnk2 arm64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build xlnk2 Docker image
+        run: |
+          docker build -t qcap2-build-env-xlnk2 -f Dockerfile.xlnk2 .
+
+      - name: Compile inside container
+        run: |
+          docker create --name compile_container \
+            -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 \
+            qcap2-build-env-xlnk2
+          docker cp . compile_container:/workspace/
+          docker start -a compile_container
+          docker cp compile_container:/workspace/build/ build/
+          docker rm compile_container
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcap2-xlnk2-build-${{ github.ref_name }}
+          path: |
+            build/lib/
+            build/test_*
+          retention-days: 7

@@ -27,7 +27,7 @@ jobs:
         run: |
           docker run --rm \
             -e GITHUB_SHA="${{ github.sha }}" \
-            -e GITHUB_REF_NAME="${{ github.ref_name }}" \
+            -e GITHUB_REF_NAME="${{ github.sha }}" \
             qcap2-build-env
 
   # Cross-compile for xlnk2_arm64 and export build artifacts
@@ -51,7 +51,7 @@ jobs:
           docker create --name compile_container \
             -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 \
             -e GITHUB_SHA="${{ github.sha }}" \
-            -e GITHUB_REF_NAME="${{ github.ref_name }}" \
+            -e GITHUB_REF_NAME="${{ github.sha }}" \
             qcap2-build-env-xlnk2
           docker cp . compile_container:/workspace/
           docker start -a compile_container
@@ -61,7 +61,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: qcap2-xlnk2-build-${{ github.ref_name }}
+          name: qcap2-xlnk2-build-${{ github.sha }}
           path: |
             build/lib/
             build/test_*
@@ -104,7 +104,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: qcap2-packages-${{ github.ref_name }}
+          name: qcap2-packages-${{ github.sha }}
           path: |
             build/*.deb
             build/*.tar.gz
@@ -135,7 +135,7 @@ jobs:
             --entrypoint /bin/bash \
             -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 \
             -e GITHUB_SHA="${{ github.sha }}" \
-            -e GITHUB_REF_NAME="${{ github.ref_name }}" \
+            -e GITHUB_REF_NAME="${{ github.sha }}" \
             -v "$PWD:/workspace" \
             -w /workspace \
             qcap2-build-env-xlnk2 \
@@ -144,7 +144,7 @@ jobs:
       - name: Upload xlnk2 packages
         uses: actions/upload-artifact@v4
         with:
-          name: qcap2-xlnk2-packages-${{ github.ref_name }}
+          name: qcap2-xlnk2-packages-${{ github.sha }}
           path: |
             build/*.deb
             build/*.tar.gz
@@ -162,7 +162,7 @@ jobs:
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
-          name: qcap2-packages-${{ github.ref_name }}
+          name: qcap2-packages-${{ github.sha }}
           path: packages/
 
       - name: Create Release
@@ -171,4 +171,4 @@ jobs:
           files: packages/*
           generate_release_notes: true
           fail_on_unmatched_files: true
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ github.sha }}

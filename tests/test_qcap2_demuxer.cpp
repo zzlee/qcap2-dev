@@ -13,6 +13,18 @@ int main() {
     std::cout << "Generating test fixture...\n";
     // Generate 1-second video at 10 fps to ensure it actually has some frames
     int sys_ret = system("ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=10 -c:v mpeg4 -y test_fixture.mp4 >/dev/null 2>&1");
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
+    if (system("which ffmpeg >/dev/null") != 0) {
+        std::cout << "ffmpeg not found, skipping test.\n";
+        return 0;
+    }
     if (sys_ret != 0) {
         std::cerr << "Failed to generate test file.\n";
         return 1;

@@ -252,6 +252,12 @@ install(DIRECTORY include/
     FILES_MATCHING PATTERN "*.h"
 )
 
+# Install any extra bundled target dependency shared libraries (copied during build)
+install(DIRECTORY ${CMAKE_BINARY_DIR}/lib/
+    DESTINATION lib/qcap2
+    FILES_MATCHING PATTERN "*.so*"
+)
+
 # ==============================================================================
 # CPack configuration (DEB + TGZ)
 # ==============================================================================

@@ -407,7 +407,11 @@ static QRESULT demuxer_create_sources_from_context(qcap2_demuxer_priv_t* priv) {
                 qcap2_audio_encoder_property_set_property1(aenc_priv->property,
                     0, // type
                     nEncoderFormat,
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
                     par->ch_layout.nb_channels,
+#else
+                    par->channels,
+#endif
                     bits_per_sample,
                     par->sample_rate,
                     par->bit_rate
@@ -571,7 +575,7 @@ static QRESULT demuxer_rtsp_do_start(qcap2_demuxer_priv_t* priv) {
     // Try opening with RTSP transport
     const AVInputFormat* input_format = av_find_input_format("rtsp");
 
-    int ret = avformat_open_input(&priv->format_context, priv->url.c_str(), input_format, &options);
+    int ret = avformat_open_input(&priv->format_context, priv->url.c_str(), const_cast<AVInputFormat*>(input_format), &options);
     if (options) av_dict_free(&options);
 
     if (ret < 0) {
@@ -863,7 +867,7 @@ QRESULT qcap2_demuxer_start(qcap2_demuxer_t* pThis) {
         if (priv->multicast) av_dict_set(&options, "rtsp_transport", "udp_multicast", 0);
     }
 
-    int ret = avformat_open_input(&priv->format_context, priv->url.c_str(), input_format, &options);
+    int ret = avformat_open_input(&priv->format_context, priv->url.c_str(), const_cast<AVInputFormat*>(input_format), &options);
     if (options) av_dict_free(&options);
 
     if (ret < 0) {

@@ -37,6 +37,8 @@ function(qcap2_add_module target output_name source_file)
         OUTPUT_NAME ${output_name}
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 endfunction()
 
@@ -46,7 +48,8 @@ function(qcap2_add_test target)
     target_link_libraries(${target} PRIVATE ${ARGN})
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-        BUILD_RPATH ${CMAKE_BINARY_DIR}/lib
+        INSTALL_RPATH "$ORIGIN/lib"
+        BUILD_WITH_INSTALL_RPATH ON
     )
     add_test(NAME ${target} COMMAND ${target})
 endfunction()

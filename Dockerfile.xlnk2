@@ -1,0 +1,58 @@
+FROM yuan88yuan/xlnk2_arm64:v1
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Update apt repositories to support multi-arch ports for arm64
+RUN sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse" > /etc/apt/sources.list.d/ports.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/ports.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe multiverse" >> /etc/apt/sources.list.d/ports.list && \
+    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list.d/ports.list
+
+# 2. Add arm64 architecture, update and install needed target libraries
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libavcodec-dev:arm64 \
+        libavformat-dev:arm64 \
+        libavutil-dev:arm64 \
+        libswscale-dev:arm64 \
+        libavfilter-dev:arm64 \
+        libswresample-dev:arm64 \
+        libfreetype-dev:arm64 \
+        libharfbuzz-dev:arm64 \
+        libpng-dev:arm64 \
+        libgraphite2-dev:arm64 \
+        && rm -rf /var/lib/apt/lists/*
+
+# 3. Copy target headers, libraries, and pkgconfig files into the Yocto target sysroot
+RUN SYSROOT=/opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux && \
+    # Headers
+    cp -r /usr/include/aarch64-linux-gnu/libav* ${SYSROOT}/usr/include/ && \
+    cp -r /usr/include/aarch64-linux-gnu/libsw* ${SYSROOT}/usr/include/ && \
+    cp -r /usr/include/freetype2 ${SYSROOT}/usr/include/ && \
+    cp -r /usr/include/harfbuzz ${SYSROOT}/usr/include/ && \
+    # Libraries (copied to /usr/lib)
+    cp -d /usr/lib/aarch64-linux-gnu/libav*.so* ${SYSROOT}/usr/lib/ && \
+    cp -d /usr/lib/aarch64-linux-gnu/libsw*.so* ${SYSROOT}/usr/lib/ && \
+    cp -d /usr/lib/aarch64-linux-gnu/libfreetype*.so* ${SYSROOT}/usr/lib/ && \
+    cp -d /usr/lib/aarch64-linux-gnu/libharfbuzz*.so* ${SYSROOT}/usr/lib/ && \
+    cp -d /usr/lib/aarch64-linux-gnu/libpng*.so* ${SYSROOT}/usr/lib/ && \
+    cp -d /usr/lib/aarch64-linux-gnu/libgraphite2*.so* ${SYSROOT}/usr/lib/ && \
+    # pkgconfig files
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/libav*.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/libsw*.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/freetype2.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/harfbuzz.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/libpng*.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
+    cp /usr/lib/aarch64-linux-gnu/pkgconfig/graphite2.pc ${SYSROOT}/usr/lib/pkgconfig/
+
+# 4. Set up working directory
+WORKDIR /workspace
+
+# Copy codebase
+COPY . /workspace
+
+# Default command compiles and bundles the dependency shared libraries alongside built outputs
+CMD [". /opt/qcap-dev-init && mkdir -p build/lib && cd build && cmake -DCMAKE_TOOLCHAIN_FILE=${OE_CMAKE_TOOLCHAIN_FILE} -DCMAKE_EXE_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" .. && make -j$(nproc) && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libav*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libsw*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libfreetype*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libharfbuzz*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libpng*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libgraphite2*.so* lib/"]

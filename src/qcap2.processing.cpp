@@ -149,6 +149,7 @@ static bool init_resampler(qcap2_audio_resampler_priv_t* p, ULONG in_ch, ULONG i
     AVSampleFormat in_sample_fmt = (AVSampleFormat)in_fmt;
     AVSampleFormat out_sample_fmt = (AVSampleFormat)p->out_sample_fmt;
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
     AVChannelLayout in_layout;
     AVChannelLayout out_layout;
     av_channel_layout_default(&in_layout, in_ch);
@@ -161,6 +162,16 @@ static bool init_resampler(qcap2_audio_resampler_priv_t* p, ULONG in_ch, ULONG i
 
     av_channel_layout_uninit(&in_layout);
     av_channel_layout_uninit(&out_layout);
+#else
+    uint64_t in_layout = av_get_default_channel_layout(in_ch);
+    uint64_t out_layout = av_get_default_channel_layout(p->out_channels);
+
+    p->swr_ctx = swr_alloc_set_opts(p->swr_ctx,
+                                    out_layout, out_sample_fmt, p->out_sample_freq,
+                                    in_layout, in_sample_fmt, in_rate,
+                                    0, nullptr);
+    int ret = p->swr_ctx ? 0 : -1;
+#endif
 
     if (ret < 0 || !p->swr_ctx) {
         return false;
@@ -447,7 +458,12 @@ QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis) {
 
     p->avctx->bit_rate = rate;
     p->avctx->sample_rate = freq;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
     av_channel_layout_default(&p->avctx->ch_layout, ch);
+#else
+    p->avctx->channels = ch;
+    p->avctx->channel_layout = av_get_default_channel_layout(ch);
+#endif
 
     if (codec->sample_fmts) {
         p->avctx->sample_fmt = codec->sample_fmts[0];
@@ -535,7 +551,12 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
     double dSampleTime = 0;
     qcap2_av_frame_get_sample_time(pFrame, &dSampleTime);
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
     av_channel_layout_default(&av_frame->ch_layout, in_ch);
+#else
+    av_frame->channels = in_ch;
+    av_frame->channel_layout = av_get_default_channel_layout(in_ch);
+#endif
     av_frame->format = p->avctx->sample_fmt; // Assume input format matches encoder requirement via resampler
     av_frame->sample_rate = in_rate;
     av_frame->nb_samples = in_size;
@@ -786,7 +807,12 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
         }
     }
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
     av_channel_layout_default(&p->avctx->ch_layout, ch);
+#else
+    p->avctx->channels = ch;
+    p->avctx->channel_layout = av_get_default_channel_layout(ch);
+#endif
     p->avctx->sample_rate = freq;
 
     if (avcodec_open2(p->avctx, codec, nullptr) < 0) {
@@ -918,7 +944,11 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
             if (out_data) {
                 qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
                 int ch = frame->ch_layout.nb_channels;
+#else
+                int ch = frame->channels;
+#endif
                 int in_rate = frame->sample_rate;
                 int format = frame->format;
 
@@ -1378,7 +1408,11 @@ static AVPixelFormat qcap2_to_ffmpeg_pix_fmt(ULONG nColorSpaceType) {
         case QCAP_COLORSPACE_TYPE_YV24:  return AV_PIX_FMT_YUV444P;
         case QCAP_COLORSPACE_TYPE_NV12:  return AV_PIX_FMT_NV12;
         case QCAP_COLORSPACE_TYPE_P010:  return AV_PIX_FMT_P010LE;
+#ifdef AV_PIX_FMT_P210LE
         case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_P210LE;
+#else
+        case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_NONE;
+#endif
         case QCAP_COLORSPACE_TYPE_Y416:  return AV_PIX_FMT_NONE;
         default:                         return AV_PIX_FMT_NONE;
     }
@@ -1580,10 +1614,18 @@ public:
                     src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
                     src_ptrs[1] += p->crop_y * src_strides[1] + p->crop_x;
                     src_ptrs[2] += p->crop_y * src_strides[2] + p->crop_x;
-                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE || in_pix_fmt == AV_PIX_FMT_P210LE) {
+                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE
+#ifdef AV_PIX_FMT_P210LE
+                           || in_pix_fmt == AV_PIX_FMT_P210LE
+#endif
+                ) {
                     int bpp = (in_pix_fmt == AV_PIX_FMT_NV12) ? 1 : 2;
                     src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * bpp;
+#ifdef AV_PIX_FMT_P210LE
                     int chroma_y_div = (in_pix_fmt == AV_PIX_FMT_P210LE) ? 1 : 2;
+#else
+                    int chroma_y_div = 2;
+#endif
                     src_ptrs[1] += (p->crop_y / chroma_y_div) * src_strides[1] + p->crop_x * 2;
                 }
             }
@@ -2136,7 +2178,11 @@ static AVPixelFormat qcap2_encoder_to_ffmpeg_pix_fmt(ULONG nColorSpaceType) {
         case QCAP_COLORSPACE_TYPE_ARGB32: return AV_PIX_FMT_ARGB;
         case QCAP_COLORSPACE_TYPE_ABGR32: return AV_PIX_FMT_ABGR;
         case QCAP_COLORSPACE_TYPE_P010:  return AV_PIX_FMT_P010LE;
+#ifdef AV_PIX_FMT_P210LE
         case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_P210LE;
+#else
+        case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_NONE;
+#endif
         default:                         return AV_PIX_FMT_NONE;
     }
 }
@@ -2810,7 +2856,11 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
     // Handle IDR request
     if (p->request_idr.exchange(false)) {
         av_frame->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
         av_frame->flags |= AV_FRAME_FLAG_KEY;
+#else
+        av_frame->key_frame = 1;
+#endif
     }
 
     // Send frame to encoder

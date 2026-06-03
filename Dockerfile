@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Configure git to trust the workspace directory system-wide
+RUN git config --system --add safe.directory '*'
+
 # Set up working directory
 WORKDIR /workspace
 

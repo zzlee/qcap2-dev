@@ -48,11 +48,14 @@ RUN SYSROOT=/opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux && \
     cp /usr/lib/aarch64-linux-gnu/pkgconfig/libpng*.pc ${SYSROOT}/usr/lib/pkgconfig/ && \
     cp /usr/lib/aarch64-linux-gnu/pkgconfig/graphite2.pc ${SYSROOT}/usr/lib/pkgconfig/
 
+# Configure git to trust the workspace directory system-wide
+RUN git config --system --add safe.directory '*'
+
 # 4. Set up working directory
 WORKDIR /workspace
 
 # Copy codebase
 COPY . /workspace
 
-# Default command compiles and bundles the dependency shared libraries alongside built outputs
-CMD [". /opt/qcap-dev-init && mkdir -p build/lib && cd build && cmake -DCMAKE_TOOLCHAIN_FILE=${OE_CMAKE_TOOLCHAIN_FILE} -DCMAKE_EXE_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" .. && make -j$(nproc) && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libav*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libsw*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libfreetype*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libharfbuzz*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libpng*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libgraphite2*.so* lib/"]
+# Default command compiles, bundles the dependency shared libraries alongside built outputs, and generates packages via CPack
+CMD [". /opt/qcap-dev-init && mkdir -p build/lib && cd build && cmake -DCMAKE_TOOLCHAIN_FILE=${OE_CMAKE_TOOLCHAIN_FILE} -DCMAKE_EXE_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" .. && make -j$(nproc) && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libav*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libsw*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libfreetype*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libharfbuzz*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libpng*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libgraphite2*.so* lib/ && cpack"]

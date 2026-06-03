@@ -32,7 +32,7 @@ build-xlnk2:
   stage: test
   script:
     - docker build -t qcap2-build-env-xlnk2 -f Dockerfile.xlnk2 .
-    - docker create --name compile_container qcap2-build-env-xlnk2
+    - docker create --name compile_container -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 qcap2-build-env-xlnk2
     - docker cp . compile_container:/workspace/
     - docker start -a compile_container
     - docker cp compile_container:/workspace/build/ build/

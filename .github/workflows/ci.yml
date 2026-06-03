@@ -96,7 +96,7 @@ jobs:
         run: |
           cd build
           dpkg-deb --version 2>/dev/null || echo "dpkg-deb not available"
-          cpack -G DEB -G TGZ 2>&1
+          cpack -G "DEB;TGZ" 2>&1
           ls -lh *.deb *.tar.gz 2>/dev/null || true
           echo "--- Packages found ---"
           find . -maxdepth 1 \( -name '*.deb' -o -name '*.tar.gz' \) -ls
@@ -138,7 +138,7 @@ jobs:
             -v "$PWD:/workspace" \
             -w /workspace \
             qcap2-build-env-xlnk2 \
-            sh -c ". /opt/qcap-dev-init && cd build && cmake -DCMAKE_TOOLCHAIN_FILE=\${OE_CMAKE_TOOLCHAIN_FILE} -DCMAKE_EXE_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE=arm64 .. && make -j\$(nproc) && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libav*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libsw*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libfreetype*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libharfbuzz*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libpng*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libgraphite2*.so* lib/ && dpkg-deb --version 2>/dev/null || echo 'dpkg-deb not available in container'; cpack -G DEB -G TGZ 2>&1; ls -lh *.deb *.tar.gz 2>/dev/null || true"
+            sh -c ". /opt/qcap-dev-init && cd build && cmake -DCMAKE_TOOLCHAIN_FILE=\${OE_CMAKE_TOOLCHAIN_FILE} -DCMAKE_EXE_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCMAKE_SHARED_LINKER_FLAGS=\"-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu\" -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE=arm64 .. && make -j\$(nproc) && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libav*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libsw*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libfreetype*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libharfbuzz*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libpng*.so* lib/ && cp -d /opt/sc6f0/sysroots/cortexa72-cortexa53-xilinx-linux/usr/lib/libgraphite2*.so* lib/ && dpkg-deb --version 2>/dev/null || echo 'dpkg-deb not available in container'; cpack -G "DEB;TGZ" 2>&1; ls -lh *.deb *.tar.gz 2>/dev/null || true"
 
       - name: Upload xlnk2 packages
         uses: actions/upload-artifact@v4

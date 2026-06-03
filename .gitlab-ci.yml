@@ -27,11 +27,16 @@ variables:
     - docker build -t "$BUILD_IMAGE" .
 
 # Build and test on native amd64
-test-amd64:
+build-amd64:
   extends: .amd64-template
   stage: test
   script:
-    - docker run --rm "$BUILD_IMAGE"
+    - |
+      docker run --rm \
+        -e CI_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+        -e CI_COMMIT_BRANCH="$CI_COMMIT_BRANCH" \
+        -e CI_COMMIT_TAG="$CI_COMMIT_TAG" \
+        "$BUILD_IMAGE"
 
 # Cross-compile for xlnk2_arm64 and export build artifacts
 build-xlnk2:
@@ -39,7 +44,13 @@ build-xlnk2:
   stage: test
   script:
     - docker build -t qcap2-build-env-xlnk2 -f Dockerfile.xlnk2 .
-    - docker create --name compile_container -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 qcap2-build-env-xlnk2
+    - |
+      docker create --name compile_container \
+        -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 \
+        -e CI_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+        -e CI_COMMIT_BRANCH="$CI_COMMIT_BRANCH" \
+        -e CI_COMMIT_TAG="$CI_COMMIT_TAG" \
+        qcap2-build-env-xlnk2
     - docker cp . compile_container:/workspace/
     - docker start -a compile_container
     - docker cp compile_container:/workspace/build/ build/

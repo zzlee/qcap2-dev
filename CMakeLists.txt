@@ -256,7 +256,7 @@ install(DIRECTORY include/
 # CPack configuration (DEB + TGZ)
 # ==============================================================================
 set(CPACK_PACKAGE_NAME "qcap2")
-set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_PACKAGE_VERSION "1.0.0")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "QCAP2 - Multimedia capture and processing library")
 set(CPACK_PACKAGE_VENDOR "Bill Yuan")
 set(CPACK_PACKAGE_CONTACT "bill@yuan.com.tw")

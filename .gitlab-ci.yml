@@ -1,0 +1,122 @@
+stages:
+  - build-images
+  - test-and-build
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev")'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev")'
+    - when: never
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_BUILDKIT: "1"
+  AMD64_BUILD_IMAGE: $CI_REGISTRY_IMAGE/qcap2-build-env-amd64
+  XLNK2_BUILD_IMAGE: $CI_REGISTRY_IMAGE/qcap2-build-env-xlnk2
+
+# Base job template for docker-in-docker operations
+.docker-job:
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+  before_script:
+    - |
+      if [ -n "$CI_REGISTRY" ]; then
+        echo "Logging into GitLab Container Registry..."
+        docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+      else
+        echo "GitLab Container Registry not configured, skipping login."
+      fi
+
+# Stage 1: Build the docker environments if Dockerfiles change
+build-env-amd64:
+  extends: .docker-job
+  stage: build-images
+  rules:
+    - changes:
+        - Dockerfile
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: manual
+      allow_failure: true
+  script:
+    - docker pull "$AMD64_BUILD_IMAGE:latest" || true
+    - docker build --pull --cache-from "$AMD64_BUILD_IMAGE:latest" -t "$AMD64_BUILD_IMAGE:$CI_COMMIT_SHA" -t "$AMD64_BUILD_IMAGE:latest" -f Dockerfile .
+    - |
+      if [ -n "$CI_REGISTRY" ]; then
+        docker push "$AMD64_BUILD_IMAGE:$CI_COMMIT_SHA"
+        docker push "$AMD64_BUILD_IMAGE:latest"
+      fi
+
+build-env-xlnk2:
+  extends: .docker-job
+  stage: build-images
+  rules:
+    - changes:
+        - Dockerfile.xlnk2
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+      when: manual
+      allow_failure: true
+  script:
+    - docker pull "$XLNK2_BUILD_IMAGE:latest" || true
+    - docker build --pull --cache-from "$XLNK2_BUILD_IMAGE:latest" -t "$XLNK2_BUILD_IMAGE:$CI_COMMIT_SHA" -t "$XLNK2_BUILD_IMAGE:latest" -f Dockerfile.xlnk2 .
+    - |
+      if [ -n "$CI_REGISTRY" ]; then
+        docker push "$XLNK2_BUILD_IMAGE:$CI_COMMIT_SHA"
+        docker push "$XLNK2_BUILD_IMAGE:latest"
+      fi
+
+# Stage 2: Compile and test the project
+test-amd64:
+  extends: .docker-job
+  stage: test-and-build
+  script:
+    - |
+      IMAGE_TO_USE="$AMD64_BUILD_IMAGE:latest"
+      if [ -n "$CI_REGISTRY" ]; then
+        if docker pull "$AMD64_BUILD_IMAGE:$CI_COMMIT_SHA"; then
+          IMAGE_TO_USE="$AMD64_BUILD_IMAGE:$CI_COMMIT_SHA"
+        elif docker pull "$AMD64_BUILD_IMAGE:latest"; then
+          IMAGE_TO_USE="$AMD64_BUILD_IMAGE:latest"
+        fi
+      fi
+      echo "Using image $IMAGE_TO_USE"
+      if ! docker inspect "$IMAGE_TO_USE" >/dev/null 2>&1; then
+        echo "Build image not found in registry. Building on the fly..."
+        docker build -t "$IMAGE_TO_USE" -f Dockerfile .
+      fi
+    - docker create --name test_container "$IMAGE_TO_USE"
+    - docker cp . test_container:/workspace/
+    - docker start -a test_container
+    - docker rm test_container
+
+build-xlnk2:
+  extends: .docker-job
+  stage: test-and-build
+  script:
+    - |
+      IMAGE_TO_USE="$XLNK2_BUILD_IMAGE:latest"
+      if [ -n "$CI_REGISTRY" ]; then
+        if docker pull "$XLNK2_BUILD_IMAGE:$CI_COMMIT_SHA"; then
+          IMAGE_TO_USE="$XLNK2_BUILD_IMAGE:$CI_COMMIT_SHA"
+        elif docker pull "$XLNK2_BUILD_IMAGE:latest"; then
+          IMAGE_TO_USE="$XLNK2_BUILD_IMAGE:latest"
+        fi
+      fi
+      echo "Using image $IMAGE_TO_USE"
+      if ! docker inspect "$IMAGE_TO_USE" >/dev/null 2>&1; then
+        echo "Build image not found in registry. Building on the fly..."
+        docker build -t "$IMAGE_TO_USE" -f Dockerfile.xlnk2 .
+      fi
+    - docker create --name compile_container -e USER=root -e HOST_UID=1000 -e HOST_GID=1000 "$IMAGE_TO_USE"
+    - docker cp . compile_container:/workspace/
+    - docker start -a compile_container
+    - docker cp compile_container:/workspace/build .
+    - docker rm compile_container
+  artifacts:
+    name: "qcap2-xlnk2-build-$CI_COMMIT_REF_SLUG"
+    paths:
+      - build/lib/
+      - build/test_*
+    expire_in: 1 week

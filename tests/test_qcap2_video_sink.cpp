@@ -69,8 +69,7 @@ int main() {
 
     // Pop from queue
     qcap2_rcbuffer_t* popped_rcbuf = nullptr;
-    // The public signature: QRESULT qcap2_video_sink_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
-    ret = qcap2_video_sink_pop(reinterpret_cast<qcap2_video_source_t*>(sink), &popped_rcbuf);
+    ret = qcap2_video_sink_pop(sink, &popped_rcbuf);
     assert(ret == QCAP_RS_SUCCESSFUL && popped_rcbuf != nullptr);
 
     PVOID pData = qcap2_rcbuffer_lock_data(popped_rcbuf);
@@ -170,6 +169,13 @@ int main() {
 
     // Wait a brief moment to allow the playback thread function to run
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Pop and release recycled buffer
+    qcap2_rcbuffer_t* popped_drm_rcbuf = nullptr;
+    ret = qcap2_video_sink_pop(drm_sink, &popped_drm_rcbuf);
+    assert(ret == QCAP_RS_SUCCESSFUL && popped_drm_rcbuf != nullptr);
+    assert(popped_drm_rcbuf == drm_rcbuf);
+    qcap2_rcbuffer_release(popped_drm_rcbuf);
 
     // Stop and clean up DRM sink
     qcap2_video_sink_stop(drm_sink);

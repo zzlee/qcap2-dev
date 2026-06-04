@@ -553,16 +553,33 @@ void test_video_encoder_h264_basic() {
     // Create and push multiple frames to ensure encoder produces output
     int frames_pushed = 0;
 
+    qcap2_rcbuffer_t* in_rc = nullptr;
     for (int f = 0; f < 5; ++f) {
-        qcap2_av_frame_t in_frame;
-        qcap2_av_frame_init(&in_frame);
-        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
-        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+        if (f == 0) {
+            qcap2_av_frame_t* in_frame = new qcap2_av_frame_t;
+            qcap2_av_frame_init(in_frame);
+            qcap2_av_frame_set_video_property(in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
+            assert(qcap2_av_frame_alloc_buffer(in_frame, 16, 1));
+
+            in_rc = qcap2_rcbuffer_new(in_frame, [](PVOID p) {
+                qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+                delete (qcap2_av_frame_t*)p;
+            });
+        } else {
+            // Pop the recycled input buffer (HPR model)
+            qcap2_rcbuffer_t* recycled = nullptr;
+            assert(qcap2_video_encoder_pop_input(encoder, &recycled) == QCAP_RS_SUCCESSFUL);
+            assert(recycled == in_rc);
+        }
 
         // Fill with a pattern
+        PVOID pData = qcap2_rcbuffer_lock_data(in_rc);
+        assert(pData != nullptr);
+        qcap2_av_frame_t* frame = (qcap2_av_frame_t*)pData;
+
         uint8_t* ptrs[4] = { nullptr };
         int strides[4] = { 0 };
-        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
+        qcap2_av_frame_get_buffer1(frame, ptrs, strides);
         // Fill Y plane with gradient
         for (int y = 0; y < 240; ++y) {
             for (int x = 0; x < strides[0] && x < 320; ++x) {
@@ -573,11 +590,8 @@ void test_video_encoder_h264_basic() {
         if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 120);
         if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 120);
 
-        qcap2_av_frame_set_pts(&in_frame, f * 3000);
-
-        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
-            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
-        });
+        qcap2_av_frame_set_pts(frame, f * 3000);
+        qcap2_rcbuffer_unlock_data(in_rc);
 
         assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
         qcap2_rcbuffer_release(in_rc);
@@ -591,6 +605,14 @@ void test_video_encoder_h264_basic() {
     // Verify we got at least some encoded packets during the push calls
     // With zerolatency and 5 frames, we should have gotten packets
     // Since stop() drains the queue, we verify the lifecycle is clean
+    qcap2_rcbuffer_t* pkt_rc = nullptr;
+    while (qcap2_video_encoder_pop(encoder, &pkt_rc) == QCAP_RS_SUCCESSFUL) {
+        assert(pkt_rc != nullptr);
+        // Recycle the output packet using push_output + release (PPR model)
+        assert(qcap2_video_encoder_push_output(encoder, pkt_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(pkt_rc);
+        pkt_rc = nullptr;
+    }
 
     // Restart and encode again to test restart
     enc_prop = qcap2_video_encoder_property_new();
@@ -625,6 +647,12 @@ void test_video_encoder_h264_basic() {
         assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
         qcap2_rcbuffer_release(in_rc);
 
+        // Pop recycled input buffer (HPR model)
+        qcap2_rcbuffer_t* recycled_in = nullptr;
+        assert(qcap2_video_encoder_pop_input(encoder, &recycled_in) == QCAP_RS_SUCCESSFUL);
+        assert(recycled_in == in_rc);
+        qcap2_rcbuffer_release(recycled_in);
+
         // With zerolatency, the first frame should produce a packet immediately
         qcap2_rcbuffer_t* out_rc = NULL;
         assert(qcap2_video_encoder_pop(encoder, &out_rc) == QCAP_RS_SUCCESSFUL);
@@ -652,6 +680,9 @@ void test_video_encoder_h264_basic() {
         assert(pkt_pts >= 0);
 
         qcap2_rcbuffer_unlock_data(out_rc);
+
+        // Recycle the output packet (PPR model)
+        assert(qcap2_video_encoder_push_output(encoder, out_rc) == QCAP_RS_SUCCESSFUL);
         qcap2_rcbuffer_release(out_rc);
     }
 
@@ -701,6 +732,12 @@ void test_video_encoder_bgr24_input() {
     assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(in_rc);
 
+    // Pop and recycle input frame (HPR model)
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_video_encoder_pop_input(encoder, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
+
     // With zerolatency, pop immediately
     qcap2_rcbuffer_t* out_rc = NULL;
     assert(qcap2_video_encoder_pop(encoder, &out_rc) == QCAP_RS_SUCCESSFUL);
@@ -715,6 +752,9 @@ void test_video_encoder_bgr24_input() {
     assert(pkt_size > 0);
 
     qcap2_rcbuffer_unlock_data(out_rc);
+
+    // Recycle output packet (PPR model)
+    assert(qcap2_video_encoder_push_output(encoder, out_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(out_rc);
 
     assert(qcap2_video_encoder_stop(encoder) == QCAP_RS_SUCCESSFUL);
@@ -951,16 +991,33 @@ void test_video_decoder_h264_integration() {
 
     // Push 3 raw gradient frames to encoder to get compressed packets
     std::vector<qcap2_rcbuffer_t*> encoded_packets;
+    qcap2_rcbuffer_t* in_rc = nullptr;
     for (int f = 0; f < 3; ++f) {
-        qcap2_av_frame_t in_frame;
-        qcap2_av_frame_init(&in_frame);
-        qcap2_av_frame_set_video_property(&in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
-        assert(qcap2_av_frame_alloc_buffer(&in_frame, 16, 1));
+        if (f == 0) {
+            qcap2_av_frame_t* in_frame = new qcap2_av_frame_t;
+            qcap2_av_frame_init(in_frame);
+            qcap2_av_frame_set_video_property(in_frame, QCAP_COLORSPACE_TYPE_I420, 320, 240);
+            assert(qcap2_av_frame_alloc_buffer(in_frame, 16, 1));
+
+            in_rc = qcap2_rcbuffer_new(in_frame, [](PVOID p) {
+                qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
+                delete (qcap2_av_frame_t*)p;
+            });
+        } else {
+            // Pop the recycled input buffer (HPR model)
+            qcap2_rcbuffer_t* recycled = nullptr;
+            assert(qcap2_video_encoder_pop_input(encoder, &recycled) == QCAP_RS_SUCCESSFUL);
+            assert(recycled == in_rc);
+        }
+
+        // Fill gradient
+        PVOID pData = qcap2_rcbuffer_lock_data(in_rc);
+        assert(pData != nullptr);
+        qcap2_av_frame_t* frame = (qcap2_av_frame_t*)pData;
 
         uint8_t* ptrs[4] = { nullptr };
         int strides[4] = { 0 };
-        qcap2_av_frame_get_buffer1(&in_frame, ptrs, strides);
-        // Fill gradient
+        qcap2_av_frame_get_buffer1(frame, ptrs, strides);
         for (int y = 0; y < 240; ++y) {
             for (int x = 0; x < 320; ++x) {
                 ptrs[0][y * strides[0] + x] = (uint8_t)((y + x + f * 10) % 256);
@@ -969,11 +1026,8 @@ void test_video_decoder_h264_integration() {
         if (ptrs[1]) memset(ptrs[1], 128, strides[1] * 120);
         if (ptrs[2]) memset(ptrs[2], 128, strides[2] * 120);
 
-        qcap2_av_frame_set_pts(&in_frame, f * 3000);
-
-        qcap2_rcbuffer_t* in_rc = qcap2_rcbuffer_new(&in_frame, [](PVOID p) {
-            qcap2_av_frame_free_buffer((qcap2_av_frame_t*)p);
-        });
+        qcap2_av_frame_set_pts(frame, f * 3000);
+        qcap2_rcbuffer_unlock_data(in_rc);
 
         assert(qcap2_video_encoder_push(encoder, in_rc) == QCAP_RS_SUCCESSFUL);
         qcap2_rcbuffer_release(in_rc);
@@ -984,10 +1038,7 @@ void test_video_decoder_h264_integration() {
         encoded_packets.push_back(out_pkt_rc);
     }
 
-    qcap2_video_encoder_stop(encoder);
-    qcap2_video_encoder_delete(encoder);
-
-    // 2. Setup decoder
+    // 2. Setup decoder (keep encoder alive to allow recycling packets to it)
     qcap2_video_decoder_t* decoder = qcap2_video_decoder_new();
     assert(decoder != NULL);
 
@@ -1005,12 +1056,27 @@ void test_video_decoder_h264_integration() {
 
     assert(qcap2_video_decoder_start(decoder) == QCAP_RS_SUCCESSFUL);
 
-    // Push encoded packets to decoder
+    // Push encoded packets to decoder and recycle them
     for (auto pkt_rc : encoded_packets) {
         assert(qcap2_video_decoder_push(decoder, pkt_rc) == QCAP_RS_SUCCESSFUL);
+
+        // Pop recycled packet from decoder (HPR model)
+        qcap2_rcbuffer_t* recycled_pkt = nullptr;
+        assert(qcap2_video_decoder_pop_input(decoder, &recycled_pkt) == QCAP_RS_SUCCESSFUL);
+        assert(recycled_pkt == pkt_rc);
+
+        // Recycle it back to the encoder's output queue (PPR model)
+        assert(qcap2_video_encoder_push_output(encoder, recycled_pkt) == QCAP_RS_SUCCESSFUL);
+
+        // Release references
+        qcap2_rcbuffer_release(recycled_pkt);
         qcap2_rcbuffer_release(pkt_rc);
     }
     encoded_packets.clear();
+
+    // Now stop and delete the encoder safely
+    qcap2_video_encoder_stop(encoder);
+    qcap2_video_encoder_delete(encoder);
 
     // Pop and verify decoded frames
     for (int f = 0; f < 3; ++f) {
@@ -1034,6 +1100,9 @@ void test_video_decoder_h264_integration() {
         assert(pts == f);
 
         qcap2_rcbuffer_unlock_data(decoded_rc);
+
+        // Recycle the decoder output raw frame (PPR model)
+        assert(qcap2_video_decoder_push_output(decoder, decoded_rc) == QCAP_RS_SUCCESSFUL);
         qcap2_rcbuffer_release(decoded_rc);
     }
 

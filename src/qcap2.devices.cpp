@@ -1167,6 +1167,13 @@ QRESULT qcap2_audio_source_pop(qcap2_audio_source_t* pThis, qcap2_rcbuffer_t** p
     return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
 }
 
+QRESULT qcap2_audio_source_push(qcap2_audio_source_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    qcap2_audio_source_priv_t* priv = reinterpret_cast<qcap2_audio_source_priv_t*>(pThis);
+    return qcap2_rcbuffer_queue_push(priv->queue, pRCBuffer);
+}
+
+
 class qcap2_alsa_audio_sink_backend_t : public qcap2_audio_sink_backend_t {
 private:
     qcap2_audio_sink_priv_t* p;
@@ -1191,6 +1198,7 @@ private:
                     }
                     qcap2_rcbuffer_unlock_data(rcbuf);
                 }
+                qcap2_rcbuffer_queue_push(self->p->recycled_queue, rcbuf);
                 qcap2_rcbuffer_release(rcbuf);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1266,6 +1274,10 @@ qcap2_audio_sink_priv_t::~qcap2_audio_sink_priv_t() {
     if (queue) {
         qcap2_rcbuffer_queue_delete(queue);
         queue = nullptr;
+    }
+    if (recycled_queue) {
+        qcap2_rcbuffer_queue_delete(recycled_queue);
+        recycled_queue = nullptr;
     }
 }
 
@@ -1400,6 +1412,7 @@ QRESULT qcap2_audio_sink_start(qcap2_audio_sink_t* pThis) {
     if (priv->backend) return QCAP_RS_SUCCESSFUL;
 
     qcap2_rcbuffer_queue_start(priv->queue);
+    qcap2_rcbuffer_queue_start(priv->recycled_queue);
 
     if (priv->backend_type == QCAP2_AUDIO_SINK_BACKEND_TYPE_ALSA) {
         priv->backend = new (std::nothrow) qcap2_alsa_audio_sink_backend_t(priv);
@@ -1422,6 +1435,7 @@ QRESULT qcap2_audio_sink_stop(qcap2_audio_sink_t* pThis) {
     qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
 
     qcap2_rcbuffer_queue_stop(priv->queue);
+    qcap2_rcbuffer_queue_stop(priv->recycled_queue);
 
     if (priv->backend) {
         priv->backend->stop();
@@ -1435,7 +1449,7 @@ QRESULT qcap2_audio_sink_stop(qcap2_audio_sink_t* pThis) {
 QRESULT qcap2_audio_sink_pop(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
     if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_audio_sink_priv_t* priv = reinterpret_cast<qcap2_audio_sink_priv_t*>(pThis);
-    return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
+    return qcap2_rcbuffer_queue_pop(priv->recycled_queue, ppRCBuffer);
 }
 
 QRESULT qcap2_audio_sink_push(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
@@ -1444,7 +1458,7 @@ QRESULT qcap2_audio_sink_push(qcap2_audio_sink_t* pThis, qcap2_rcbuffer_t* pRCBu
     if (priv->backend) {
         return priv->backend->push(pRCBuffer);
     }
-    return qcap2_rcbuffer_queue_push(priv->queue, pRCBuffer);
+    return qcap2_rcbuffer_queue_push(priv->recycled_queue, pRCBuffer);
 }
 
 // alsa.h specific audio sink APIs
@@ -1463,6 +1477,9 @@ qcap2_video_sink_priv_t::~qcap2_video_sink_priv_t() {
     qcap2_video_sink_stop(reinterpret_cast<qcap2_video_sink_t*>(this));
     if (queue) {
         qcap2_rcbuffer_queue_delete(queue);
+    }
+    if (recycled_queue) {
+        qcap2_rcbuffer_queue_delete(recycled_queue);
     }
 }
 
@@ -1607,6 +1624,7 @@ private:
             }
 
             qcap2_rcbuffer_unlock_data(rcbuf);
+            qcap2_rcbuffer_queue_push(self->p->recycled_queue, rcbuf);
             qcap2_rcbuffer_release(rcbuf);
 
             if (queued_count == self->slot_count && !stream_on) {
@@ -1864,6 +1882,7 @@ private:
             }
 
             qcap2_rcbuffer_unlock_data(rcbuf);
+            qcap2_rcbuffer_queue_push(self->p->recycled_queue, rcbuf);
             qcap2_rcbuffer_release(rcbuf);
         }
     }
@@ -2041,6 +2060,7 @@ QRESULT qcap2_video_sink_start(qcap2_video_sink_t* pThis) {
     if (priv->backend) return QCAP_RS_SUCCESSFUL;
 
     qcap2_rcbuffer_queue_start(priv->queue);
+    qcap2_rcbuffer_queue_start(priv->recycled_queue);
 
     if (priv->backend_type == QCAP2_VIDEO_SINK_BACKEND_TYPE_V4L2) {
         priv->backend = new (std::nothrow) qcap2_v4l2_video_sink_backend_t(priv);
@@ -2072,6 +2092,7 @@ QRESULT qcap2_video_sink_stop(qcap2_video_sink_t* pThis) {
     qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
 
     qcap2_rcbuffer_queue_stop(priv->queue);
+    qcap2_rcbuffer_queue_stop(priv->recycled_queue);
 
     if (priv->backend) {
         priv->backend->stop();
@@ -2082,10 +2103,10 @@ QRESULT qcap2_video_sink_stop(qcap2_video_sink_t* pThis) {
     return QCAP_RS_SUCCESSFUL;
 }
 
-QRESULT qcap2_video_sink_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+QRESULT qcap2_video_sink_pop(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
     if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_sink_priv_t* priv = reinterpret_cast<qcap2_video_sink_priv_t*>(pThis);
-    return qcap2_rcbuffer_queue_pop(priv->queue, ppRCBuffer);
+    return qcap2_rcbuffer_queue_pop(priv->recycled_queue, ppRCBuffer);
 }
 
 QRESULT qcap2_video_sink_push(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
@@ -2094,7 +2115,7 @@ QRESULT qcap2_video_sink_push(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t* pRCBu
     if (priv->backend) {
         return priv->backend->push(pRCBuffer);
     }
-    return qcap2_rcbuffer_queue_push(priv->queue, pRCBuffer);
+    return qcap2_rcbuffer_queue_push(priv->recycled_queue, pRCBuffer);
 }
 
 // v4l2.h specific video sink APIs

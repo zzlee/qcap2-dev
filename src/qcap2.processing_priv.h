@@ -20,6 +20,8 @@ typedef struct qcap2_audio_encoder_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     qcap2_audio_encoder_property_t* property;
     uint8_t* extra_data;
@@ -45,6 +47,14 @@ typedef struct qcap2_audio_encoder_priv_t {
         event = nullptr;
         avctx = nullptr;
         running = false;
+        input_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_start(input_recycled_queue);
+        }
+        output_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_start(output_recycled_queue);
+        }
     }
 
     ~qcap2_audio_encoder_priv_t() {
@@ -61,6 +71,12 @@ typedef struct qcap2_audio_encoder_priv_t {
             qcap2_rcbuffer_release(output_queue.front());
             output_queue.pop();
         }
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(input_recycled_queue);
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(output_recycled_queue);
+        }
         delete cv;
         delete mtx;
     }
@@ -70,6 +86,8 @@ typedef struct qcap2_video_encoder_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     // Encoder property (owned reference)
     qcap2_video_encoder_property_t* enc_prop;
@@ -132,6 +150,14 @@ typedef struct qcap2_video_encoder_priv_t {
         cached_in_color = 0;
         cached_in_w = 0;
         cached_in_h = 0;
+        input_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_start(input_recycled_queue);
+        }
+        output_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_start(output_recycled_queue);
+        }
     }
 
     ~qcap2_video_encoder_priv_t() {
@@ -139,6 +165,12 @@ typedef struct qcap2_video_encoder_priv_t {
         if (enc_prop) { qcap2_video_encoder_property_delete(enc_prop); enc_prop = nullptr; }
         if (dyn_prop) { qcap2_video_encoder_dynamic_property_delete(dyn_prop); dyn_prop = nullptr; }
         if (extra_data) { free(extra_data); extra_data = nullptr; }
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(input_recycled_queue);
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(output_recycled_queue);
+        }
         delete cv;
         delete mtx;
     }
@@ -169,6 +201,8 @@ typedef struct qcap2_audio_decoder_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     qcap2_audio_encoder_property_t* property;
     uint8_t* extra_data;
@@ -206,6 +240,15 @@ typedef struct qcap2_audio_decoder_priv_t {
         bypass_decoding = false;
         notify_mtx = nullptr;
         notify_cv = nullptr;
+
+        input_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_start(input_recycled_queue);
+        }
+        output_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_start(output_recycled_queue);
+        }
     }
 
     ~qcap2_audio_decoder_priv_t() {
@@ -226,6 +269,12 @@ typedef struct qcap2_audio_decoder_priv_t {
             qcap2_rcbuffer_release(input_queue.front());
             input_queue.pop();
         }
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(input_recycled_queue);
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(output_recycled_queue);
+        }
         delete cv;
         delete mtx;
     }
@@ -235,6 +284,8 @@ typedef struct qcap2_video_decoder_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     // Decoder property (owned copy of encoder properties defining output/stream properties)
     qcap2_video_encoder_property_t* dec_prop;
@@ -310,6 +361,15 @@ typedef struct qcap2_video_decoder_priv_t {
         bypass_decoding = false;
         notify_mtx = nullptr;
         notify_cv = nullptr;
+
+        input_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_start(input_recycled_queue);
+        }
+        output_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_start(output_recycled_queue);
+        }
     }
 
     ~qcap2_video_decoder_priv_t() {
@@ -329,6 +389,12 @@ typedef struct qcap2_video_decoder_priv_t {
         while (!input_queue.empty()) {
             qcap2_rcbuffer_release(input_queue.front());
             input_queue.pop();
+        }
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(input_recycled_queue);
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(output_recycled_queue);
         }
         delete cv;
         delete mtx;

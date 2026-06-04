@@ -497,6 +497,9 @@ QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis) {
         memset(p->extra_data + p->extra_data_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     }
 
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
     p->running = true;
     return QCAP_RS_SUCCESSFUL;
 }
@@ -507,6 +510,18 @@ QRESULT qcap2_audio_encoder_stop(qcap2_audio_encoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     p->running = false;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+
     if (p->avctx) {
         avcodec_free_context(&p->avctx);
     }
@@ -594,26 +609,39 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
             return QCAP_RS_ERROR_GENERAL;
         }
 
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
+
         qcap2_rcbuffer_t* out_rc = nullptr;
-        qcap2_av_packet_t* new_packet = new qcap2_av_packet_t;
-        qcap2_av_packet_init(new_packet);
-        out_rc = qcap2_rcbuffer_new(new_packet, [](PVOID pData) {
-            qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)pData;
-            if (pkt) {
-                qcap2_av_packet_free_buffer(pkt);
-                delete pkt;
-            }
-        });
+        if (rec_rc) {
+            out_rc = rec_rc;
+        } else {
+            qcap2_av_packet_t* new_packet = new qcap2_av_packet_t;
+            qcap2_av_packet_init(new_packet);
+            out_rc = qcap2_rcbuffer_new(new_packet, [](PVOID pData) {
+                qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)pData;
+                if (pkt) {
+                    qcap2_av_packet_free_buffer(pkt);
+                    delete pkt;
+                }
+            });
+        }
 
         if (out_rc) {
             PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
             if (out_data) {
                 qcap2_av_packet_t* out_packet = (qcap2_av_packet_t*)out_data;
-                qcap2_av_packet_alloc_buffer(out_packet, pkt->size);
-
+                
                 uint8_t* out_buf = nullptr;
                 int out_size = 0;
                 qcap2_av_packet_get_buffer(out_packet, &out_buf, &out_size);
+                if (!out_buf || out_size < pkt->size) {
+                    qcap2_av_packet_alloc_buffer(out_packet, pkt->size);
+                    qcap2_av_packet_get_buffer(out_packet, &out_buf, &out_size);
+                }
+                
                 if (out_buf && pkt->size <= out_size) {
                     memcpy(out_buf, pkt->data, pkt->size);
                 }
@@ -625,6 +653,9 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
 
                 qcap2_rcbuffer_unlock_data(out_rc);
                 p->output_queue.push(out_rc);
+                if (rec_rc) {
+                    qcap2_rcbuffer_release(rec_rc);
+                }
             } else {
                 qcap2_rcbuffer_release(out_rc);
             }
@@ -637,6 +668,9 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
     if (p->event) {
         qcap2_event_notify(p->event);
     }
+
+    // Recycle raw input frame (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
 
     return QCAP_RS_SUCCESSFUL;
 }
@@ -655,6 +689,18 @@ QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_encoder_pop_input(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_encoder_push_output(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 // ==============================================================================
@@ -777,6 +823,8 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
     if (p->bypass_decoding) {
+        qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+        qcap2_rcbuffer_queue_start(p->output_recycled_queue);
         p->running = true;
         return QCAP_RS_SUCCESSFUL;
     }
@@ -820,6 +868,9 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
     p->running = true;
     return QCAP_RS_SUCCESSFUL;
 }
@@ -828,6 +879,19 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
     if (!pThis) return QCAP_RS_ERROR_GENERAL;
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
     std::lock_guard<std::mutex> lock(*(p->mtx));
+
+    if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
 
     p->running = false;
     if (p->avctx) {
@@ -862,6 +926,8 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
         if (p->event) {
             qcap2_event_notify(p->event);
         }
+        // Recycle input packet (HPR)
+        qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
         return QCAP_RS_SUCCESSFUL;
     }
 
@@ -923,21 +989,30 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
             return QCAP_RS_ERROR_GENERAL;
         }
 
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
+
         qcap2_rcbuffer_t* out_rc = nullptr;
-        qcap2_av_frame_t* new_frame = new qcap2_av_frame_t;
-        qcap2_av_frame_init(new_frame);
-        out_rc = qcap2_rcbuffer_new(new_frame, [](PVOID pData) {
-            qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
-            if (f) {
-                uint8_t* buf = nullptr;
-                int stride = 0;
-                qcap2_av_frame_get_buffer(f, &buf, &stride);
-                if (buf) {
-                    free(buf);
+        if (rec_rc) {
+            out_rc = rec_rc;
+        } else {
+            qcap2_av_frame_t* new_frame = new qcap2_av_frame_t;
+            qcap2_av_frame_init(new_frame);
+            out_rc = qcap2_rcbuffer_new(new_frame, [](PVOID pData) {
+                qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
+                if (f) {
+                    uint8_t* buf = nullptr;
+                    int stride = 0;
+                    qcap2_av_frame_get_buffer(f, &buf, &stride);
+                    if (buf) {
+                        free(buf);
+                    }
+                    delete f;
                 }
-                delete f;
-            }
-        });
+            });
+        }
 
         if (out_rc) {
             PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
@@ -956,12 +1031,19 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
 
                 int size = av_samples_get_buffer_size(nullptr, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
 
-                uint8_t* out_buf = (uint8_t*)malloc(size);
+                uint8_t* out_buf = nullptr;
+                int out_stride = 0;
+                qcap2_av_frame_get_buffer(out_frame, &out_buf, &out_stride);
+                if (!out_buf || out_stride < size) {
+                    if (out_buf) free(out_buf);
+                    out_buf = (uint8_t*)malloc(size);
+                    qcap2_av_frame_set_buffer(out_frame, out_buf, size);
+                }
+
                 if (out_buf) {
                     uint8_t* out_ptrs[AV_NUM_DATA_POINTERS] = { nullptr };
                     av_samples_fill_arrays(out_ptrs, nullptr, out_buf, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
                     av_samples_copy(out_ptrs, frame->data, 0, 0, frame->nb_samples, ch, (enum AVSampleFormat)format);
-                    qcap2_av_frame_set_buffer(out_frame, out_buf, size);
                 }
 
                 qcap2_av_frame_set_pts(out_frame, frame->pts);
@@ -969,6 +1051,9 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
 
                 qcap2_rcbuffer_unlock_data(out_rc);
                 p->output_queue.push(out_rc);
+                if (rec_rc) {
+                    qcap2_rcbuffer_release(rec_rc);
+                }
             } else {
                 qcap2_rcbuffer_release(out_rc);
             }
@@ -981,6 +1066,9 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
     if (p->event) {
         qcap2_event_notify(p->event);
     }
+
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
 
     return QCAP_RS_SUCCESSFUL;
 }
@@ -999,6 +1087,18 @@ QRESULT qcap2_audio_decoder_pop(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_decoder_pop_input(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_decoder_push_output(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 // ==============================================================================
@@ -2446,13 +2546,32 @@ static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
             return QCAP_RS_ERROR_GENERAL;
         }
 
-        // Wrap the packet data into our output format
-        EncoderOutputPacket* out = new EncoderOutputPacket;
-        qcap2_av_packet_init(&out->packet);
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
 
-        // Copy packet data (avcodec owns the original buffer)
-        out->buffer_size = pkt->size;
-        out->pkt_buffer = new uint8_t[pkt->size];
+        EncoderOutputPacket* out = nullptr;
+        if (rec_rc) {
+            PVOID pData = qcap2_rcbuffer_get_data(rec_rc);
+            out = qcap2_container_of(pData, EncoderOutputPacket, packet);
+            if (out->buffer_size < (size_t)pkt->size) {
+                delete[] out->pkt_buffer;
+                out->pkt_buffer = new uint8_t[pkt->size];
+                out->buffer_size = pkt->size;
+            }
+        } else {
+            out = new EncoderOutputPacket;
+            qcap2_av_packet_init(&out->packet);
+            out->pkt_buffer = new uint8_t[pkt->size];
+            out->buffer_size = pkt->size;
+            out->rc_buffer = qcap2_rcbuffer_new(&out->packet, [](PVOID pData) {
+                EncoderOutputPacket* ep = qcap2_container_of(pData, EncoderOutputPacket, packet);
+                delete[] ep->pkt_buffer;
+                delete ep;
+            });
+        }
+
         memcpy(out->pkt_buffer, pkt->data, pkt->size);
 
         qcap2_av_packet_set_buffer(&out->packet, out->pkt_buffer, pkt->size);
@@ -2463,13 +2582,12 @@ static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
         qcap2_av_packet_set_property(&out->packet, 0, is_key);
         qcap2_av_packet_set_sample_time(&out->packet, (double)pkt->pts / 90000.0);
 
-        out->rc_buffer = qcap2_rcbuffer_new(&out->packet, [](PVOID pData) {
-            EncoderOutputPacket* ep = qcap2_container_of(pData, EncoderOutputPacket, packet);
-            delete[] ep->pkt_buffer;
-            delete ep;
-        });
-
-        p->output_queue.push(out->rc_buffer);
+        qcap2_rcbuffer_t* push_rc = rec_rc ? rec_rc : out->rc_buffer;
+        p->output_queue.push(push_rc);
+        if (rec_rc) {
+            // Keep reference balanced
+            qcap2_rcbuffer_release(rec_rc);
+        }
 
         av_packet_unref(pkt);
     }
@@ -2728,6 +2846,9 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
     p->running = true;
     p->frame_counter = 0;
     return QCAP_RS_SUCCESSFUL;
@@ -2739,6 +2860,17 @@ QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
 
     // Flush the encoder
     if (p->codec_ctx) {
@@ -2882,6 +3014,9 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
         }
     }
 
+    // Recycle raw input frame (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
     return qr;
 }
 
@@ -2899,6 +3034,18 @@ QRESULT qcap2_video_encoder_pop(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_encoder_pop_input(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_encoder_push_output(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 #ifdef __cplusplus
@@ -3027,13 +3174,10 @@ static bool init_decoder_sws(qcap2_video_decoder_priv_t* p, AVPixelFormat src_pi
 }
 
 static qcap2_rcbuffer_t* get_decoder_output_buffer(qcap2_video_decoder_priv_t* p, int dst_w, int dst_h) {
-    if (!p->registered_buffers.empty()) {
-        for (auto buf : p->registered_buffers) {
-            if (qcap2_rcbuffer_use_count(buf) == 1) {
-                qcap2_rcbuffer_add_ref(buf);
-                return buf;
-            }
-        }
+    qcap2_rcbuffer_t* buf = nullptr;
+    if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+        qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &buf);
+        return buf;
     }
 
     qcap2_av_frame_t* out_frame = new qcap2_av_frame_t;
@@ -3369,12 +3513,22 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
     if (p->bypass_decoding) {
+        qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+        qcap2_rcbuffer_queue_start(p->output_recycled_queue);
         p->running = true;
         return QCAP_RS_SUCCESSFUL;
     }
 
     if (!init_decoder(p)) {
         return QCAP_RS_ERROR_GENERAL;
+    }
+
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
+    // Warm up the output recycling queue with registered buffers
+    for (auto buf : p->registered_buffers) {
+        qcap2_rcbuffer_queue_push(p->output_recycled_queue, buf);
     }
 
     p->running = true;
@@ -3387,6 +3541,17 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
 
     if (p->bypass_decoding) {
         p->running = false;
@@ -3427,6 +3592,8 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
         if (p->event) {
             qcap2_event_notify(p->event);
         }
+        // Recycle input packet (HPR)
+        qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
         return QCAP_RS_SUCCESSFUL;
     }
 
@@ -3478,6 +3645,9 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
         }
     }
 
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
     return qr;
 }
 
@@ -3495,6 +3665,18 @@ QRESULT qcap2_video_decoder_pop(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_decoder_pop_input(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_decoder_push_output(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 #ifdef __cplusplus

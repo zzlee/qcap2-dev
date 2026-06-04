@@ -1253,6 +1253,9 @@ static void demuxer_mock_read_thread(qcap2_demuxer_priv_t* priv) {
                 }
             });
 
+            auto vs = priv->video_sources[0];
+            qcap2_video_source_push(vs, enc_rcbuf);
+
             auto venc = priv->video_encoders[0];
             auto venc_priv = reinterpret_cast<qcap2_video_encoder_priv_t*>(venc);
             std::lock_guard<std::mutex> elock(*(venc_priv->mtx));
@@ -1287,6 +1290,9 @@ static void demuxer_mock_read_thread(qcap2_demuxer_priv_t* priv) {
                     delete p;
                 }
             });
+
+            auto as = priv->audio_sources[0];
+            qcap2_audio_source_push(as, enc_rcbuf);
 
             auto aenc = priv->audio_encoders[0];
             auto aenc_priv = reinterpret_cast<qcap2_audio_encoder_priv_t*>(aenc);

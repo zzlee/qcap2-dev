@@ -116,6 +116,7 @@ public:
 
 struct qcap2_audio_sink_priv_t {
     qcap2_rcbuffer_queue_t* queue;
+    qcap2_rcbuffer_queue_t* recycled_queue;
 
     // Configuration
     int backend_type;
@@ -136,6 +137,10 @@ struct qcap2_audio_sink_priv_t {
         queue = qcap2_rcbuffer_queue_new();
         if (queue) {
             qcap2_rcbuffer_queue_start(queue);
+        }
+        recycled_queue = qcap2_rcbuffer_queue_new();
+        if (recycled_queue) {
+            qcap2_rcbuffer_queue_start(recycled_queue);
         }
         backend_type = 0;
         card = 0;
@@ -162,6 +167,7 @@ public:
 
 struct qcap2_video_sink_priv_t {
     qcap2_rcbuffer_queue_t* queue;
+    qcap2_rcbuffer_queue_t* recycled_queue;
 
     // Configuration
     int backend_type;
@@ -201,6 +207,10 @@ struct qcap2_video_sink_priv_t {
         queue = qcap2_rcbuffer_queue_new();
         if (queue) {
             qcap2_rcbuffer_queue_start(queue);
+        }
+        recycled_queue = qcap2_rcbuffer_queue_new();
+        if (recycled_queue) {
+            qcap2_rcbuffer_queue_start(recycled_queue);
         }
         backend_type = 0;
         frame_count = 0;

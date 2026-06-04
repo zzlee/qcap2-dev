@@ -70,6 +70,8 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis);
 QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis);
 QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_video_encoder_pop(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_encoder_pop_input(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_encoder_push_output(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_video_decoder_t
 qcap2_video_decoder_t* qcap2_video_decoder_new();
@@ -91,6 +93,8 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis);
 QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis);
 QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_video_decoder_pop(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_decoder_pop_input(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_decoder_push_output(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_encoder_t
 qcap2_audio_encoder_t* qcap2_audio_encoder_new();
@@ -107,6 +111,8 @@ QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis);
 QRESULT qcap2_audio_encoder_stop(qcap2_audio_encoder_t* pThis);
 QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_encoder_pop_input(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_encoder_push_output(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_decoder_t
 qcap2_audio_decoder_t* qcap2_audio_decoder_new();
@@ -125,6 +131,8 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis);
 QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis);
 QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_audio_decoder_pop(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_decoder_pop_input(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_decoder_push_output(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_frame_pool_t
 qcap2_frame_pool_t* qcap2_frame_pool_new();

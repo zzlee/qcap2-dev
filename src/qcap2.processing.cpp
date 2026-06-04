@@ -691,16 +691,16 @@ QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t**
     return QCAP_RS_SUCCESSFUL;
 }
 
-QRESULT qcap2_audio_encoder_pop_input(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
-    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_audio_encoder_get_input_queue(qcap2_audio_encoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+    return p->input_recycled_queue;
 }
 
-QRESULT qcap2_audio_encoder_push_output(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
-    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_audio_encoder_get_output_queue(qcap2_audio_encoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
+    return p->output_recycled_queue;
 }
 
 // ==============================================================================
@@ -1089,16 +1089,16 @@ QRESULT qcap2_audio_decoder_pop(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t**
     return QCAP_RS_SUCCESSFUL;
 }
 
-QRESULT qcap2_audio_decoder_pop_input(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
-    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_audio_decoder_get_input_queue(qcap2_audio_decoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+    return p->input_recycled_queue;
 }
 
-QRESULT qcap2_audio_decoder_push_output(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
-    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_audio_decoder_get_output_queue(qcap2_audio_decoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
+    return p->output_recycled_queue;
 }
 
 // ==============================================================================
@@ -3036,16 +3036,16 @@ QRESULT qcap2_video_encoder_pop(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t**
     return QCAP_RS_SUCCESSFUL;
 }
 
-QRESULT qcap2_video_encoder_pop_input(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
-    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_video_encoder_get_input_queue(qcap2_video_encoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+    return p->input_recycled_queue;
 }
 
-QRESULT qcap2_video_encoder_push_output(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
-    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_video_encoder_get_output_queue(qcap2_video_encoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
+    return p->output_recycled_queue;
 }
 
 #ifdef __cplusplus
@@ -3667,16 +3667,16 @@ QRESULT qcap2_video_decoder_pop(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t**
     return QCAP_RS_SUCCESSFUL;
 }
 
-QRESULT qcap2_video_decoder_pop_input(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
-    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_video_decoder_get_input_queue(qcap2_video_decoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+    return p->input_recycled_queue;
 }
 
-QRESULT qcap2_video_decoder_push_output(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
-    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+qcap2_rcbuffer_queue_t* qcap2_video_decoder_get_output_queue(qcap2_video_decoder_t* pThis) {
+    if (!pThis) return nullptr;
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
-    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
+    return p->output_recycled_queue;
 }
 
 #ifdef __cplusplus

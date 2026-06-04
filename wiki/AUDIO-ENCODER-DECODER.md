@@ -22,8 +22,8 @@ The audio encoder encapsulates the process of taking uncompressed `qcap2_av_fram
   - Synchronization (`mtx` and `cv`) protects the internal buffer queue.
   - Events set by `qcap2_audio_encoder_set_event()` notify consumers when packets are ready.
 - **Recycling (HPR/PPR):**
-  - **`qcap2_audio_encoder_pop_input()`**: Dequeues a processed raw input frame from the `input_recycled_queue` (HPR model) for reuse.
-  - **`qcap2_audio_encoder_push_output()`**: Returns an empty/used packet buffer to the `output_recycled_queue` (PPR model) to be reused for future output packets.
+  - **`qcap2_audio_encoder_get_input_queue()`**: Returns the input recycled queue pointer (HPR model) where raw input buffers are automatically recycled.
+  - **`qcap2_audio_encoder_get_output_queue()`**: Returns the output recycled queue pointer (PPR model) where empty output packet buffers must be enqueued.
 
 ## `qcap2_audio_decoder_t`
 
@@ -35,8 +35,8 @@ The audio decoder is responsible for converting compressed `qcap2_av_packet_t` r
   - `qcap2_audio_decoder_push()` pulls compressed data off the input `qcap2_rcbuffer_t`, funnels it into `avcodec_send_packet()`, and automatically enqueues the input packet to `input_recycled_queue` for recycling.
   - The decoded frames are retrieved using `avcodec_receive_frame()`, converted dynamically, and re-wrapped inside output `qcap2_rcbuffer_t` objects encapsulating `qcap2_av_frame_t`.
 - **Recycling (HPR/PPR):**
-  - **`qcap2_audio_decoder_pop_input()`**: Dequeues a processed compressed packet from the `input_recycled_queue` (HPR model) for reuse.
-  - **`qcap2_audio_decoder_push_output()`**: Returns an empty/used decoded raw frame to the `output_recycled_queue` (PPR model) to be reused for future decoded frames.
+  - **`qcap2_audio_decoder_get_input_queue()`**: Returns the input recycled queue pointer (HPR model) where compressed packet buffers are automatically recycled.
+  - **`qcap2_audio_decoder_get_output_queue()`**: Returns the output recycled queue pointer (PPR model) where empty decoded raw frame buffers must be enqueued.
 
 ## Implementation Details
 

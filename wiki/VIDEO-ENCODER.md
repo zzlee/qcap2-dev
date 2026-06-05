@@ -83,10 +83,10 @@ The video encoder employs two lifecycle queues to achieve zero-allocation and lo
 1. **Input Queue (Push-Pop-Release / HPR)**:
    - The user calls `qcap2_video_encoder_push()` to submit a raw video frame for encoding.
    - The encoder processes it synchronously and then automatically pushes it to an internal `input_recycled_queue`.
-   - The user retrieves the empty/processed input frame by popping it from the queue returned by `qcap2_video_encoder_get_input_queue()`.
+   - The user retrieves the empty/processed input frame via `qcap2_video_encoder_pop_input()` to reuse it for the next push.
 2. **Output Queue (Pop-Push-Release / PPR)**:
    - The user calls `qcap2_video_encoder_pop()` to retrieve a compressed packet.
-   - Once the user is done reading the packet, they return the empty packet buffer back to the queue returned by `qcap2_video_encoder_get_output_queue()`.
+   - Once the user is done reading the packet, they return the empty packet buffer to the encoder via `qcap2_video_encoder_push_output()`.
    - Finally, they release the user-level reference via `qcap2_rcbuffer_release()`.
 
 ```
@@ -98,7 +98,7 @@ Push (raw frame in)                   Pop (encoded packet out)
 │                 │    (libx264)      │ via rcbuffer     │
 └─────────────────┘                   └──────────────────┘
    ▲                                     │
-   │ (pop from input queue)              │ (push to output queue)
+   │ (pop_input)                         │ (push_output)
    └─────────────── [Recycle] ◄──────────┘
 ```
 
@@ -181,8 +181,8 @@ Encodes a raw video frame:
 ### `qcap2_video_encoder_pop(pThis, ppRCBuffer)`
 Blocks until an encoded packet is available or the encoder is stopped. Returns the oldest queued `qcap2_rcbuffer_t` containing a `qcap2_av_packet_t`.
 
-### `qcap2_video_encoder_get_input_queue(pThis)`
-Returns the `input_recycled_queue` handle (HPR model) where raw input buffers are automatically recycled.
+### `qcap2_video_encoder_pop_input(pThis, ppRCBuffer)`
+Dequeues the oldest processed raw input frame from the `input_recycled_queue` (HPR model). Non-blocking if a recycled frame is available.
 
-### `qcap2_video_encoder_get_output_queue(pThis)`
-Returns the `output_recycled_queue` handle (PPR model) where empty/used output packet buffers must be enqueued.
+### `qcap2_video_encoder_push_output(pThis, pRCBuffer)`
+Enqueues an empty/used packet buffer back to the `output_recycled_queue` (PPR model) so that the encoder can reuse it on future compressions.

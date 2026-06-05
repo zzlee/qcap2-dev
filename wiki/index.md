@@ -27,3 +27,7 @@ This directory contains implementation notes and usage constraints for QCAP2 API
 - [PACKET-POOL.md](./PACKET-POOL.md) — `qcap2_packet_pool_t` pre-allocated packet buffer pool with dynamic resizing and reference-counted recycling.
 - [AUDIO-ENCODER-DECODER.md](./AUDIO-ENCODER-DECODER.md) — `qcap2_audio_encoder_t` and `qcap2_audio_decoder_t` FFmpeg-backed implementations, context mappings, and thread safety rules.
 
+## Buffer Recycling Architecture
+
+- [BUFFER-RECYCLING-ANALYSIS.md](./BUFFER-RECYCLING-ANALYSIS.md) — Multi-perspective architectural analysis of the zero-allocation HPR and PPR models.
+- [RCBUF-QUEUE-RECYCLE-EXPLAINED.md](./RCBUF-QUEUE-RECYCLE-EXPLAINED.md) — Detailed sequence and data flow diagrams explaining host/pipeline buffer recycling and pools.

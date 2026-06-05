@@ -40,6 +40,12 @@ void test_audio_resampler() {
 
     // Push frame
     assert(qcap2_audio_resampler_push(resampler, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_audio_resampler_pop_input(resampler, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
 
     // Pop resampled frame
     qcap2_rcbuffer_t* out_rc = NULL;
@@ -69,9 +75,8 @@ void test_audio_resampler() {
     assert(out_buf != NULL);
 
     qcap2_rcbuffer_unlock_data(out_rc);
+    assert(qcap2_audio_resampler_push_output(resampler, out_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(out_rc);
-
-    qcap2_rcbuffer_release(in_rc);
 
     assert(qcap2_audio_resampler_stop(resampler) == QCAP_RS_SUCCESSFUL);
     qcap2_audio_resampler_delete(resampler);
@@ -114,6 +119,12 @@ void test_video_scaler_direct() {
 
     // Push frame
     assert(qcap2_video_scaler_push(scaler, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_video_scaler_pop_input(scaler, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
 
     // Pop resampled frame
     qcap2_rcbuffer_t* out_rc = NULL;
@@ -135,9 +146,8 @@ void test_video_scaler_direct() {
     assert(pts == 98765);
 
     qcap2_rcbuffer_unlock_data(out_rc);
+    assert(qcap2_video_scaler_push_output(scaler, out_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(out_rc);
-
-    qcap2_rcbuffer_release(in_rc);
 
     assert(qcap2_video_scaler_stop(scaler) == QCAP_RS_SUCCESSFUL);
     qcap2_video_scaler_delete(scaler);
@@ -170,6 +180,12 @@ void test_video_scaler_crop() {
     });
 
     assert(qcap2_video_scaler_push(scaler, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_video_scaler_pop_input(scaler, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
 
     qcap2_rcbuffer_t* out_rc = NULL;
     assert(qcap2_video_scaler_pop(scaler, &out_rc) == QCAP_RS_SUCCESSFUL);
@@ -183,8 +199,8 @@ void test_video_scaler_crop() {
     assert(h == 100);
 
     qcap2_rcbuffer_unlock_data(out_rc);
+    assert(qcap2_video_scaler_push_output(scaler, out_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(out_rc);
-    qcap2_rcbuffer_release(in_rc);
 
     assert(qcap2_video_scaler_stop(scaler) == QCAP_RS_SUCCESSFUL);
     qcap2_video_scaler_delete(scaler);
@@ -239,6 +255,12 @@ void test_video_scaler_buffer_pool() {
 
     // Push frame
     assert(qcap2_video_scaler_push(scaler, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_video_scaler_pop_input(scaler, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
 
     // Pop popped frame
     qcap2_rcbuffer_t* out_rc = NULL;
@@ -249,7 +271,6 @@ void test_video_scaler_buffer_pool() {
     assert(out_rc == pool_rc1 || out_rc == pool_rc2);
 
     qcap2_rcbuffer_release(out_rc);
-    qcap2_rcbuffer_release(in_rc);
 
     assert(qcap2_video_scaler_stop(scaler) == QCAP_RS_SUCCESSFUL);
     qcap2_video_scaler_delete(scaler);
@@ -282,6 +303,12 @@ void test_video_scaler_filter_graph() {
     });
 
     assert(qcap2_video_scaler_push(scaler, in_rc) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(in_rc);
+
+    qcap2_rcbuffer_t* recycled_in = nullptr;
+    assert(qcap2_video_scaler_pop_input(scaler, &recycled_in) == QCAP_RS_SUCCESSFUL);
+    assert(recycled_in == in_rc);
+    qcap2_rcbuffer_release(recycled_in);
 
     qcap2_rcbuffer_t* out_rc = NULL;
     assert(qcap2_video_scaler_pop(scaler, &out_rc) == QCAP_RS_SUCCESSFUL);
@@ -296,8 +323,8 @@ void test_video_scaler_filter_graph() {
     assert(h == 120);
 
     qcap2_rcbuffer_unlock_data(out_rc);
+    assert(qcap2_video_scaler_push_output(scaler, out_rc) == QCAP_RS_SUCCESSFUL);
     qcap2_rcbuffer_release(out_rc);
-    qcap2_rcbuffer_release(in_rc);
 
     assert(qcap2_video_scaler_stop(scaler) == QCAP_RS_SUCCESSFUL);
     qcap2_video_scaler_delete(scaler);

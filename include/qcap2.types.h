@@ -41,9 +41,6 @@ typedef struct qcap2_window_t qcap2_window_t;
 typedef struct qcap2_block_lock_t qcap2_block_lock_t;
 typedef struct qcap2_binder_t qcap2_binder_t;
 
-typedef struct qcap2_qdev_enum_t qcap2_qdev_enum_t;
-typedef struct qcap2_qdev_info_t qcap2_qdev_info_t;
-typedef struct qcap2_qdev_t qcap2_qdev_t;
 typedef struct qcap2_video_source_t qcap2_video_source_t;
 typedef struct qcap2_video_sink_t qcap2_video_sink_t;
 typedef struct qcap2_audio_source_t qcap2_audio_source_t;
@@ -130,14 +127,6 @@ enum qcap2_video_scaler_backend_type_t {
 	QCAP2_VIDEO_SCALER_BACKEND_TYPE_EXPERIMENTAL = 9999,
 };
 
-enum qcap2_qdev_type_t {
-	QCAP2_QDEV_TYPE_UNKNOWN,
-
-	QCAP2_QDEV_TYPE_UB3300,
-	QCAP2_QDEV_TYPE_MZ0380,
-	QCAP2_QDEV_TYPE_SC440N2_GMSL,
-	QCAP2_QDEV_TYPE_CV0830,
-};
 
 enum qcap2_window_backend_type_t {
 	QCAP2_WINDOW_BACKEND_TYPE_UNKNOWN,

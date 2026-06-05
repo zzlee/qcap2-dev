@@ -33,6 +33,8 @@ QRESULT qcap2_video_scaler_stop(qcap2_video_scaler_t* pThis);
 QRESULT qcap2_video_scaler_run(qcap2_video_scaler_t* pThis);
 QRESULT qcap2_video_scaler_push(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_video_scaler_pop(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_scaler_pop_input(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_scaler_push_output(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_resampler_t
 qcap2_audio_resampler_t* qcap2_audio_resampler_new();
@@ -46,6 +48,8 @@ QRESULT qcap2_audio_resampler_start(qcap2_audio_resampler_t* pThis);
 QRESULT qcap2_audio_resampler_stop(qcap2_audio_resampler_t* pThis);
 QRESULT qcap2_audio_resampler_push(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 QRESULT qcap2_audio_resampler_pop(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_resampler_pop_input(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_audio_resampler_push_output(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_video_encoder_t
 qcap2_video_encoder_t* qcap2_video_encoder_new();

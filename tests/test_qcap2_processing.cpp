@@ -1276,11 +1276,9 @@ void test_audio_encoder_sync_async() {
             qcap2_rcbuffer_unlock_data(in_rc);
         }
 
-        qcap2_rcbuffer_add_ref(in_rc);
         assert(qcap2_audio_encoder_push(aenc, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
     }
-
-    qcap2_rcbuffer_release(in_rc);
 
     // Drain the sync packets using qcap2_event_wait_count
     uint64_t sync_count = 0;
@@ -1359,10 +1357,9 @@ void test_audio_encoder_sync_async() {
             qcap2_rcbuffer_unlock_data(in_rc);
         }
 
-        qcap2_rcbuffer_add_ref(in_rc);
         assert(qcap2_audio_encoder_push(aenc, in_rc) == QCAP_RS_SUCCESSFUL);
+        qcap2_rcbuffer_release(in_rc);
     }
-    qcap2_rcbuffer_release(in_rc);
 
     // Wait a short time for async event handlers thread to dispatch any pending callbacks
     for (int i = 0; i < 20 && async_ctx.packet_count < sync_packets_received; ++i) {

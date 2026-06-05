@@ -85,6 +85,8 @@ static void encoder_thread_func(
 		//   and moves pInputRCBuffer into its internal input_recycled_queue.
 		// =============================================================
 		QRESULT qr = qcap2_video_encoder_push(pEncoder, pInputRCBuffer);
+		qcap2_rcbuffer_release(pInputRCBuffer);
+		pInputRCBuffer = NULL;
 		if (qr != QCAP_RS_SUCCESSFUL) {
 			LOGE("encoder_push() failed at frame %d", i);
 			break;
@@ -130,6 +132,13 @@ static void encoder_thread_func(
 
 			// --- Forward the encoded packet to the decoder ---
 			qcap2_video_decoder_push(pDecoder, pOutputRCBuffer);
+
+			// Reclaim the packet buffer from decoder input recycled queue (HPR)
+			qcap2_rcbuffer_t* pRecycledPacket = NULL;
+			qcap2_video_decoder_pop_input(pDecoder, &pRecycledPacket);
+			if (pRecycledPacket != NULL) {
+				qcap2_rcbuffer_release(pRecycledPacket);
+			}
 		}
 		qcap2_rcbuffer_unlock_data(pOutputRCBuffer);
 

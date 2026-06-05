@@ -81,7 +81,7 @@ The queue notifies the event when:
 - a pop removes one item but more items remain queued;
 - the queue is stopped/deleted, to wake external waiters.
 
-This supports the common pattern:
+This supports the common synchronous blocking pattern:
 
 ```cpp
 qcap2_event_wait(event);
@@ -89,6 +89,31 @@ qcap2_rcbuffer_queue_pop(queue, &buffer);
 ```
 
 Because events may be auto-reset or eventfd-like, consumers should treat the event as a wakeup hint, not as the queue item itself. After waking, call `qcap2_rcbuffer_queue_pop()` to retrieve the actual rc-buffer.
+
+### Asynchronous Handler Pattern
+
+When the event is registered with a `qcap2_event_handlers_t` manager, do not call `qcap2_event_wait()` inside the handler callback. Instead, call `qcap2_event_read()` to drain the event notifications and retrieve the count of wakeups, then pop and process the queue items in a loop:
+
+```cpp
+QRETURN on_queue_event(PVOID pUserData) {
+	MyContext* ctx = (MyContext*)pUserData;
+	if (!ctx) return QCAP_RT_OK;
+
+	uint64_t notify_count = 0;
+	if (qcap2_event_read(ctx->evt, &notify_count) == QCAP_RS_SUCCESSFUL) {
+		for (uint64_t i = 0; i < notify_count; ++i) {
+			qcap2_rcbuffer_t* buffer = NULL;
+			if (qcap2_rcbuffer_queue_pop(ctx->queue, &buffer) == QCAP_RS_SUCCESSFUL) {
+				if (buffer) {
+					// Consume buffer...
+					qcap2_rcbuffer_release(buffer);
+				}
+			}
+		}
+	}
+	return QCAP_RT_OK;
+}
+```
 
 ## Push/pop semantics
 

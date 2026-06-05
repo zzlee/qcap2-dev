@@ -68,3 +68,63 @@ On Linux, `qcap2_timer_t` is implemented using the kernel's `timerfd` API to ena
   - `qcap2_timer_stop(pThis)`: Disarms the timer by setting the timerfd specification to 0.
   - `qcap2_timer_wait(pThis, pExpirations)`: Blocks using `poll()` until the timerfd is readable, then reads and returns the expiration count.
   - `qcap2_timer_next(pThis, nDuration)`: Configures a single-shot timer for `nDuration` milliseconds.
+
+---
+
+## qcap2_event_t Integration and Callback Pattern
+
+`qcap2_event_t` encapsulates a cross-platform synchronization event (backed by a Linux `eventfd`). When integrated with `qcap2_event_handlers_t`, the handler monitoring thread monitors the event's native handle using `poll()`.
+
+### The Non-Blocking Drain Pattern (`qcap2_event_read`)
+
+When a monitored `qcap2_event_t` triggers its registered callback inside the monitoring thread, **do not call `qcap2_event_wait()` inside the callback.**
+* **Redundant Poll**: `qcap2_event_wait()` performs its own internal `poll()`. Calling it inside a handler callback executes a nested `poll()` on the same thread/descriptor, which is wasteful and redundant since the background loop's `poll()` has already indicated readability.
+* **Non-blocking Drain**: Instead, use `qcap2_event_read()`. It drains the eventfd counter non-blockingly and returns the number of pending event notifications, allowing batch processing.
+
+#### Recommended Callback Pattern
+
+```cpp
+QRETURN on_device_event(PVOID pUserData) {
+	DeviceContext* ctx = (DeviceContext*)pUserData;
+	if (!ctx) return QCAP_RT_OK;
+
+	uint64_t notify_count = 0;
+	// Non-blockingly drain and get the notification count
+	if (qcap2_event_read(ctx->evt, &notify_count) == QCAP_RS_SUCCESSFUL) {
+		// Draining in batches according to notify_count prevents missed wakeups and busy loops
+		for (uint64_t i = 0; i < notify_count; ++i) {
+			qcap2_rcbuffer_t* buf = nullptr;
+			if (qcap2_video_encoder_pop(ctx->venc, &buf) == QCAP_RS_SUCCESSFUL) {
+				if (buf) {
+					// Consume buffer...
+					qcap2_rcbuffer_release(buf);
+				}
+			}
+		}
+	}
+	return QCAP_RT_OK;
+}
+```
+
+### Function Semantics
+
+#### `qcap2_event_read(qcap2_event_t* pThis, uint64_t* pCount)`
+
+Non-blockingly drains the event and retrieves the accumulated notification count.
+
+* **Linux**: Reads the 8-byte value from the underlying `eventfd` and stores it in `*pCount`. If no event is pending (returning `EAGAIN` or `EWOULDBLOCK`), it sets `*pCount = 0` and returns `QCAP_RS_SUCCESSFUL`.
+* **Other Platforms**: Acquires the internal mutex lock, checks if the event is signaled, sets `*pCount = signaled ? 1 : 0`, and resets the signaled state to `false`.
+* **Return Values**:
+  * `QCAP_RS_SUCCESSFUL` on success (event is drained, count written to `pCount`).
+  * `QCAP_RS_ERROR_GENERAL` if `pThis` or `pCount` is null, or if the system `read` call fails.
+
+#### `qcap2_event_wait_count(qcap2_event_t* pThis, uint64_t* pCount)`
+
+Blocks the calling thread until the event is signaled, then drains the event and retrieves the accumulated notification count.
+
+* **Linux**: Blocks using `poll()` on the underlying `eventfd` descriptor until readable. Once readable, it performs an 8-byte `read` and stores the accumulated counter value in `*pCount`.
+* **Other Platforms**: Blocks the thread on a condition variable until the `signaled` flag is true. Once woken, sets `*pCount = signaled ? 1 : 0` and resets the signaled state to `false`.
+* **Return Values**:
+  * `QCAP_RS_SUCCESSFUL` on success.
+  * `QCAP_RS_ERROR_GENERAL` if `pThis` or `pCount` is null, or if `poll()` or `read()` fails.
+

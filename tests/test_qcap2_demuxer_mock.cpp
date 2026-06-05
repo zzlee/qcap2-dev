@@ -35,23 +35,15 @@ std::atomic<int> popped_video_source(0);
 QRETURN on_venc_event(PVOID pUserData) {
     DeviceContext* ctx = (DeviceContext*)pUserData;
     if (ctx) {
-        uint64_t u = 1;
-#ifdef __linux__
-        uintptr_t handle = 0;
-        qcap2_event_get_native_handle(ctx->evt, &handle);
-        int fd = (int)handle;
-        if (read(fd, &u, sizeof(uint64_t)) < 0) {
-            u = 1;
-        }
-#else
-        qcap2_event_wait(ctx->evt);
-#endif
+        uint64_t u = 0;
+        qcap2_event_read(ctx->evt, &u);
         qcap2_video_encoder_t* venc = (qcap2_video_encoder_t*)ctx->device;
         for (uint64_t i = 0; i < u; ++i) {
             qcap2_rcbuffer_t* v_buf = nullptr;
             if (qcap2_video_encoder_pop(venc, &v_buf) == QCAP_RS_SUCCESSFUL) {
                 if (v_buf) {
                     popped_video++;
+                    qcap2_video_encoder_push_output(venc, v_buf);
                     qcap2_rcbuffer_release(v_buf);
                 }
             }
@@ -63,22 +55,14 @@ QRETURN on_venc_event(PVOID pUserData) {
 QRETURN on_aenc_event(PVOID pUserData) {
     DeviceContext* ctx = (DeviceContext*)pUserData;
     if (ctx) {
-        uint64_t u = 1;
-#ifdef __linux__
-        uintptr_t handle = 0;
-        qcap2_event_get_native_handle(ctx->evt, &handle);
-        int fd = (int)handle;
-        if (read(fd, &u, sizeof(uint64_t)) < 0) {
-            u = 1;
-        }
-#else
-        qcap2_event_wait(ctx->evt);
-#endif
+        uint64_t u = 0;
+        qcap2_event_read(ctx->evt, &u);
         qcap2_audio_encoder_t* aenc = (qcap2_audio_encoder_t*)ctx->device;
         for (uint64_t i = 0; i < u; ++i) {
             qcap2_rcbuffer_t* a_buf = nullptr;
             if (qcap2_audio_encoder_pop(aenc, &a_buf) == QCAP_RS_SUCCESSFUL) {
                 if (a_buf) {
+                    qcap2_audio_encoder_push_output(aenc, a_buf);
                     qcap2_rcbuffer_release(a_buf);
                 }
             }
@@ -90,17 +74,8 @@ QRETURN on_aenc_event(PVOID pUserData) {
 QRETURN on_vs_event(PVOID pUserData) {
     DeviceContext* ctx = (DeviceContext*)pUserData;
     if (ctx) {
-        uint64_t u = 1;
-#ifdef __linux__
-        uintptr_t handle = 0;
-        qcap2_event_get_native_handle(ctx->evt, &handle);
-        int fd = (int)handle;
-        if (read(fd, &u, sizeof(uint64_t)) < 0) {
-            u = 1;
-        }
-#else
-        qcap2_event_wait(ctx->evt);
-#endif
+        uint64_t u = 0;
+        qcap2_event_read(ctx->evt, &u);
         qcap2_video_source_t* vs = (qcap2_video_source_t*)ctx->device;
         for (uint64_t i = 0; i < u; ++i) {
             qcap2_rcbuffer_t* v_buf = nullptr;
@@ -119,17 +94,8 @@ QRETURN on_vs_event(PVOID pUserData) {
 QRETURN on_as_event(PVOID pUserData) {
     DeviceContext* ctx = (DeviceContext*)pUserData;
     if (ctx) {
-        uint64_t u = 1;
-#ifdef __linux__
-        uintptr_t handle = 0;
-        qcap2_event_get_native_handle(ctx->evt, &handle);
-        int fd = (int)handle;
-        if (read(fd, &u, sizeof(uint64_t)) < 0) {
-            u = 1;
-        }
-#else
-        qcap2_event_wait(ctx->evt);
-#endif
+        uint64_t u = 0;
+        qcap2_event_read(ctx->evt, &u);
         qcap2_audio_source_t* as = (qcap2_audio_source_t*)ctx->device;
         for (uint64_t i = 0; i < u; ++i) {
             qcap2_rcbuffer_t* a_buf = nullptr;
@@ -149,7 +115,8 @@ QRETURN on_dmx_event(PVOID pUserData) {
     DemuxerContext* ctx = (DemuxerContext*)pUserData;
     if (ctx) {
         // Drain the event to reset it (otherwise level-triggered poll will loop infinitely)
-        qcap2_event_wait(ctx->evt);
+        uint64_t u = 0;
+        qcap2_event_read(ctx->evt, &u);
 
         // Update demuxer internal state
         qcap2_demuxer_update(ctx->demuxer);

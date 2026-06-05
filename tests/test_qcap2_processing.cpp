@@ -2,10 +2,14 @@
 #include "qcap2.buffer.h"
 #include "qcap2.sync.h"
 #include "qcap2.formats.h"
+#include "qcap2.sync.h"
 #include <stdio.h>
 #include <assert.h>
 #include <vector>
 #include <string.h>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 void test_audio_resampler() {
     qcap2_audio_resampler_t* resampler = qcap2_audio_resampler_new();
@@ -1185,6 +1189,205 @@ void test_packet_pool_recycling_and_resizing() {
     printf("Packet pool recycling and resizing tests passed successfully!\n");
 }
 
+struct AsyncAencContext {
+    qcap2_audio_encoder_t* aenc;
+    qcap2_event_t* evt;
+    std::atomic<int> packet_count;
+};
+
+static QRETURN on_async_aenc_event(PVOID pUserData) {
+    AsyncAencContext* ctx = (AsyncAencContext*)pUserData;
+    if (ctx) {
+        uint64_t count = 0;
+        if (qcap2_event_read(ctx->evt, &count) == QCAP_RS_SUCCESSFUL) {
+            for (uint64_t i = 0; i < count; ++i) {
+                qcap2_rcbuffer_t* pkt = nullptr;
+                if (qcap2_audio_encoder_pop(ctx->aenc, &pkt) == QCAP_RS_SUCCESSFUL) {
+                    if (pkt) {
+                        ctx->packet_count++;
+                        qcap2_audio_encoder_push_output(ctx->aenc, pkt);
+                        qcap2_rcbuffer_release(pkt);
+                    }
+                }
+            }
+        }
+    }
+    return QCAP_RT_OK;
+}
+
+struct AudioFrameBuffer {
+    qcap2_av_frame_t frame;
+    std::vector<int16_t> data;
+};
+
+void test_audio_encoder_sync_async() {
+    qcap2_audio_encoder_t* aenc = qcap2_audio_encoder_new();
+    assert(aenc != nullptr);
+
+    // Configure audio encoder: PCM, Stereo, 16-bit, 44100Hz, 1411200bps
+    qcap2_audio_encoder_property_t* aprop = qcap2_audio_encoder_property_new();
+    assert(aprop != nullptr);
+    qcap2_audio_encoder_property_set_property1(aprop,
+        0, QCAP_ENCODER_FORMAT_PCM, 2, 16, 44100, 1411200
+    );
+    qcap2_audio_encoder_set_audio_property(aenc, aprop);
+    qcap2_audio_encoder_property_delete(aprop);
+
+    // ----------------------------------------------------
+    // Part 1: Test Synchronous Event Handling (wait_count)
+    // ----------------------------------------------------
+    qcap2_event_t* sync_evt = qcap2_event_new();
+    assert(sync_evt != nullptr);
+    assert(qcap2_event_start(sync_evt) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_audio_encoder_set_event(aenc, sync_evt);
+    assert(qcap2_audio_encoder_start(aenc) == QCAP_RS_SUCCESSFUL);
+
+    // Push 5 frames of S16 PCM (1024 samples, stereo)
+    qcap2_rcbuffer_t* in_rc = nullptr;
+    int sync_packets_received = 0;
+
+    for (int f = 0; f < 5; ++f) {
+        if (f == 0) {
+            AudioFrameBuffer* af = new AudioFrameBuffer();
+            qcap2_av_frame_init(&af->frame);
+            qcap2_av_frame_set_audio_property(&af->frame, 2, 1, 44100, 1024);
+            af->data.resize(1024 * 2);
+            for (size_t i = 0; i < af->data.size(); ++i) {
+                af->data[i] = (int16_t)(i % 1000);
+            }
+            qcap2_av_frame_set_buffer(&af->frame, (uint8_t*)af->data.data(), 1024 * 2 * sizeof(int16_t));
+            qcap2_av_frame_set_pts(&af->frame, f * 1024);
+
+            in_rc = qcap2_rcbuffer_new(&af->frame, [](PVOID p) {
+                AudioFrameBuffer* af = qcap2_container_of((qcap2_av_frame_t*)p, AudioFrameBuffer, frame);
+                delete af;
+            });
+        } else {
+            // HPR recycle check
+            qcap2_rcbuffer_t* recycled = nullptr;
+            assert(qcap2_audio_encoder_pop_input(aenc, &recycled) == QCAP_RS_SUCCESSFUL);
+            assert(recycled == in_rc);
+
+            qcap2_av_frame_t* frame = (qcap2_av_frame_t*)qcap2_rcbuffer_lock_data(in_rc);
+            assert(frame != nullptr);
+            AudioFrameBuffer* af = qcap2_container_of(frame, AudioFrameBuffer, frame);
+            qcap2_av_frame_set_pts(&af->frame, f * 1024);
+            qcap2_rcbuffer_unlock_data(in_rc);
+        }
+
+        qcap2_rcbuffer_add_ref(in_rc);
+        assert(qcap2_audio_encoder_push(aenc, in_rc) == QCAP_RS_SUCCESSFUL);
+    }
+
+    qcap2_rcbuffer_release(in_rc);
+
+    // Drain the sync packets using qcap2_event_wait_count
+    uint64_t sync_count = 0;
+    if (qcap2_event_wait_count(sync_evt, &sync_count) == QCAP_RS_SUCCESSFUL) {
+        for (uint64_t i = 0; i < sync_count; ++i) {
+            qcap2_rcbuffer_t* pkt = nullptr;
+            if (qcap2_audio_encoder_pop(aenc, &pkt) == QCAP_RS_SUCCESSFUL) {
+                if (pkt) {
+                    sync_packets_received++;
+                    qcap2_audio_encoder_push_output(aenc, pkt);
+                    qcap2_rcbuffer_release(pkt);
+                }
+            }
+        }
+    }
+    assert(sync_packets_received > 0);
+
+    // Stop the encoder after retrieving packets
+    assert(qcap2_audio_encoder_stop(aenc) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_audio_encoder_set_event(aenc, nullptr);
+    assert(qcap2_event_stop(sync_evt) == QCAP_RS_SUCCESSFUL);
+    qcap2_event_delete(sync_evt);
+
+    // ----------------------------------------------------
+    // Part 2: Test Asynchronous Event Handling (event_handlers)
+    // ----------------------------------------------------
+    qcap2_event_t* async_evt = qcap2_event_new();
+    assert(async_evt != nullptr);
+    assert(qcap2_event_start(async_evt) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_event_handlers_t* handlers = qcap2_event_handlers_new();
+    assert(handlers != nullptr);
+    assert(qcap2_event_handlers_start(handlers) == QCAP_RS_SUCCESSFUL);
+
+    uintptr_t handle = 0;
+    assert(qcap2_event_get_native_handle(async_evt, &handle) == QCAP_RS_SUCCESSFUL);
+
+    AsyncAencContext async_ctx;
+    async_ctx.aenc = aenc;
+    async_ctx.evt = async_evt;
+    async_ctx.packet_count = 0;
+
+    assert(qcap2_event_handlers_add_handler(handlers, handle, on_async_aenc_event, &async_ctx) == QCAP_RS_SUCCESSFUL);
+
+    qcap2_audio_encoder_set_event(aenc, async_evt);
+    assert(qcap2_audio_encoder_start(aenc) == QCAP_RS_SUCCESSFUL);
+
+    // Push 5 frames
+    in_rc = nullptr;
+    for (int f = 0; f < 5; ++f) {
+        if (f == 0) {
+            AudioFrameBuffer* af = new AudioFrameBuffer();
+            qcap2_av_frame_init(&af->frame);
+            qcap2_av_frame_set_audio_property(&af->frame, 2, 1, 44100, 1024);
+            af->data.resize(1024 * 2);
+            for (size_t i = 0; i < af->data.size(); ++i) {
+                af->data[i] = (int16_t)(i % 1000);
+            }
+            qcap2_av_frame_set_buffer(&af->frame, (uint8_t*)af->data.data(), 1024 * 2 * sizeof(int16_t));
+            qcap2_av_frame_set_pts(&af->frame, f * 1024);
+
+            in_rc = qcap2_rcbuffer_new(&af->frame, [](PVOID p) {
+                AudioFrameBuffer* af = qcap2_container_of((qcap2_av_frame_t*)p, AudioFrameBuffer, frame);
+                delete af;
+            });
+        } else {
+            qcap2_rcbuffer_t* recycled = nullptr;
+            assert(qcap2_audio_encoder_pop_input(aenc, &recycled) == QCAP_RS_SUCCESSFUL);
+            assert(recycled == in_rc);
+
+            qcap2_av_frame_t* frame = (qcap2_av_frame_t*)qcap2_rcbuffer_lock_data(in_rc);
+            assert(frame != nullptr);
+            AudioFrameBuffer* af = qcap2_container_of(frame, AudioFrameBuffer, frame);
+            qcap2_av_frame_set_pts(&af->frame, f * 1024);
+            qcap2_rcbuffer_unlock_data(in_rc);
+        }
+
+        qcap2_rcbuffer_add_ref(in_rc);
+        assert(qcap2_audio_encoder_push(aenc, in_rc) == QCAP_RS_SUCCESSFUL);
+    }
+    qcap2_rcbuffer_release(in_rc);
+
+    // Wait a short time for async event handlers thread to dispatch any pending callbacks
+    for (int i = 0; i < 20 && async_ctx.packet_count < sync_packets_received; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    assert(async_ctx.packet_count > 0);
+
+    // Stop encoder
+    assert(qcap2_audio_encoder_stop(aenc) == QCAP_RS_SUCCESSFUL);
+
+    // Clean up async handlers
+    assert(qcap2_event_handlers_remove_handler(handlers, handle) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_event_handlers_stop(handlers) == QCAP_RS_SUCCESSFUL);
+    qcap2_event_handlers_delete(handlers);
+
+    qcap2_audio_encoder_set_event(aenc, nullptr);
+    assert(qcap2_event_stop(async_evt) == QCAP_RS_SUCCESSFUL);
+    qcap2_event_delete(async_evt);
+
+    qcap2_audio_encoder_delete(aenc);
+
+    printf("Audio encoder sync and async event tests passed successfully!\n");
+}
+
 int main() {
     test_audio_resampler();
     test_video_scaler_direct();
@@ -1205,6 +1408,7 @@ int main() {
     test_video_decoder_h264_integration();
     test_packet_pool_basic();
     test_packet_pool_recycling_and_resizing();
+    test_audio_encoder_sync_async();
 
     printf("All processing unit tests passed successfully!\n");
     return 0;

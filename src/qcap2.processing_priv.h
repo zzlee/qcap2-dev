@@ -123,6 +123,13 @@ typedef struct qcap2_video_encoder_priv_t {
     bool running;
     int64_t frame_counter;
 
+    // Allegro VCU encoder state
+    void* allegro_enc_handle;    // AL_HEncoder (opaque)
+    void* allegro_scheduler;     // AL_IEncScheduler* (opaque)
+    void* allegro_allocator;     // AL_TAllocator* (opaque)
+    int allegro_channel_id;
+    bool allegro_inited;
+
     // Cached input format for sws reinitialization
     ULONG cached_in_color;
     ULONG cached_in_w;
@@ -154,6 +161,11 @@ typedef struct qcap2_video_encoder_priv_t {
         cached_in_color = 0;
         cached_in_w = 0;
         cached_in_h = 0;
+        allegro_enc_handle = nullptr;
+        allegro_scheduler = nullptr;
+        allegro_allocator = nullptr;
+        allegro_channel_id = 0;
+        allegro_inited = false;
         input_recycled_queue = qcap2_rcbuffer_queue_new();
         if (input_recycled_queue) {
             qcap2_rcbuffer_queue_start(input_recycled_queue);
@@ -334,6 +346,12 @@ typedef struct qcap2_video_decoder_priv_t {
 
     // Muxer bypass support
     bool bypass_decoding;
+
+    // Allegro VCU decoder state
+    void* allegro_dec_handle;    // AL_HDecoder (opaque)
+    void* allegro_scheduler;     // AL_IDecScheduler* (opaque)
+    void* allegro_allocator;     // AL_TAllocator* (opaque)
+    bool allegro_inited;
     std::queue<qcap2_rcbuffer_t*> input_queue;
     std::mutex* notify_mtx;
     std::condition_variable* notify_cv;
@@ -369,6 +387,10 @@ typedef struct qcap2_video_decoder_priv_t {
         bypass_decoding = false;
         notify_mtx = nullptr;
         notify_cv = nullptr;
+        allegro_dec_handle = nullptr;
+        allegro_scheduler = nullptr;
+        allegro_allocator = nullptr;
+        allegro_inited = false;
 
         input_recycled_queue = qcap2_rcbuffer_queue_new();
         if (input_recycled_queue) {
@@ -427,5 +449,16 @@ typedef struct qcap2_video_decoder_priv_t {
         sws_src_h = 0;
     }
 } qcap2_video_decoder_priv_t;
+
+// Allegro VCU backend function declarations
+// Implemented in qcap2.vcuallegro.cpp (when QCAP2_HAVE_ALLEGRO is defined)
+// or as fallback stubs in qcap2.processing.cpp (when QCAP2_HAVE_ALLEGRO is not defined)
+extern QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p);
+extern QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p);
+extern QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
+
+extern QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p);
+extern QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p);
+extern QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
 
 #endif // QCAP2_PROCESSING_PRIV_H

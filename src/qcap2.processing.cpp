@@ -2849,45 +2849,6 @@ static QRESULT ffmpeg_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer
 }
 
 // ==============================================================================
-// Backend-specific encoder stubs (to be implemented)
-// Allegro VCU encoder backend
-// ==============================================================================
-static QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p) {
-    (void)p;
-    // TODO: Allegro VCU encoder initialization
-    //  1. AL_Lib_Encoder_Init(AL_LIB_ENCODER_ARCH_HOST)
-    //  2. Create IP device, scheduler, DMA allocator
-    //  3. Map qcap2_video_encoder_property_t → AL_TEncSettings
-    //  4. AL_Encoder_Create(&hEnc, scheduler, alloc, settings, callback)
-    //  5. Pre-allocate stream buffers (AL_Buffer_Create_And_Allocate)
-    //  6. Pre-allocate source frame buffers
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-static QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p) {
-    (void)p;
-    // TODO: Allegro VCU encoder teardown
-    //  1. AL_Encoder_Destroy(hEnc)
-    //  2. AL_IEncScheduler_Destroy(pScheduler)
-    //  3. Release allocator
-    //  4. AL_Lib_Encoder_DeInit()
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-static QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
-    (void)p;
-    (void)pRCBuffer;
-    // TODO: Allegro VCU frame encoding
-    //  1. Get source AL_TBuffer from pool
-    //  2. Set pixmap metadata (AL_PixMapMetaData_Create)
-    //  3. Copy YUV data from qcap2_av_frame_t into AL_TBuffer
-    //  4. AL_Encoder_Process(hEnc, pFrame, NULL)
-    //  5. On callback: extract stream data → qcap2_av_packet_t
-    //  6. Push to output queue, recycle input
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-// ==============================================================================
 // V4L2 M2M encoder backend
 // ==============================================================================
 static QRESULT v4l2_encoder_start(qcap2_video_encoder_priv_t* p) {
@@ -3171,11 +3132,6 @@ void qcap2_video_encoder_request_idr(qcap2_video_encoder_t* pThis) {
         p->request_idr.store(true);
     }
 }
-
-// Forward declarations for backend-specific implementations
-static QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p);
-static QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p);
-static QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
 
 static QRESULT v4l2_encoder_start(qcap2_video_encoder_priv_t* p);
 static QRESULT v4l2_encoder_stop(qcap2_video_encoder_priv_t* p);
@@ -3845,11 +3801,6 @@ int qcap2_video_decoder_get_backend_type(qcap2_video_decoder_t* pThis) {
     return QCAP2_VIDEO_DECODER_BACKEND_TYPE_UNKNOWN;
 }
 
-// Forward declarations for decoder backends
-static QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p);
-static QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p);
-static QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
-
 static QRESULT v4l2_decoder_start(qcap2_video_decoder_priv_t* p);
 static QRESULT v4l2_decoder_stop(qcap2_video_decoder_priv_t* p);
 static QRESULT v4l2_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
@@ -3994,46 +3945,6 @@ QRESULT qcap2_video_decoder_push_output(qcap2_video_decoder_t* pThis, qcap2_rcbu
 }
 
 // ==============================================================================
-// Backend-specific decoder stubs (to be implemented)
-// Allegro VCU decoder backend
-// ==============================================================================
-static QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p) {
-    (void)p;
-    // TODO: Allegro VCU decoder initialization
-    //  1. AL_Lib_Decoder_Init(AL_LIB_DECODER_ARCH_HOST)
-    //  2. Create IP device, scheduler, DMA allocator
-    //  3. Map properties → AL_TDecSettings
-    //  4. Register callbacks (endDecodingCB, displayCB, resolutionFoundCB, errorCB)
-    //  5. AL_Decoder_Create(&hDec, scheduler, alloc, settings, callbacks)
-    //  6. Pre-allocate display buffers → AL_Decoder_PutDisplayPicture
-    //  7. Call AL_Decoder_ConfigureOutputSettings for target colorspace/resolution
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-static QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p) {
-    (void)p;
-    // TODO: Allegro VCU decoder teardown
-    //  1. AL_Decoder_Flush(hDec)
-    //  2. AL_Decoder_Destroy(hDec)
-    //  3. AL_IDecScheduler_Destroy(pScheduler)
-    //  4. Release allocator
-    //  5. AL_Lib_Decoder_DeInit()
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-static QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
-    (void)p;
-    (void)pRCBuffer;
-    // TODO: Allegro VCU packet decoding
-    //  1. Get stream AL_TBuffer from pool, copy compressed data
-    //  2. Set stream flags (end of frame, etc.)
-    //  3. AL_Decoder_PushStreamBuffer(hDec, pBuf, size, flags)
-    //  4. On displayCB: extract YUV data → qcap2_av_frame_t
-    //  5. Push to output queue, recycle stream buffer
-    return QCAP_RS_ERROR_NON_SUPPORT;
-}
-
-// ==============================================================================
 // V4L2 M2M decoder backend
 // ==============================================================================
 static QRESULT v4l2_decoder_start(qcap2_video_decoder_priv_t* p) {
@@ -4058,6 +3969,47 @@ static QRESULT v4l2_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t
 // ==============================================================================
 // End of backend-specific decoder stubs
 // ==============================================================================
+
+// ==============================================================================
+// Allegro VCU backend fallback stubs (when QCAP2_HAVE_ALLEGRO is not defined)
+// When QCAP2_HAVE_ALLEGRO IS defined, these symbols are provided by
+// src/qcap2.vcuallegro.cpp instead.
+// ==============================================================================
+#ifndef QCAP2_HAVE_ALLEGRO
+
+QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p) {
+    (void)p;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p) {
+    (void)p;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
+    (void)p;
+    (void)pRCBuffer;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p) {
+    (void)p;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p) {
+    (void)p;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
+    (void)p;
+    (void)pRCBuffer;
+    return QCAP_RS_ERROR_NON_SUPPORT;
+}
+
+#endif // !QCAP2_HAVE_ALLEGRO
 
 #ifdef __cplusplus
 }

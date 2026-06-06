@@ -8,6 +8,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Compile options
 add_compile_options(-Wall -Wextra -g)
 
+# Optional Xilinx Allegro VCU hardware backend
+option(QCAP2_HAVE_ALLEGRO "Enable Xilinx Allegro VCU hardware encoder/decoder backend" OFF)
+if(QCAP2_HAVE_ALLEGRO)
+    message(STATUS "Xilinx Allegro VCU backend ENABLED")
+else()
+    message(STATUS "Xilinx Allegro VCU backend DISABLED (using fallback stubs)")
+endif()
+
 # ==============================================================================
 # Git build info (injected at configure time)
 # ==============================================================================
@@ -167,6 +175,12 @@ if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB AND AVCODEC_LI
         ${AVCODEC_LIB}
         ${AVUTIL_LIB}
     )
+
+    # Conditionally include Allegro VCU backend source
+    if(QCAP2_HAVE_ALLEGRO)
+        target_sources(qcap2_processing PRIVATE src/qcap2.vcuallegro.cpp)
+        target_compile_definitions(qcap2_processing PRIVATE QCAP2_HAVE_ALLEGRO)
+    endif()
 else()
     message(WARNING "FFmpeg swresample/swscale/avfilter/avcodec/avutil NOT found. Skipping libqcap2.processing.so and test_qcap2_processing.")
 endif()

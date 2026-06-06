@@ -1,58 +1,113 @@
-# rcbuf C++ Interface Redesign
+# rcbuf Extensibility Improvement Plan
 
-## 1. Background
+## 1. Background & Motivation
+Currently, [qcap2_rcbuffer_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L37) is a reference-counted buffer wrapper used throughout the pipeline. The implementation is based on a C struct storing a generic `PVOID pData` along with a free callback. Internal consumers cast `pData` to specific structs like [qcap2_av_frame_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L71) or [qcap2_av_packet_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L75). This requires type-specific free functions and switch statements, making it difficult to extend the pipeline with hardware-accelerated buffers (e.g., CUDA memory, dmabufs, Jetson nvbufs).
 
-`qcap2_rcbuffer_t` is a reference-counted buffer wrapper used throughout the
-pipeline. Currently it is a C struct holding `PVOID pData` + a free callback,
-with consumers casting `pData` to known types (`qcap2_av_frame_t*`,
-`qcap2_av_packet_t*`). This works but forces every metadata access through
-type-specific getter/setter functions, and adding a new buffer type means
-adding switch cases everywhere.
-
-Moving to a C++ virtual interface eliminates the opaque pointer entirely —
-each buffer type becomes a concrete subclass that implements the accessor
-methods directly. No casts, no switch dispatch, no `buffer_type` enum.
+To improve extensibility, we propose refactoring [qcap2_rcbuffer_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L37) to use a C++ virtual interface internally while **exposing a pure C interface in the public headers**. This avoids exposing C++-specific constructs (like classes, virtual methods, or inheritance) to C callers, satisfying the requirement to maintain a clean C interface.
 
 ## 2. Goals
-
-- **No opaque pointers**: Buffer metadata is accessed through virtual methods,
-  not by casting `PVOID pData`.
-- **Pluggable backends**: Adding a new buffer type means writing one subclass,
-  not patching switch statements across the codebase.
-- **Zero-copy**: Backends wrap native types (`AVPacket*`, `AVFrame*`,
-  `CUdeviceptr`, etc.) at construction time — no intermediate copy.
-- **Reference counting**: Atomic `ref_count_` in the base class. Subclasses
-  implement `on_release_resource()` to free their native resource.
+*   **Public C Interface**: The public header [qcap2.buffer.h](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h) must expose only C-compatible constructs (opaque pointers, enum tags, and C wrapper functions). No C++ virtual classes are to be exposed directly to users.
+*   **Internal C++ Polymorphism**: Internally (in `src/`), the buffer is represented by a C++ virtual base class and concrete subclasses (`qcap2_system_buffer`, `qcap2_avpacket_buffer`, etc.) to eliminate switch statements and type casting.
+*   **Zero-Copy Support**: Enable retrieving underlying native hardware handles (e.g. `CUdeviceptr`, `NvBufSurface*`) directly via the C/C++ interface.
+*   **Pointer Identity Backward Compatibility**: Maintain the key memory-layout rule where [qcap2_rcbuffer_get_data](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h#L20) returns the exact borrowed identity pointer passed to [qcap2_rcbuffer_new](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h#L12) (supporting the `qcap2_container_of` pattern described in [RCBUF.md](file:///home/zzlee/qcap2-dev/wiki/RCBUF.md)).
 
 ## 3. Architecture
 
-### 3.1. Base Class (`qcap2.buffer.h`)
+### 3.1. Public C Interface (`include/qcap2.buffer.h`)
+The public header [qcap2.buffer.h](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h) remains a C-compatible header wrapped in `extern "C"`. It declares [qcap2_rcbuffer_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L37) as an opaque pointer:
 
-The base class lives in its own header with **no 3rdparty dependencies**. It
-declares only the general-purpose virtual functions that work across all buffer
-types — packet metadata, frame properties, raw data access, and memory mapping.
+```c
+// include/qcap2.buffer.h
+#include "qcap2.types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Opaque struct type (typedef in qcap2.types.h)
+// typedef struct qcap2_rcbuffer_t qcap2_rcbuffer_t;
+
+// --- Lifecycle APIs ---
+qcap2_rcbuffer_t* qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFreeResource);
+void qcap2_rcbuffer_delete(qcap2_rcbuffer_t* pRCBuffer);
+void qcap2_rcbuffer_add_ref(qcap2_rcbuffer_t* pRCBuffer);
+void qcap2_rcbuffer_release(qcap2_rcbuffer_t* pRCBuffer);
+PVOID qcap2_rcbuffer_lock_data(qcap2_rcbuffer_t* pRCBuffer);
+void qcap2_rcbuffer_unlock_data(qcap2_rcbuffer_t* pRCBuffer);
+PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer);
+int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer);
+int32_t qcap2_rcbuffer_res_count(qcap2_rcbuffer_t* pRCBuffer);
+
+// --- Buffer Tagging & Native Handles ---
+typedef enum {
+    QCAP2_BUFFER_TYPE_SYSTEM = 0,
+    QCAP2_BUFFER_TYPE_DMABUF,
+    QCAP2_BUFFER_TYPE_V4L2,
+    QCAP2_BUFFER_TYPE_CUDA,
+    QCAP2_BUFFER_TYPE_NVBUF,
+    QCAP2_BUFFER_TYPE_AVFRAME,
+    QCAP2_BUFFER_TYPE_AVPACKET,
+    QCAP2_BUFFER_TYPE_CUSTOM
+} qcap2_buffer_type_t;
+
+qcap2_buffer_type_t qcap2_rcbuffer_get_type(qcap2_rcbuffer_t* pRCBuffer);
+PVOID qcap2_rcbuffer_get_native_handle(qcap2_rcbuffer_t* pRCBuffer);
+
+// --- Extended Buffer Metadata & Accessors ---
+QRESULT qcap2_rcbuffer_get_pts(qcap2_rcbuffer_t* pRCBuffer, int64_t* pts);
+QRESULT qcap2_rcbuffer_set_pts(qcap2_rcbuffer_t* pRCBuffer, int64_t pts);
+QRESULT qcap2_rcbuffer_get_dts(qcap2_rcbuffer_t* pRCBuffer, int64_t* dts);
+QRESULT qcap2_rcbuffer_set_dts(qcap2_rcbuffer_t* pRCBuffer, int64_t dts);
+QRESULT qcap2_rcbuffer_get_stream_index(qcap2_rcbuffer_t* pRCBuffer, int* idx);
+QRESULT qcap2_rcbuffer_set_stream_index(qcap2_rcbuffer_t* pRCBuffer, int idx);
+QRESULT qcap2_rcbuffer_is_keyframe(qcap2_rcbuffer_t* pRCBuffer, BOOL* key);
+QRESULT qcap2_rcbuffer_set_keyframe(qcap2_rcbuffer_t* pRCBuffer, BOOL key);
+
+// --- Frame/Raw Data Properties ---
+QRESULT qcap2_rcbuffer_get_data_ptr(qcap2_rcbuffer_t* pRCBuffer, uint8_t** data, int* size);
+QRESULT qcap2_rcbuffer_get_video_property(qcap2_rcbuffer_t* pRCBuffer, ULONG* colorspace, ULONG* width, ULONG* height);
+QRESULT qcap2_rcbuffer_get_plane(qcap2_rcbuffer_t* pRCBuffer, int plane, uint8_t** data, int* stride);
+
+// --- Hardware memory mapping ---
+QRESULT qcap2_rcbuffer_map_system_memory(qcap2_rcbuffer_t* pRCBuffer, PVOID* ppDataOut);
+QRESULT qcap2_rcbuffer_unmap_system_memory(qcap2_rcbuffer_t* pRCBuffer);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+### 3.2. Private C++ Class Hierarchy (`src/qcap2.buffer_priv.h`)
+The C++ base class is defined internally in a private header (invisible to public C users). In C++, the struct [qcap2_rcbuffer_t](file:///home/zzlee/qcap2-dev/include/qcap2.types.h#L37) is declared as a C++ base class:
 
 ```cpp
-// include/qcap2.buffer.h
+// src/qcap2.buffer_priv.h
+#pragma once
+#include "qcap2.buffer.h"
+#include <atomic>
 
-class qcap2_rcbuffer_t {
+struct qcap2_rcbuffer_t {
 protected:
-    std::atomic<int32_t> ref_count_{1};
+    std::atomic<int32_t> use_count_{1};
+    std::atomic<int32_t> res_count_{1};
+    std::atomic<bool> resource_freed_{false};
 
     virtual ~qcap2_rcbuffer_t() = default;
-
-    // Called once when ref_count_ reaches 0, before delete this.
-    // Subclasses free their native resource here (av_packet_free, etc.).
     virtual void on_release_resource() = 0;
 
 public:
-    // ── Lifecycle (implemented once in base) ──
     void add_ref();
     void release();
-
     int32_t use_count() const;
+    int32_t res_count() const;
+    PVOID lock_data();
+    void unlock_data();
 
-    // ── Packet metadata (override per type) ──
+    // Virtual interfaces overridden by concrete backends
+    virtual PVOID get_data() const = 0;
+    virtual qcap2_buffer_type_t get_type() const = 0;
+    virtual PVOID get_native_handle() const = 0;
+
     virtual QRESULT get_pts(int64_t* pts) = 0;
     virtual QRESULT set_pts(int64_t pts) = 0;
     virtual QRESULT get_dts(int64_t* dts) = 0;
@@ -62,326 +117,137 @@ public:
     virtual QRESULT is_keyframe(BOOL* key) = 0;
     virtual QRESULT set_keyframe(BOOL key) = 0;
 
-    // ── Frame / raw data (override per type) ──
     virtual QRESULT get_data_ptr(uint8_t** data, int* size) = 0;
-    virtual QRESULT get_video_property(
-        ULONG* colorspace, ULONG* width, ULONG* height) = 0;
-    virtual QRESULT get_plane(
-        int plane, uint8_t** data, int* stride) = 0;
+    virtual QRESULT get_video_property(ULONG* colorspace, ULONG* width, ULONG* height) = 0;
+    virtual QRESULT get_plane(int plane, uint8_t** data, int* stride) = 0;
 
-    // ── Mapping (optional, for hardware buffers) ──
-    virtual QRESULT map_system_memory(PVOID* ppDataOut);
-    virtual QRESULT unmap_system_memory();
+    virtual QRESULT map_system_memory(PVOID* ppDataOut) { return QCAP_RS_ERROR_NOT_SUPPORTED; }
+    virtual QRESULT unmap_system_memory() { return QCAP_RS_ERROR_NOT_SUPPORTED; }
 };
 ```
 
-Reference counting is centralized:
-
+Reference counting implementation in the base class:
 ```cpp
 void qcap2_rcbuffer_t::add_ref() {
-    ref_count_.fetch_add(1, std::memory_order_relaxed);
+    use_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void qcap2_rcbuffer_t::release() {
-    if (ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        on_release_resource();
-        delete this;
-    }
-}
-```
-
-### 3.2. Modular Header Layout
-
-Each 3rdparty library gets its own header that includes the library directly.
-The base class never sees them.
-
-```
-include/
- └── qcap2.buffer.h              ← base class only (no 3rdparty deps)
-     qcap2.buffer.ffmpeg.h       ← AVPacket / AVFrame subclasses
-     qcap2.buffer.cuda.h         ← CUDA buffer subclass
-     qcap2.buffer.nvbuf.h        ← Jetson nvbuf subclass
-     qcap2.buffer.v4l2.h         ← V4L2 buffer subclass
-```
-
-Each type-specific header provides the subclass and a downcast helper using
-`dynamic_cast`:
-
-```cpp
-// include/qcap2.buffer.ffmpeg.h
-#include <libavcodec/avcodec.h>
-#include "qcap2.buffer.h"
-
-class qcap2_avpacket_buffer : public qcap2_rcbuffer_t {
-    AVPacket* pkt_;
-    void on_release_resource() override { av_packet_free(&pkt_); }
-public:
-    qcap2_avpacket_buffer(AVPacket* pkt) : pkt_(pkt) {}
-    AVPacket* native_handle() const { return pkt_; }
-
-    QRESULT get_pts(int64_t* pts) override { ... }
-    QRESULT set_pts(int64_t pts) override { ... }
-    QRESULT get_stream_index(int* idx) override { ... }
-    QRESULT is_keyframe(BOOL* key) override { ... }
-    QRESULT get_data_ptr(uint8_t** data, int* size) override { ... }
-};
-
-// Downcast helper — safe, returns nullptr on type mismatch
-inline qcap2_avpacket_buffer*
-qcap2_buffer_to_avpacket(qcap2_rcbuffer_t* buf) {
-    return dynamic_cast<qcap2_avpacket_buffer*>(buf);
-}
-
-class qcap2_avframe_buffer : public qcap2_rcbuffer_t {
-    AVFrame* frame_;
-    void on_release_resource() override { av_frame_free(&frame_); }
-public:
-    qcap2_avframe_buffer(AVFrame* frame) : frame_(frame) {}
-    AVFrame* native_handle() const { return frame_; }
-
-    QRESULT get_pts(int64_t* pts) override { ... }
-    QRESULT get_video_property(...) override { ... }
-    QRESULT get_plane(int plane, uint8_t** data, int* stride) override { ... }
-};
-
-inline qcap2_avframe_buffer*
-qcap2_buffer_to_avframe(qcap2_rcbuffer_t* buf) {
-    return dynamic_cast<qcap2_avframe_buffer*>(buf);
-}
-```
-
-```cpp
-// include/qcap2.buffer.cuda.h
-#include <cuda.h>
-#include "qcap2.buffer.h"
-
-class qcap2_cuda_buffer : public qcap2_rcbuffer_t {
-    CUdeviceptr devptr_;
-    int width_, height_;
-    void on_release_resource() override { /* cudaFree */ }
-public:
-    CUdeviceptr native_handle() const { return devptr_; }
-    QRESULT get_video_property(...) override { /* CUDA-specific */ }
-    QRESULT map_system_memory(PVOID* ppDataOut) override { ... }
-};
-
-inline qcap2_cuda_buffer*
-qcap2_buffer_to_cuda(qcap2_rcbuffer_t* buf) {
-    return dynamic_cast<qcap2_cuda_buffer*>(buf);
-}
-```
-
-Consumers that need a specific backend's features include the corresponding
-header and use the downcast helper:
-
-```cpp
-#include "qcap2.buffer.h"
-#include "qcap2.buffer.ffmpeg.h"
-
-void process(qcap2_rcbuffer_t* buf) {
-    // General access — works with any backend
-    int64_t pts;
-    buf->get_pts(&pts);
-
-    // Backend-specific access — only if it's an AVPacket buffer
-    if (auto* pkt_buf = qcap2_buffer_to_avpacket(buf)) {
-        AVPacket* raw = pkt_buf->native_handle();
-        avcodec_send_packet(avctx, raw);
-    }
-}
-```
-
-This design keeps 3rdparty dependencies completely isolated — a pipeline that
-only uses ffmpeg never needs to include CUDA headers, and vice versa.
-
-### 3.3. Concrete Subclasses
-
-Each buffer backend writes a subclass that implements the pure virtual methods.
-The implementations live in backend-specific source files.
-
-#### AVPacket (ffmpeg bitstream)
-
-```cpp
-// src/backends/buffer_avpacket.cpp
-#include "qcap2.buffer.ffmpeg.h"
-
-qcap2_avpacket_buffer::qcap2_avpacket_buffer(AVPacket* pkt)
-    : pkt_(pkt) {}
-
-void qcap2_avpacket_buffer::on_release_resource() {
-    av_packet_free(&pkt_);
-}
-
-QRESULT qcap2_avpacket_buffer::get_pts(int64_t* pts) {
-    if (!pts) return QCAP_RS_ERROR_INVALID_PARAMETER;
-    *pts = pkt_->pts;
-    return QCAP_RS_SUCCESSFUL;
-}
-
-QRESULT qcap2_avpacket_buffer::get_data_ptr(uint8_t** data, int* size) {
-    *data = pkt_->data;
-    *size = pkt_->size;
-    return QCAP_RS_SUCCESSFUL;
-}
-// ... other overrides ...
-```
-
-#### AVFrame (ffmpeg decoded frames)
-
-```cpp
-// src/backends/buffer_avframe.cpp
-#include "qcap2.buffer.ffmpeg.h"
-// ... AVFrame override implementations ...
-```
-
-#### SYSTEM (generic system memory — for non-ffmpeg pipelines)
-
-```cpp
-// include/qcap2.buffer.h  (inline in the base header, no 3rdparty deps)
-class qcap2_system_buffer : public qcap2_rcbuffer_t {
-    uint8_t* buf_;
-    int      size_;
-    void*    user_data_;
-    void (*free_cb_)(void*);
-    void on_release_resource() override {
-        if (free_cb_) free_cb_(user_data_);
-    }
-public:
-    qcap2_system_buffer(uint8_t* buf, int size, void* cb_data, void (*cb)(void*))
-        : buf_(buf), size_(size), user_data_(cb_data), free_cb_(cb) {}
-    QRESULT get_data_ptr(uint8_t** data, int* size) override { ... }
-};
-```
-
-#### CUDA (hardware memory)
-
-```cpp
-// src/backends/buffer_cuda.cpp
-#include "qcap2.buffer.cuda.h"
-// ... CUDA override implementations ...
-```
-
-### 3.4. Factory / Construction
-
-Backends create the appropriate subclass directly. No central registry needed.
-
-```cpp
-// Inside the ffmpeg demuxer backend:
-AVPacket* pkt = av_packet_alloc();
-av_read_frame(ctx, pkt);
-
-qcap2_rcbuffer_t* buf = new qcap2_avpacket_buffer(pkt);
-
-// The buffer is ready to use — metadata is accessed through virtual methods.
-```
-
-For code that needs to create a simple system-memory buffer:
-
-```cpp
-qcap2_rcbuffer_t* buf = new qcap2_system_buffer(data, size, free_cb);
-```
-
-### 3.5. Pool Integration
-
-A pool can pre-allocate buffers of a specific subclass:
-
-```cpp
-class qcap2_buffer_pool_t {
-    std::vector<qcap2_rcbuffer_t*> pool_;
-    std::function<qcap2_rcbuffer_t*()> factory_;
-
-public:
-    QRESULT get_buffer(qcap2_rcbuffer_t** out) {
-        for (auto* buf : pool_) {
-            if (buf->use_count() == 1) {  // only pool owns it
-                buf->add_ref();
-                *out = buf;
-                return QCAP_RS_SUCCESSFUL;
+    if (use_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // Decrease res_count; when both are 0, free resource and delete
+        int32_t r = res_count_.fetch_sub(1, std::memory_order_acq_rel);
+        if (r == 1) {
+            bool expected = false;
+            if (resource_freed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                on_release_resource();
             }
+            delete this;
         }
-        return QCAP_RS_ERROR_GENERAL;
     }
-};
+}
 ```
 
-The pool is parameterized by factory function — it can produce
-`qcap2_avpacket_buffer`, `qcap2_system_buffer`, or any other subclass.
+### 3.3. C-to-C++ Forwarding Layer (`src/qcap2.buffer.cpp`)
+All public C APIs are defined in [qcap2.buffer.cpp](file:///home/zzlee/qcap2-dev/src/qcap2.buffer.cpp) and forward their operations to the C++ base class virtual methods via casting:
 
-## 4. Comparison: C Interface (type enum) vs C++ Interface
+```cpp
+// src/qcap2.buffer.cpp
+#include "qcap2.buffer_priv.h"
 
-| Aspect | Type enum + switch | Virtual interface |
+extern "C" {
+
+void qcap2_rcbuffer_add_ref(qcap2_rcbuffer_t* pRCBuffer) {
+    if (pRCBuffer) pRCBuffer->add_ref();
+}
+
+void qcap2_rcbuffer_release(qcap2_rcbuffer_t* pRCBuffer) {
+    if (pRCBuffer) pRCBuffer->release();
+}
+
+PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer) {
+    return pRCBuffer ? pRCBuffer->get_data() : NULL;
+}
+
+qcap2_buffer_type_t qcap2_rcbuffer_get_type(qcap2_rcbuffer_t* pRCBuffer) {
+    return pRCBuffer ? pRCBuffer->get_type() : QCAP2_BUFFER_TYPE_SYSTEM;
+}
+
+PVOID qcap2_rcbuffer_get_native_handle(qcap2_rcbuffer_t* pRCBuffer) {
+    return pRCBuffer ? pRCBuffer->get_native_handle() : NULL;
+}
+
+QRESULT qcap2_rcbuffer_get_pts(qcap2_rcbuffer_t* pRCBuffer, int64_t* pts) {
+    if (!pRCBuffer) return QCAP_RS_ERROR_INVALID_PARAMETER;
+    return pRCBuffer->get_pts(pts);
+}
+
+// ... other forwarding functions ...
+}
+```
+
+### 3.4. Private Modular Headers & Concrete Subclasses
+Private subclasses exist in the `src/backends/` directory (or internally in `src/`) and are never exposed in public headers:
+
+*   **System Memory Subclass (`qcap2_system_buffer`)**
+    Wraps standard system buffers. Implements `get_data()` to return the original borrowed identity pointer to support `qcap2_container_of` patterns described in [RCBUF.md](file:///home/zzlee/qcap2-dev/wiki/RCBUF.md).
+*   **FFmpeg AVPacket Subclass (`qcap2_avpacket_buffer`)**
+    Wraps an `AVPacket*` and extracts packet metadata dynamically.
+*   **FFmpeg AVFrame Subclass (`qcap2_avframe_buffer`)**
+    Wraps an `AVFrame*`.
+*   **CUDA Memory Subclass (`qcap2_cuda_buffer`)**
+    Wraps a `CUdeviceptr` and overrides `map_system_memory` and `unmap_system_memory`.
+
+Internally, downcasting is performed safely using helper inline functions:
+```cpp
+inline qcap2_avpacket_buffer* qcap2_buffer_to_avpacket(qcap2_rcbuffer_t* buf) {
+    return (buf && buf->get_type() == QCAP2_BUFFER_TYPE_AVPACKET) 
+        ? static_cast<qcap2_avpacket_buffer*>(buf) : nullptr;
+}
+```
+
+---
+
+## 4. Codebase Progress Verification
+
+Checking the actual files in this repository reveals that **none of the migration steps have been started**. The previous draft of the plan stated that the demuxer, muxer, and portions of processing/utilities were already ported. This is **incorrect**:
+
+*   [include/qcap2.buffer.h](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h): Still contains the legacy C functions and has no classes or new getters.
+*   [qcap2.buffer.cpp](file:///home/zzlee/qcap2-dev/src/qcap2.buffer.cpp): Still defines the C struct `_qcap2_rcbuffer_priv_t` and `_qcap2_av_frame_priv_t` with no virtual methods or subclasses.
+*   [qcap2.demuxer.cpp](file:///home/zzlee/qcap2-dev/src/qcap2.demuxer.cpp): Still creates buffers with `qcap2_rcbuffer_new()` and manages lifetime manually.
+*   [qcap2.muxer.cpp](file:///home/zzlee/qcap2-dev/src/qcap2.muxer.cpp): Still uses `qcap2_rcbuffer_lock_data()` and expects legacy frame layout structures.
+*   **Tests** in [tests/test_qcap2_buffer.cpp](file:///home/zzlee/qcap2-dev/tests/test_qcap2_buffer.cpp): Still compile and run successfully asserting the behavior of the old C structs.
+
+### Progress Table
+
+| Component | Status | Description |
 |---|---|---|
-| Adding a new buffer type | Add enum entry + edit every switch | Write one subclass |
-| Dispatch cost | Runtime switch (branch) | vtable dispatch (indirect call) |
-| Type safety | `PVOID pData` cast at every call site | Compiler-verified per override |
-| Data access | Cast `PVOID pData` to known type | Virtual methods on the buffer pointer |
-| Code locality | Accessor logic spread across one big file | Each backend in its own file |
-| Extensibility (third-party) | Must patch SDK enums and switches | Link a new subclass |
-| C compatibility | Works from C code | C++ only |
+| **Define Base Class & Subclasses** | ❌ Not Started | Core polymorphism architecture needs to be written. |
+| **Port Demuxer & Muxer** | ❌ Not Started | Uses the legacy callbacks and struct-casting patterns. |
+| **Port Processing** | ❌ Not Started | Encoders/decoders still cast `PVOID` to `qcap2_av_frame_t`. |
+| **Port Utility Files** | ❌ Not Started | `sync.cpp`, `utils.cpp`, etc., still use old locking APIs. |
+| **Remove Old Types** | ❌ Not Started | `qcap2_av_frame_t` is still declared in `qcap2.types.h`. |
+| **Update Tests** | ❌ Not Started | Unit tests are based entirely on the legacy interface. |
 
-The project is already C++ (the implementation uses `std::atomic`, `new`/
-`delete`, lambdas). The public headers already have `extern "C"` guards for
-C callers — but the rcbuf internals and pipeline code are all C++. Moving
-the buffer type hierarchy to virtual methods is a natural fit.
+---
 
-## 5. What Gets Deleted
+## 5. Migration Path & Roadmap
 
-| Artifact | Replaced by |
-|---|---|
-| `struct qcap2_av_frame_t { padding[512] }` | `qcap2_avframe_buffer` class |
-| `struct qcap2_av_packet_t { padding[128] }` | `qcap2_avpacket_buffer` class |
-| `qcap2_av_frame_priv_t` overlay struct | (embedded in the class directly) |
-| `qcap2_av_packet_priv_t` overlay struct | (embedded in the class directly) |
-| All `qcap2_av_frame_*()` free functions | Virtual methods on `qcap2_rcbuffer_t` |
-| All `qcap2_av_packet_*()` free functions | Virtual methods on `qcap2_rcbuffer_t` |
-| `qcap2_rcbuffer_av_frame_owner_t` wrapper | (the object IS the buffer) |
-| `qcap2_rcbuffer_av_packet_owner_t` wrapper | (the object IS the buffer) |
-| `qcap2_rcbuffer_new_av_frame()` | `new qcap2_avframe_buffer(...)` |
-| `qcap2_rcbuffer_new_av_packet()` | `new qcap2_avpacket_buffer(...)` |
-| `qcap2_rcbuffer_priv_t` C struct | (members moved into base class) |
-| `qcap2_buffer_type_t` enum | (type identity via `dynamic_cast` or a virtual `type_id()` if needed) |
-| All switch-on-type dispatch | (polymorphism handles it) |
+To ensure continuous build verification and prevent regression, the migration must be phased:
 
-## 6. Pipeline User Code (unchanged)
+### Phase 1: Core Framework (Private)
+1. Add the internal base class `qcap2_rcbuffer_t` inside `src/qcap2.buffer_priv.h`.
+2. Define `qcap2_system_buffer` subclass to emulate the legacy `qcap2_rcbuffer_new` behavior.
+3. Rewrite [qcap2.buffer.cpp](file:///home/zzlee/qcap2-dev/src/qcap2.buffer.cpp) to forward the existing C API functions to the new virtual backend. This ensures all tests compile and pass before porting internal components.
 
-The outermost API remains the same. Users still write:
+### Phase 2: Extend public APIs
+1. Update [qcap2.buffer.h](file:///home/zzlee/qcap2-dev/include/qcap2.buffer.h) to add `qcap2_rcbuffer_get_type`, `qcap2_rcbuffer_get_native_handle` and metadata getters (`qcap2_rcbuffer_get_pts`, etc.).
+2. Implement subclasses `qcap2_avpacket_buffer` and `qcap2_avframe_buffer`.
 
-```c
-qcap2_rcbuffer_t* buf;
-qcap2_pipeline_pop(my_pipeline, &buf);
+### Phase 3: Port Internal Components
+1. Port demuxer, muxer, and processing components to use the new C metadata getters instead of direct structure access.
+2. Replace legacy frame/packet allocation calls with the creation of the respective subclasses.
 
-int64_t pts;
-buf->get_pts(&pts);                // virtual dispatch — no type checking needed
-
-uint8_t* data;
-int size;
-buf->get_data_ptr(&data, &size);   // works for AVPACKET, SYSTEM
-
-process(data, size, pts);
-buf->release();                    // ref-counting from base class
-```
-
-The difference is internal: `buf` is now a polymorphic object instead of a C
-struct with a tagged `PVOID`. The user doesn't need to know.
-
-## 7. Migration Path
-
-1. **Define the base class** in `include/qcap2.buffer.h` with the virtual
-   interface and the centralized ref-counting implementation.
-
-2. **Write concrete subclasses**: start with `qcap2_system_buffer` (replaces
-   the legacy two-parameter `qcap2_rcbuffer_new` pattern), then
-   `qcap2_avpacket_buffer` and `qcap2_avframe_buffer`.
-
-3. **Port internal consumers**: change `qcap2.demuxer.cpp`, `qcap2.muxer.cpp`,
-   `qcap2.processing.cpp` to construct the appropriate subclass and call
-   virtual methods instead of `qcap2_av_packet_*` / `qcap2_av_frame_*`
-   free functions.
-
-4. **Remove the old types**: delete `qcap2_av_frame_t`, `qcap2_av_packet_t`,
-   their overlay structs, their free functions, and their owning wrappers.
-
-5. **Rework pools**: replace `qcap2_frame_pool_t` / `qcap2_packet_pool_t`
-   with a generic `qcap2_buffer_pool_t` parameterized by a factory.
-
-6. **Documentation**: update `wiki/RCBUF.md` and remove obsolete wiki pages.
+### Phase 4: Cleanup & Rework Pools
+1. Remove `qcap2_av_frame_t` and `qcap2_av_packet_t` from public headers.
+2. Refactor buffer pools to use factory functions creating subclasses.
+3. Update unit tests to verify the extended features (types and hardware handles).

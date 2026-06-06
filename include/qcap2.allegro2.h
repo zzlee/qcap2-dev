@@ -8,11 +8,12 @@
 // specific configuration for the QCAP2 video encoder/decoder backends.
 //
 // These functions are only available when the encoder/decoder's backend_type
-// is set to QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO2 or
-// QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO2.
+// is set to QCAP_ENCODER_TYPE_ALLEGRO2.
 //
-// They must be called BEFORE qcap2_video_encoder_start() /
-// qcap2_video_decoder_start().
+// The backend_type is set via qcap2_video_encoder_set_backend_type() with
+// QCAP_ENCODER_TYPE_ALLEGRO2 from qcap.ext.core.h.
+//
+// They must be called BEFORE qcap2_video_encoder_start().
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,7 +37,7 @@ void qcap2_video_decoder_set_input_mode(qcap2_video_decoder_t* pThis, int nInput
 void qcap2_video_decoder_set_allegro_device_path(qcap2_video_decoder_t* pThis, const char* path);
 
 // Set Allegro2 decoder instance
-qcap2_video_decoder_set_allegro_instance(qcap2_video_decoder_t* pThis, int nInstance);
+void qcap2_video_decoder_set_allegro_instance(qcap2_video_decoder_t* pThis, int nInstance);
 
 #ifdef __cplusplus
 }

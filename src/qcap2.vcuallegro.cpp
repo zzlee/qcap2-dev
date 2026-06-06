@@ -59,8 +59,8 @@ QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p) {
     if (p->allegro_inited) return QCAP_RS_SUCCESSFUL;
 
     // Guard against start without proper backend type
-    if (p->backend_type != QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO &&
-        p->backend_type != QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type != QCAP_ENCODER_TYPE_ALLEGRO &&
+        p->backend_type != QCAP_ENCODER_TYPE_ALLEGRO2) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
@@ -239,8 +239,7 @@ QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p) {
     if (p->allegro_inited) return QCAP_RS_SUCCESSFUL;
 
     // Guard against start without proper backend type
-    if (p->backend_type != QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO &&
-        p->backend_type != QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type != QCAP_DECODER_TYPE_ALLEGRO) {
         return QCAP_RS_ERROR_GENERAL;
     }
 

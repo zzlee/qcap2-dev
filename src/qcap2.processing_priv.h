@@ -5,6 +5,7 @@
 #include "qcap2.buffer.h"
 #include "qcap2.sync.h"
 #include "qcap2.formats.h"
+#include "qcap.ext.core.h"
 #include <mutex>
 #include <queue>
 #include <atomic>
@@ -138,7 +139,7 @@ typedef struct qcap2_video_encoder_priv_t {
     qcap2_video_encoder_priv_t() {
         mtx = new std::mutex();
         cv = new std::condition_variable();
-        backend_type = QCAP2_VIDEO_ENCODER_BACKEND_TYPE_DEFAULT;
+        backend_type = QCAP_ENCODER_TYPE_SOFTWARE;
         enc_prop = nullptr;
         dyn_prop = nullptr;
         extra_data = nullptr;
@@ -359,7 +360,7 @@ typedef struct qcap2_video_decoder_priv_t {
     qcap2_video_decoder_priv_t() {
         mtx = new std::mutex();
         cv = new std::condition_variable();
-        backend_type = QCAP2_VIDEO_DECODER_BACKEND_TYPE_DEFAULT;
+        backend_type = QCAP_DECODER_TYPE_SOFTWARE;
         dec_prop = nullptr;
         extra_data = nullptr;
         extra_data_size = 0;

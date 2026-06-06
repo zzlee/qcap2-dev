@@ -3123,7 +3123,7 @@ int qcap2_video_encoder_get_backend_type(qcap2_video_encoder_t* pThis) {
         std::lock_guard<std::mutex> lock(*(p->mtx));
         return p->backend_type;
     }
-    return QCAP2_VIDEO_ENCODER_BACKEND_TYPE_UNKNOWN;
+    return -1;
 }
 
 void qcap2_video_encoder_request_idr(qcap2_video_encoder_t* pThis) {
@@ -3144,12 +3144,13 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
+        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_start(p);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_V4L2_M2M) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_start(p);
     }
 
@@ -3173,12 +3174,13 @@ QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis) {
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
+        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_stop(p);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_V4L2_M2M) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_stop(p);
     }
 
@@ -3210,12 +3212,13 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
+        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_push(p, pRCBuffer);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_ENCODER_BACKEND_TYPE_V4L2_M2M) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_push(p, pRCBuffer);
     }
 
@@ -3798,7 +3801,7 @@ int qcap2_video_decoder_get_backend_type(qcap2_video_decoder_t* pThis) {
         std::lock_guard<std::mutex> lock(*(p->mtx));
         return p->backend_type;
     }
-    return QCAP2_VIDEO_DECODER_BACKEND_TYPE_UNKNOWN;
+    return -1;
 }
 
 static QRESULT v4l2_decoder_start(qcap2_video_decoder_priv_t* p);
@@ -3813,12 +3816,13 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
     // Dispatch to backend-specific start
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_start(p);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_V4L2_M2M) {
+    // V4L2 decoder backend (no dedicated QCAP_DECODER_TYPE)
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_start(p);
     }
 
@@ -3853,12 +3857,12 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
     if (!p->running) return QCAP_RS_SUCCESSFUL;
 
     // Dispatch to backend-specific stop
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_stop(p);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_V4L2_M2M) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_stop(p);
     }
 
@@ -3900,12 +3904,12 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
 
     // Dispatch to backend-specific push
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO ||
-        p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_ALLEGRO2) {
+    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_push(p, pRCBuffer);
     }
 
-    if (p->backend_type == QCAP2_VIDEO_DECODER_BACKEND_TYPE_V4L2_M2M) {
+    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
+        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_push(p, pRCBuffer);
     }
 

@@ -41,6 +41,11 @@ struct ResamplerOutputFrame {
    ```
 3. **No-Leak Callback**: When the consumer releases the output buffer (`qcap2_rcbuffer_release()`), the custom callback uses `qcap2_container_of()` to obtain the base pointer of the `ResamplerOutputFrame` and safely deallocates both the dynamic audio buffer and the container struct.
 
+### 4. Input-Recycling (HPR) and Output-Recycling (PPR)
+`qcap2_audio_resampler_t` implements a dual-queue zero-allocation buffer recycling mechanism to support high-performance audio processing:
+- **HPR (Host-Pipeline-Recycle) for Input Buffers**: When the user pushes a raw audio frame using `qcap2_audio_resampler_push()`, the resampler processes it and enqueues the consumed input buffer into an internal `input_recycled_queue`. The user retrieves this buffer by calling `qcap2_audio_resampler_pop_input()`, refills it with new raw audio data, and pushes it again. This completely avoids input buffer allocations on the hot path.
+- **PPR (Pipeline-Push-Recycle) for Output Buffers**: When the user retrieves a resampled output frame via `qcap2_audio_resampler_pop()`, they consume the audio payload and then recycle the empty output buffer shell back to the resampler's `output_recycled_queue` via `qcap2_audio_resampler_push_output()`. The resampler reuses buffers from this queue on subsequent pushes before allocating new ones.
+
 ---
 
 ## Public API Function Semantics
@@ -92,3 +97,10 @@ Pushes a new reference-counted input audio frame.
 Pops a resampled frame from the output queue.
 - Blocks if the queue is empty, until a frame is pushed or the resampler is stopped.
 - Returns `QCAP_RS_SUCCESSFUL` on success, or an error if stopped.
+
+### `qcap2_audio_resampler_pop_input(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer)`
+Pops a consumed input buffer from the resampler's internal `input_recycled_queue`. The user can reuse this buffer to hold subsequent raw input audio frames.
+
+### `qcap2_audio_resampler_push_output(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t* pRCBuffer)`
+Pushes a consumed output buffer back to the resampler's `output_recycled_queue` for recycling. The resampler will reuse this buffer shell for future resampling outputs.
+

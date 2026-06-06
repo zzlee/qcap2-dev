@@ -169,16 +169,17 @@ QRESULT qcap2_event_notify(qcap2_event_t* pThis) {
     return QCAP_RS_ERROR_GENERAL;
 }
 
-QRESULT qcap2_event_wait(qcap2_event_t* pThis) {
-    if (pThis) {
+QRESULT qcap2_event_wait_count(qcap2_event_t* pThis, uint64_t* pCount) {
+    if (pThis && pCount) {
         qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
 #ifdef __linux__
         struct pollfd pfd = { p->efd, POLLIN, 0 };
         while (true) {
             int ret = poll(&pfd, 1, -1);
             if (ret > 0) {
-                uint64_t u;
+                uint64_t u = 0;
                 if (read(p->efd, &u, sizeof(uint64_t)) > 0) {
+                    *pCount = u;
                     return QCAP_RS_SUCCESSFUL;
                 } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue; // Another thread might have read it, wait again
@@ -192,7 +193,37 @@ QRESULT qcap2_event_wait(qcap2_event_t* pThis) {
 #else
         std::unique_lock<std::mutex> lock(*(p->mtx));
         p->cv->wait(lock, [p]{ return p->signaled; });
+        *pCount = p->signaled ? 1 : 0;
         p->signaled = false; // Auto-reset for simple implementation
+        return QCAP_RS_SUCCESSFUL;
+#endif
+    }
+    return QCAP_RS_ERROR_GENERAL;
+}
+
+QRESULT qcap2_event_wait(qcap2_event_t* pThis) {
+    uint64_t dummy = 0;
+    return qcap2_event_wait_count(pThis, &dummy);
+}
+
+QRESULT qcap2_event_read(qcap2_event_t* pThis, uint64_t* pCount) {
+    if (pThis && pCount) {
+        qcap2_event_priv_t* p = (qcap2_event_priv_t*)pThis;
+#ifdef __linux__
+        uint64_t u = 0;
+        if (read(p->efd, &u, sizeof(uint64_t)) > 0) {
+            *pCount = u;
+            return QCAP_RS_SUCCESSFUL;
+        }
+        // EAGAIN means already drained by another thread
+        *pCount = 0;
+        return (errno == EAGAIN || errno == EWOULDBLOCK)
+            ? QCAP_RS_SUCCESSFUL
+            : QCAP_RS_ERROR_GENERAL;
+#else
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        *pCount = p->signaled ? 1 : 0;
+        p->signaled = false;
         return QCAP_RS_SUCCESSFUL;
 #endif
     }

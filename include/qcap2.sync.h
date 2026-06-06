@@ -22,6 +22,8 @@ QRESULT qcap2_event_stop(qcap2_event_t* pThis);
 QRESULT qcap2_event_get_native_handle(qcap2_event_t* pThis, uintptr_t* pHandle);
 QRESULT qcap2_event_notify(qcap2_event_t* pThis);
 QRESULT qcap2_event_wait(qcap2_event_t* pThis);
+QRESULT qcap2_event_wait_count(qcap2_event_t* pThis, uint64_t* pCount);
+QRESULT qcap2_event_read(qcap2_event_t* pThis, uint64_t* pCount);
 
 // qcap2_event_handlers_t
 qcap2_event_handlers_t* qcap2_event_handlers_new();

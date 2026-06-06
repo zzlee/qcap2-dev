@@ -43,6 +43,8 @@ typedef struct qcap2_audio_resampler_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     // Output configuration (from set_audio_property)
     ULONG out_channels;
@@ -87,6 +89,15 @@ qcap2_audio_resampler_t* qcap2_audio_resampler_new() {
     pThis->in_sample_fmt = 0;
     pThis->in_sample_freq = 0;
     pThis->in_frame_size = 0;
+
+    pThis->input_recycled_queue = qcap2_rcbuffer_queue_new();
+    if (pThis->input_recycled_queue) {
+        qcap2_rcbuffer_queue_start(pThis->input_recycled_queue);
+    }
+    pThis->output_recycled_queue = qcap2_rcbuffer_queue_new();
+    if (pThis->output_recycled_queue) {
+        qcap2_rcbuffer_queue_start(pThis->output_recycled_queue);
+    }
     return (qcap2_audio_resampler_t*)pThis;
 }
 
@@ -94,6 +105,12 @@ void qcap2_audio_resampler_delete(qcap2_audio_resampler_t* pThis) {
     if (pThis) {
         qcap2_audio_resampler_stop(pThis);
         qcap2_audio_resampler_priv_t* p = (qcap2_audio_resampler_priv_t*)pThis;
+        if (p->input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(p->input_recycled_queue);
+        }
+        if (p->output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(p->output_recycled_queue);
+        }
         delete p->cv;
         delete p->mtx;
         delete p;
@@ -149,6 +166,7 @@ static bool init_resampler(qcap2_audio_resampler_priv_t* p, ULONG in_ch, ULONG i
     AVSampleFormat in_sample_fmt = (AVSampleFormat)in_fmt;
     AVSampleFormat out_sample_fmt = (AVSampleFormat)p->out_sample_fmt;
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
     AVChannelLayout in_layout;
     AVChannelLayout out_layout;
     av_channel_layout_default(&in_layout, in_ch);
@@ -161,6 +179,16 @@ static bool init_resampler(qcap2_audio_resampler_priv_t* p, ULONG in_ch, ULONG i
 
     av_channel_layout_uninit(&in_layout);
     av_channel_layout_uninit(&out_layout);
+#else
+    uint64_t in_layout = av_get_default_channel_layout(in_ch);
+    uint64_t out_layout = av_get_default_channel_layout(p->out_channels);
+
+    p->swr_ctx = swr_alloc_set_opts(p->swr_ctx,
+                                    out_layout, out_sample_fmt, p->out_sample_freq,
+                                    in_layout, in_sample_fmt, in_rate,
+                                    0, nullptr);
+    int ret = p->swr_ctx ? 0 : -1;
+#endif
 
     if (ret < 0 || !p->swr_ctx) {
         return false;
@@ -201,6 +229,22 @@ QRESULT qcap2_audio_resampler_stop(qcap2_audio_resampler_t* pThis) {
             p->output_queue.pop();
             qcap2_rcbuffer_release(buf);
         }
+
+        if (p->input_recycled_queue) {
+            qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+            qcap2_rcbuffer_t* drain_buf = nullptr;
+            while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+                qcap2_rcbuffer_release(drain_buf);
+            }
+        }
+        if (p->output_recycled_queue) {
+            qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+            qcap2_rcbuffer_t* drain_buf = nullptr;
+            while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+                qcap2_rcbuffer_release(drain_buf);
+            }
+        }
+
         p->cv->notify_all();
         return QCAP_RS_SUCCESSFUL;
     }
@@ -243,7 +287,36 @@ QRESULT qcap2_audio_resampler_push(qcap2_audio_resampler_t* pThis, qcap2_rcbuffe
 
     int out_bytes_per_sample = av_get_bytes_per_sample((AVSampleFormat)p->out_sample_fmt);
     size_t out_buf_size = out_samples * p->out_channels * out_bytes_per_sample;
-    uint8_t* pOutputBuffer = new uint8_t[out_buf_size];
+
+    qcap2_rcbuffer_t* out_rc = nullptr;
+    ResamplerOutputFrame* out_frame = nullptr;
+    if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+        qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &out_rc);
+    }
+
+    if (out_rc) {
+        PVOID pOutData = qcap2_rcbuffer_lock_data(out_rc);
+        out_frame = qcap2_container_of((qcap2_av_frame_t*)pOutData, ResamplerOutputFrame, frame);
+        if (out_frame->buffer_size < out_buf_size) {
+            delete[] out_frame->audio_buffer;
+            out_frame->audio_buffer = new uint8_t[out_buf_size];
+            out_frame->buffer_size = out_buf_size;
+        }
+        qcap2_rcbuffer_unlock_data(out_rc);
+    } else {
+        out_frame = new ResamplerOutputFrame;
+        out_frame->audio_buffer = new uint8_t[out_buf_size];
+        out_frame->buffer_size = out_buf_size;
+        qcap2_av_frame_init(&out_frame->frame);
+        out_frame->rc_buffer = qcap2_rcbuffer_new(&out_frame->frame, [](PVOID pData) {
+            ResamplerOutputFrame* p = qcap2_container_of(pData, ResamplerOutputFrame, frame);
+            delete[] p->audio_buffer;
+            delete p;
+        });
+        out_rc = out_frame->rc_buffer;
+    }
+
+    uint8_t* pOutputBuffer = out_frame->audio_buffer;
 
     const uint8_t* in_data[8] = { pInputBuffer, nullptr };
     uint8_t* out_data[8] = { pOutputBuffer, nullptr };
@@ -259,32 +332,22 @@ QRESULT qcap2_audio_resampler_push(qcap2_audio_resampler_t* pThis, qcap2_rcbuffe
     qcap2_rcbuffer_unlock_data(pRCBuffer);
 
     if (converted < 0) {
-        delete[] pOutputBuffer;
+        qcap2_rcbuffer_release(out_rc);
         return QCAP_RS_ERROR_GENERAL;
     }
 
-    ResamplerOutputFrame* out_frame = new ResamplerOutputFrame;
-    qcap2_av_frame_init(&out_frame->frame);
     qcap2_av_frame_set_audio_property(&out_frame->frame, p->out_channels, p->out_sample_fmt, p->out_sample_freq, converted);
-    out_frame->audio_buffer = pOutputBuffer;
-    out_frame->buffer_size = converted * p->out_channels * out_bytes_per_sample;
-
     qcap2_av_frame_set_buffer(&out_frame->frame, pOutputBuffer, converted * out_bytes_per_sample);
     qcap2_av_frame_set_pts(&out_frame->frame, nPTS);
 
-    out_frame->rc_buffer = qcap2_rcbuffer_new(&out_frame->frame, [](PVOID pData) {
-        ResamplerOutputFrame* p = qcap2_container_of(pData, ResamplerOutputFrame, frame);
-        delete[] p->audio_buffer;
-        delete p;
-    });
-
-    p->output_queue.push(out_frame->rc_buffer);
+    p->output_queue.push(out_rc);
     p->cv->notify_all();
 
     if (p->event) {
         qcap2_event_notify(p->event);
     }
 
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
     return QCAP_RS_SUCCESSFUL;
 }
 
@@ -302,6 +365,18 @@ QRESULT qcap2_audio_resampler_pop(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_resampler_pop_input(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_resampler_priv_t* p = (qcap2_audio_resampler_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_resampler_push_output(qcap2_audio_resampler_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_resampler_priv_t* p = (qcap2_audio_resampler_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 // ==============================================================================
@@ -326,55 +401,7 @@ static enum AVCodecID qcap2_audio_format_to_ffmpeg_codec_id(ULONG nEncoderFormat
     }
 }
 
-typedef struct qcap2_audio_encoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    qcap2_audio_encoder_property_t* property;
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    int max_frames;
-    int packet_count;
-    bool multithread;
-    qcap2_event_t* event;
-
-    AVCodecContext* avctx;
-    bool running;
-
-    qcap2_audio_encoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        property = qcap2_audio_encoder_property_new();
-        extra_data = nullptr;
-        extra_data_size = 0;
-        max_frames = 0;
-        packet_count = 0;
-        multithread = false;
-        event = nullptr;
-        avctx = nullptr;
-        running = false;
-    }
-
-    ~qcap2_audio_encoder_priv_t() {
-        if (property) {
-            qcap2_audio_encoder_property_delete(property);
-        }
-        if (extra_data) {
-            delete[] extra_data;
-        }
-        if (avctx) {
-            avcodec_free_context(&avctx);
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        delete cv;
-        delete mtx;
-    }
-} qcap2_audio_encoder_priv_t;
+#include "qcap2.processing_priv.h"
 
 qcap2_audio_encoder_t* qcap2_audio_encoder_new() {
     qcap2_audio_encoder_priv_t* p = new qcap2_audio_encoder_priv_t;
@@ -495,7 +522,12 @@ QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis) {
 
     p->avctx->bit_rate = rate;
     p->avctx->sample_rate = freq;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
     av_channel_layout_default(&p->avctx->ch_layout, ch);
+#else
+    p->avctx->channels = ch;
+    p->avctx->channel_layout = av_get_default_channel_layout(ch);
+#endif
 
     if (codec->sample_fmts) {
         p->avctx->sample_fmt = codec->sample_fmts[0];
@@ -529,6 +561,9 @@ QRESULT qcap2_audio_encoder_start(qcap2_audio_encoder_t* pThis) {
         memset(p->extra_data + p->extra_data_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     }
 
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
     p->running = true;
     return QCAP_RS_SUCCESSFUL;
 }
@@ -539,6 +574,18 @@ QRESULT qcap2_audio_encoder_stop(qcap2_audio_encoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     p->running = false;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+
     if (p->avctx) {
         avcodec_free_context(&p->avctx);
     }
@@ -583,7 +630,12 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
     double dSampleTime = 0;
     qcap2_av_frame_get_sample_time(pFrame, &dSampleTime);
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
     av_channel_layout_default(&av_frame->ch_layout, in_ch);
+#else
+    av_frame->channels = in_ch;
+    av_frame->channel_layout = av_get_default_channel_layout(in_ch);
+#endif
     av_frame->format = p->avctx->sample_fmt; // Assume input format matches encoder requirement via resampler
     av_frame->sample_rate = in_rate;
     av_frame->nb_samples = in_size;
@@ -621,26 +673,39 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
             return QCAP_RS_ERROR_GENERAL;
         }
 
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
+
         qcap2_rcbuffer_t* out_rc = nullptr;
-        qcap2_av_packet_t* new_packet = new qcap2_av_packet_t;
-        qcap2_av_packet_init(new_packet);
-        out_rc = qcap2_rcbuffer_new(new_packet, [](PVOID pData) {
-            qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)pData;
-            if (pkt) {
-                qcap2_av_packet_free_buffer(pkt);
-                delete pkt;
-            }
-        });
+        if (rec_rc) {
+            out_rc = rec_rc;
+        } else {
+            qcap2_av_packet_t* new_packet = new qcap2_av_packet_t;
+            qcap2_av_packet_init(new_packet);
+            out_rc = qcap2_rcbuffer_new(new_packet, [](PVOID pData) {
+                qcap2_av_packet_t* pkt = (qcap2_av_packet_t*)pData;
+                if (pkt) {
+                    qcap2_av_packet_free_buffer(pkt);
+                    delete pkt;
+                }
+            });
+        }
 
         if (out_rc) {
             PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
             if (out_data) {
                 qcap2_av_packet_t* out_packet = (qcap2_av_packet_t*)out_data;
-                qcap2_av_packet_alloc_buffer(out_packet, pkt->size);
-
+                
                 uint8_t* out_buf = nullptr;
                 int out_size = 0;
                 qcap2_av_packet_get_buffer(out_packet, &out_buf, &out_size);
+                if (!out_buf || out_size < pkt->size) {
+                    qcap2_av_packet_alloc_buffer(out_packet, pkt->size);
+                    qcap2_av_packet_get_buffer(out_packet, &out_buf, &out_size);
+                }
+                
                 if (out_buf && pkt->size <= out_size) {
                     memcpy(out_buf, pkt->data, pkt->size);
                 }
@@ -652,6 +717,9 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
 
                 qcap2_rcbuffer_unlock_data(out_rc);
                 p->output_queue.push(out_rc);
+                if (rec_rc) {
+                    qcap2_rcbuffer_release(rec_rc);
+                }
             } else {
                 qcap2_rcbuffer_release(out_rc);
             }
@@ -664,6 +732,9 @@ QRESULT qcap2_audio_encoder_push(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t*
     if (p->event) {
         qcap2_event_notify(p->event);
     }
+
+    // Recycle raw input frame (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
 
     return QCAP_RS_SUCCESSFUL;
 }
@@ -684,61 +755,23 @@ QRESULT qcap2_audio_encoder_pop(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t**
     return QCAP_RS_SUCCESSFUL;
 }
 
+QRESULT qcap2_audio_encoder_pop_input(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_encoder_push_output(qcap2_audio_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_encoder_priv_t* p = (qcap2_audio_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
+}
+
 // ==============================================================================
 // qcap2_audio_decoder_t Implementation
 // ==============================================================================
 
-typedef struct qcap2_audio_decoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    qcap2_audio_encoder_property_t* property;
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    int max_frames;
-    int packet_count;
-    bool multithread;
-    qcap2_event_t* event;
-
-    int payload_type;
-    AVCodecContext* avctx;
-    bool running;
-
-    qcap2_audio_decoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        property = qcap2_audio_encoder_property_new();
-        extra_data = nullptr;
-        extra_data_size = 0;
-        max_frames = 0;
-        packet_count = 0;
-        multithread = false;
-        event = nullptr;
-        payload_type = 0;
-        avctx = nullptr;
-        running = false;
-    }
-
-    ~qcap2_audio_decoder_priv_t() {
-        if (property) {
-            qcap2_audio_encoder_property_delete(property);
-        }
-        if (extra_data) {
-            delete[] extra_data;
-        }
-        if (avctx) {
-            avcodec_free_context(&avctx);
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        delete cv;
-        delete mtx;
-    }
-} qcap2_audio_decoder_priv_t;
+// qcap2_audio_decoder_priv_t moved to qcap2.processing_priv.h
 
 qcap2_audio_decoder_t* qcap2_audio_decoder_new() {
     qcap2_audio_decoder_priv_t* p = new qcap2_audio_decoder_priv_t;
@@ -853,6 +886,13 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
+    if (p->bypass_decoding) {
+        qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+        qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+        p->running = true;
+        return QCAP_RS_SUCCESSFUL;
+    }
+
     ULONG type = 0, fmt = 0, ch = 0, bits = 0, freq = 0, rate = 0;
     qcap2_audio_encoder_property_get_property1(p->property, &type, &fmt, &ch, &bits, &freq, &rate);
 
@@ -879,13 +919,21 @@ QRESULT qcap2_audio_decoder_start(qcap2_audio_decoder_t* pThis) {
         }
     }
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
     av_channel_layout_default(&p->avctx->ch_layout, ch);
+#else
+    p->avctx->channels = ch;
+    p->avctx->channel_layout = av_get_default_channel_layout(ch);
+#endif
     p->avctx->sample_rate = freq;
 
     if (avcodec_open2(p->avctx, codec, nullptr) < 0) {
         avcodec_free_context(&p->avctx);
         return QCAP_RS_ERROR_GENERAL;
     }
+
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
 
     p->running = true;
     return QCAP_RS_SUCCESSFUL;
@@ -896,6 +944,19 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
+    if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+
     p->running = false;
     if (p->avctx) {
         avcodec_free_context(&p->avctx);
@@ -904,6 +965,10 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
         qcap2_rcbuffer_release(p->output_queue.front());
         p->output_queue.pop();
     }
+    while (!p->input_queue.empty()) {
+        qcap2_rcbuffer_release(p->input_queue.front());
+        p->input_queue.pop();
+    }
     p->cv->notify_all();
     return QCAP_RS_SUCCESSFUL;
 }
@@ -911,6 +976,24 @@ QRESULT qcap2_audio_decoder_stop(qcap2_audio_decoder_t* pThis) {
 QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+
+    if (p->bypass_decoding) {
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (!p->running) return QCAP_RS_ERROR_GENERAL;
+        qcap2_rcbuffer_add_ref(pRCBuffer);
+        p->input_queue.push(pRCBuffer);
+        p->cv->notify_all();
+        if (p->notify_cv) {
+            std::lock_guard<std::mutex> lock2(*p->notify_mtx);
+            p->notify_cv->notify_all();
+        }
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+        // Recycle input packet (HPR)
+        qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
     if (!pData) return QCAP_RS_ERROR_GENERAL;
@@ -970,28 +1053,41 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
             return QCAP_RS_ERROR_GENERAL;
         }
 
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
+
         qcap2_rcbuffer_t* out_rc = nullptr;
-        qcap2_av_frame_t* new_frame = new qcap2_av_frame_t;
-        qcap2_av_frame_init(new_frame);
-        out_rc = qcap2_rcbuffer_new(new_frame, [](PVOID pData) {
-            qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
-            if (f) {
-                uint8_t* buf = nullptr;
-                int stride = 0;
-                qcap2_av_frame_get_buffer(f, &buf, &stride);
-                if (buf) {
-                    free(buf);
+        if (rec_rc) {
+            out_rc = rec_rc;
+        } else {
+            qcap2_av_frame_t* new_frame = new qcap2_av_frame_t;
+            qcap2_av_frame_init(new_frame);
+            out_rc = qcap2_rcbuffer_new(new_frame, [](PVOID pData) {
+                qcap2_av_frame_t* f = (qcap2_av_frame_t*)pData;
+                if (f) {
+                    uint8_t* buf = nullptr;
+                    int stride = 0;
+                    qcap2_av_frame_get_buffer(f, &buf, &stride);
+                    if (buf) {
+                        free(buf);
+                    }
+                    delete f;
                 }
-                delete f;
-            }
-        });
+            });
+        }
 
         if (out_rc) {
             PVOID out_data = qcap2_rcbuffer_lock_data(out_rc);
             if (out_data) {
                 qcap2_av_frame_t* out_frame = (qcap2_av_frame_t*)out_data;
 
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
                 int ch = frame->ch_layout.nb_channels;
+#else
+                int ch = frame->channels;
+#endif
                 int in_rate = frame->sample_rate;
                 int format = frame->format;
 
@@ -999,12 +1095,19 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
 
                 int size = av_samples_get_buffer_size(nullptr, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
 
-                uint8_t* out_buf = (uint8_t*)malloc(size);
+                uint8_t* out_buf = nullptr;
+                int out_stride = 0;
+                qcap2_av_frame_get_buffer(out_frame, &out_buf, &out_stride);
+                if (!out_buf || out_stride < size) {
+                    if (out_buf) free(out_buf);
+                    out_buf = (uint8_t*)malloc(size);
+                    qcap2_av_frame_set_buffer(out_frame, out_buf, size);
+                }
+
                 if (out_buf) {
                     uint8_t* out_ptrs[AV_NUM_DATA_POINTERS] = { nullptr };
                     av_samples_fill_arrays(out_ptrs, nullptr, out_buf, ch, frame->nb_samples, (enum AVSampleFormat)format, 1);
                     av_samples_copy(out_ptrs, frame->data, 0, 0, frame->nb_samples, ch, (enum AVSampleFormat)format);
-                    qcap2_av_frame_set_buffer(out_frame, out_buf, size);
                 }
 
                 qcap2_av_frame_set_pts(out_frame, frame->pts);
@@ -1012,6 +1115,9 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
 
                 qcap2_rcbuffer_unlock_data(out_rc);
                 p->output_queue.push(out_rc);
+                if (rec_rc) {
+                    qcap2_rcbuffer_release(rec_rc);
+                }
             } else {
                 qcap2_rcbuffer_release(out_rc);
             }
@@ -1024,6 +1130,9 @@ QRESULT qcap2_audio_decoder_push(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t*
     if (p->event) {
         qcap2_event_notify(p->event);
     }
+
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
 
     return QCAP_RS_SUCCESSFUL;
 }
@@ -1042,6 +1151,18 @@ QRESULT qcap2_audio_decoder_pop(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_audio_decoder_pop_input(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_audio_decoder_push_output(qcap2_audio_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_audio_decoder_priv_t* p = (qcap2_audio_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 // ==============================================================================
@@ -1451,7 +1572,11 @@ static AVPixelFormat qcap2_to_ffmpeg_pix_fmt(ULONG nColorSpaceType) {
         case QCAP_COLORSPACE_TYPE_YV24:  return AV_PIX_FMT_YUV444P;
         case QCAP_COLORSPACE_TYPE_NV12:  return AV_PIX_FMT_NV12;
         case QCAP_COLORSPACE_TYPE_P010:  return AV_PIX_FMT_P010LE;
+#ifdef AV_PIX_FMT_P210LE
         case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_P210LE;
+#else
+        case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_NONE;
+#endif
         case QCAP_COLORSPACE_TYPE_Y416:  return AV_PIX_FMT_NONE;
         default:                         return AV_PIX_FMT_NONE;
     }
@@ -1467,6 +1592,8 @@ typedef struct qcap2_video_scaler_priv_t {
     std::mutex* mtx;
     std::condition_variable* cv;
     std::queue<qcap2_rcbuffer_t*> output_queue;
+    qcap2_rcbuffer_queue_t* input_recycled_queue;
+    qcap2_rcbuffer_queue_t* output_recycled_queue;
 
     // Output target configuration
     ULONG out_color_space;
@@ -1540,10 +1667,25 @@ typedef struct qcap2_video_scaler_priv_t {
 
         running = false;
         backend = nullptr;
+
+        input_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_start(input_recycled_queue);
+        }
+        output_recycled_queue = qcap2_rcbuffer_queue_new();
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_start(output_recycled_queue);
+        }
     }
 
     ~qcap2_video_scaler_priv_t() {
         cleanup();
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(input_recycled_queue);
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_delete(output_recycled_queue);
+        }
         delete cv;
         delete mtx;
     }
@@ -1562,6 +1704,21 @@ typedef struct qcap2_video_scaler_priv_t {
             qcap2_rcbuffer_t* buf = output_queue.front();
             output_queue.pop();
             qcap2_rcbuffer_release(buf);
+        }
+
+        if (input_recycled_queue) {
+            qcap2_rcbuffer_queue_stop(input_recycled_queue);
+            qcap2_rcbuffer_t* drain_buf = nullptr;
+            while (qcap2_rcbuffer_queue_pop(input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+                qcap2_rcbuffer_release(drain_buf);
+            }
+        }
+        if (output_recycled_queue) {
+            qcap2_rcbuffer_queue_stop(output_recycled_queue);
+            qcap2_rcbuffer_t* drain_buf = nullptr;
+            while (qcap2_rcbuffer_queue_pop(output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+                qcap2_rcbuffer_release(drain_buf);
+            }
         }
     }
 } qcap2_video_scaler_priv_t;
@@ -1653,10 +1810,18 @@ public:
                     src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x;
                     src_ptrs[1] += p->crop_y * src_strides[1] + p->crop_x;
                     src_ptrs[2] += p->crop_y * src_strides[2] + p->crop_x;
-                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE || in_pix_fmt == AV_PIX_FMT_P210LE) {
+                } else if (in_pix_fmt == AV_PIX_FMT_NV12 || in_pix_fmt == AV_PIX_FMT_P010LE
+#ifdef AV_PIX_FMT_P210LE
+                           || in_pix_fmt == AV_PIX_FMT_P210LE
+#endif
+                ) {
                     int bpp = (in_pix_fmt == AV_PIX_FMT_NV12) ? 1 : 2;
                     src_ptrs[0] += p->crop_y * src_strides[0] + p->crop_x * bpp;
+#ifdef AV_PIX_FMT_P210LE
                     int chroma_y_div = (in_pix_fmt == AV_PIX_FMT_P210LE) ? 1 : 2;
+#else
+                    int chroma_y_div = 2;
+#endif
                     src_ptrs[1] += (p->crop_y / chroma_y_div) * src_strides[1] + p->crop_x * 2;
                 }
             }
@@ -1862,6 +2027,13 @@ public:
 };
 
 static qcap2_rcbuffer_t* get_output_buffer(qcap2_video_scaler_priv_t* p) {
+    if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+        qcap2_rcbuffer_t* buf = nullptr;
+        if (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &buf) == QCAP_RS_SUCCESSFUL) {
+            return buf;
+        }
+    }
+
     if (!p->registered_buffers.empty()) {
         for (auto buf : p->registered_buffers) {
             if (qcap2_rcbuffer_use_count(buf) == 1) {
@@ -2165,6 +2337,7 @@ QRESULT qcap2_video_scaler_push(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* p
         qcap2_event_notify(p->event);
     }
 
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
     return QCAP_RS_SUCCESSFUL;
 }
 
@@ -2182,6 +2355,18 @@ QRESULT qcap2_video_scaler_pop(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** p
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_scaler_pop_input(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_scaler_push_output(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_scaler_priv_t* p = (qcap2_video_scaler_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 // ==============================================================================
@@ -2209,7 +2394,11 @@ static AVPixelFormat qcap2_encoder_to_ffmpeg_pix_fmt(ULONG nColorSpaceType) {
         case QCAP_COLORSPACE_TYPE_ARGB32: return AV_PIX_FMT_ARGB;
         case QCAP_COLORSPACE_TYPE_ABGR32: return AV_PIX_FMT_ABGR;
         case QCAP_COLORSPACE_TYPE_P010:  return AV_PIX_FMT_P010LE;
+#ifdef AV_PIX_FMT_P210LE
         case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_P210LE;
+#else
+        case QCAP_COLORSPACE_TYPE_P210:  return AV_PIX_FMT_NONE;
+#endif
         default:                         return AV_PIX_FMT_NONE;
     }
 }
@@ -2232,104 +2421,7 @@ static enum AVCodecID qcap2_encoder_format_to_codec_id(ULONG nEncoderFormat) {
     }
 }
 
-typedef struct qcap2_video_encoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    // Encoder property (owned reference)
-    qcap2_video_encoder_property_t* enc_prop;
-
-    // Dynamic property (owned reference)
-    qcap2_video_encoder_dynamic_property_t* dyn_prop;
-
-    // Extra data
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    // Configuration
-    int frame_count;
-    int frame_align;
-    int frame_valign;
-    int packet_count;
-    int max_packet_size;
-    bool multithread;
-    qcap2_event_t* event;
-    int num_cores;
-    bool native_buffer;
-    std::atomic<bool> request_idr;
-
-    // FFmpeg encoder context
-    const AVCodec* codec;
-    AVCodecContext* codec_ctx;
-    SwsContext* sws_ctx; // for input pixel format conversion if needed
-
-    // Running state
-    bool running;
-    int64_t frame_counter;
-
-    // Cached input format for sws reinitialization
-    ULONG cached_in_color;
-    ULONG cached_in_w;
-    ULONG cached_in_h;
-
-    qcap2_video_encoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        enc_prop = nullptr;
-        dyn_prop = nullptr;
-        extra_data = nullptr;
-        extra_data_size = 0;
-        frame_count = 4;
-        frame_align = 16;
-        frame_valign = 1;
-        packet_count = 8;
-        max_packet_size = 0;
-        multithread = false;
-        event = nullptr;
-        num_cores = 0;
-        native_buffer = false;
-        request_idr.store(false);
-        codec = nullptr;
-        codec_ctx = nullptr;
-        sws_ctx = nullptr;
-        running = false;
-        frame_counter = 0;
-        cached_in_color = 0;
-        cached_in_w = 0;
-        cached_in_h = 0;
-    }
-
-    ~qcap2_video_encoder_priv_t() {
-        cleanup();
-        if (enc_prop) { qcap2_video_encoder_property_delete(enc_prop); enc_prop = nullptr; }
-        if (dyn_prop) { qcap2_video_encoder_dynamic_property_delete(dyn_prop); dyn_prop = nullptr; }
-        if (extra_data) { free(extra_data); extra_data = nullptr; }
-        delete cv;
-        delete mtx;
-    }
-
-    void cleanup() {
-        if (codec_ctx) {
-            avcodec_free_context(&codec_ctx);
-            codec_ctx = nullptr;
-        }
-        codec = nullptr;
-        if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-            sws_ctx = nullptr;
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_t* buf = output_queue.front();
-            output_queue.pop();
-            qcap2_rcbuffer_release(buf);
-        }
-        frame_counter = 0;
-        cached_in_color = 0;
-        cached_in_w = 0;
-        cached_in_h = 0;
-    }
-} qcap2_video_encoder_priv_t;
+// qcap2_video_encoder_priv_t moved to qcap2.processing_priv.h
 
 static bool init_encoder(qcap2_video_encoder_priv_t* p) {
     if (!p->enc_prop) return false;
@@ -2570,13 +2662,32 @@ static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
             return QCAP_RS_ERROR_GENERAL;
         }
 
-        // Wrap the packet data into our output format
-        EncoderOutputPacket* out = new EncoderOutputPacket;
-        qcap2_av_packet_init(&out->packet);
+        qcap2_rcbuffer_t* rec_rc = nullptr;
+        if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+            qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &rec_rc);
+        }
 
-        // Copy packet data (avcodec owns the original buffer)
-        out->buffer_size = pkt->size;
-        out->pkt_buffer = new uint8_t[pkt->size];
+        EncoderOutputPacket* out = nullptr;
+        if (rec_rc) {
+            PVOID pData = qcap2_rcbuffer_get_data(rec_rc);
+            out = qcap2_container_of(pData, EncoderOutputPacket, packet);
+            if (out->buffer_size < (size_t)pkt->size) {
+                delete[] out->pkt_buffer;
+                out->pkt_buffer = new uint8_t[pkt->size];
+                out->buffer_size = pkt->size;
+            }
+        } else {
+            out = new EncoderOutputPacket;
+            qcap2_av_packet_init(&out->packet);
+            out->pkt_buffer = new uint8_t[pkt->size];
+            out->buffer_size = pkt->size;
+            out->rc_buffer = qcap2_rcbuffer_new(&out->packet, [](PVOID pData) {
+                EncoderOutputPacket* ep = qcap2_container_of(pData, EncoderOutputPacket, packet);
+                delete[] ep->pkt_buffer;
+                delete ep;
+            });
+        }
+
         memcpy(out->pkt_buffer, pkt->data, pkt->size);
 
         qcap2_av_packet_set_buffer(&out->packet, out->pkt_buffer, pkt->size);
@@ -2587,13 +2698,12 @@ static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
         qcap2_av_packet_set_property(&out->packet, 0, is_key);
         qcap2_av_packet_set_sample_time(&out->packet, (double)pkt->pts / 90000.0);
 
-        out->rc_buffer = qcap2_rcbuffer_new(&out->packet, [](PVOID pData) {
-            EncoderOutputPacket* ep = qcap2_container_of(pData, EncoderOutputPacket, packet);
-            delete[] ep->pkt_buffer;
-            delete ep;
-        });
-
-        p->output_queue.push(out->rc_buffer);
+        qcap2_rcbuffer_t* push_rc = rec_rc ? rec_rc : out->rc_buffer;
+        p->output_queue.push(push_rc);
+        if (rec_rc) {
+            // Keep reference balanced
+            qcap2_rcbuffer_release(rec_rc);
+        }
 
         av_packet_unref(pkt);
     }
@@ -2852,6 +2962,9 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
     p->running = true;
     p->frame_counter = 0;
     return QCAP_RS_SUCCESSFUL;
@@ -2863,6 +2976,17 @@ QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
 
     // Flush the encoder
     if (p->codec_ctx) {
@@ -2980,7 +3104,11 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
     // Handle IDR request
     if (p->request_idr.exchange(false)) {
         av_frame->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
         av_frame->flags |= AV_FRAME_FLAG_KEY;
+#else
+        av_frame->key_frame = 1;
+#endif
     }
 
     // Send frame to encoder
@@ -3002,6 +3130,9 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
         }
     }
 
+    // Recycle raw input frame (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
     return qr;
 }
 
@@ -3019,6 +3150,18 @@ QRESULT qcap2_video_encoder_pop(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_encoder_pop_input(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_encoder_push_output(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 #ifdef __cplusplus
@@ -3047,114 +3190,7 @@ static enum AVCodecID qcap2_decoder_format_to_codec_id(ULONG nEncoderFormat) {
     }
 }
 
-struct qcap2_video_decoder_priv_t {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    std::queue<qcap2_rcbuffer_t*> output_queue;
-
-    // Decoder property (owned copy of encoder properties defining output/stream properties)
-    qcap2_video_encoder_property_t* dec_prop;
-
-    // Extra data (SPS/PPS/VPS)
-    uint8_t* extra_data;
-    int extra_data_size;
-
-    // Configuration / Hints
-    int frame_count;
-    int frame_align;
-    int frame_valign;
-    int packet_count;
-    int max_packet_size;
-    bool multithread;
-    qcap2_event_t* event;
-    int payload_type;
-
-    // Registered output buffers for recycling
-    std::vector<qcap2_rcbuffer_t*> registered_buffers;
-
-    // FFmpeg decoder context
-    const AVCodec* codec;
-    AVCodecContext* codec_ctx;
-    SwsContext* sws_ctx; // for output format conversion/scaling if needed
-
-    // Running state
-    bool running;
-
-    // Target properties (resolution/colorspace we want to convert the decoded frame into)
-    ULONG target_color;
-    ULONG target_width;
-    ULONG target_height;
-
-    // Sws conversion state
-    ULONG sws_src_color;
-    ULONG sws_src_w;
-    ULONG sws_src_h;
-
-    qcap2_video_decoder_priv_t() {
-        mtx = new std::mutex();
-        cv = new std::condition_variable();
-        dec_prop = nullptr;
-        extra_data = nullptr;
-        extra_data_size = 0;
-        frame_count = 4;
-        frame_align = 16;
-        frame_valign = 1;
-        packet_count = 8;
-        max_packet_size = 0;
-        multithread = false;
-        event = nullptr;
-        payload_type = 0;
-        codec = nullptr;
-        codec_ctx = nullptr;
-        sws_ctx = nullptr;
-        running = false;
-
-        target_color = QCAP_COLORSPACE_TYPE_I420; // default output colorspace
-        target_width = 0;
-        target_height = 0;
-
-        sws_src_color = 0;
-        sws_src_w = 0;
-        sws_src_h = 0;
-    }
-
-    ~qcap2_video_decoder_priv_t() {
-        cleanup();
-        if (dec_prop) {
-            qcap2_video_encoder_property_delete(dec_prop);
-            dec_prop = nullptr;
-        }
-        if (extra_data) {
-            free(extra_data);
-            extra_data = nullptr;
-        }
-        for (auto buf : registered_buffers) {
-            qcap2_rcbuffer_release(buf);
-        }
-        registered_buffers.clear();
-        delete cv;
-        delete mtx;
-    }
-
-    void cleanup() {
-        if (codec_ctx) {
-            avcodec_free_context(&codec_ctx);
-            codec_ctx = nullptr;
-        }
-        codec = nullptr;
-        if (sws_ctx) {
-            sws_freeContext(sws_ctx);
-            sws_ctx = nullptr;
-        }
-        while (!output_queue.empty()) {
-            qcap2_rcbuffer_release(output_queue.front());
-            output_queue.pop();
-        }
-        sws_src_color = 0;
-        sws_src_w = 0;
-        sws_src_h = 0;
-    }
-};
+// qcap2_video_decoder_priv_t moved to qcap2.processing_priv.h
 
 static bool init_decoder(qcap2_video_decoder_priv_t* p) {
     if (!p->dec_prop) return false;
@@ -3254,13 +3290,10 @@ static bool init_decoder_sws(qcap2_video_decoder_priv_t* p, AVPixelFormat src_pi
 }
 
 static qcap2_rcbuffer_t* get_decoder_output_buffer(qcap2_video_decoder_priv_t* p, int dst_w, int dst_h) {
-    if (!p->registered_buffers.empty()) {
-        for (auto buf : p->registered_buffers) {
-            if (qcap2_rcbuffer_use_count(buf) == 1) {
-                qcap2_rcbuffer_add_ref(buf);
-                return buf;
-            }
-        }
+    qcap2_rcbuffer_t* buf = nullptr;
+    if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
+        qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &buf);
+        return buf;
     }
 
     qcap2_av_frame_t* out_frame = new qcap2_av_frame_t;
@@ -3595,8 +3628,23 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
+    if (p->bypass_decoding) {
+        qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+        qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+        p->running = true;
+        return QCAP_RS_SUCCESSFUL;
+    }
+
     if (!init_decoder(p)) {
         return QCAP_RS_ERROR_GENERAL;
+    }
+
+    qcap2_rcbuffer_queue_start(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_start(p->output_recycled_queue);
+
+    // Warm up the output recycling queue with registered buffers
+    for (auto buf : p->registered_buffers) {
+        qcap2_rcbuffer_queue_push(p->output_recycled_queue, buf);
     }
 
     p->running = true;
@@ -3609,6 +3657,27 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
     std::lock_guard<std::mutex> lock(*(p->mtx));
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
+
+    qcap2_rcbuffer_queue_stop(p->input_recycled_queue);
+    qcap2_rcbuffer_queue_stop(p->output_recycled_queue);
+
+    qcap2_rcbuffer_t* drain_buf = nullptr;
+    while (qcap2_rcbuffer_queue_pop(p->input_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+    while (qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &drain_buf) == QCAP_RS_SUCCESSFUL) {
+        qcap2_rcbuffer_release(drain_buf);
+    }
+
+    if (p->bypass_decoding) {
+        p->running = false;
+        while (!p->input_queue.empty()) {
+            qcap2_rcbuffer_release(p->input_queue.front());
+            p->input_queue.pop();
+        }
+        p->cv->notify_all();
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     // Flush the decoder
     if (p->codec_ctx) {
@@ -3625,6 +3694,24 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
 QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+
+    if (p->bypass_decoding) {
+        std::lock_guard<std::mutex> lock(*(p->mtx));
+        if (!p->running) return QCAP_RS_ERROR_GENERAL;
+        qcap2_rcbuffer_add_ref(pRCBuffer);
+        p->input_queue.push(pRCBuffer);
+        p->cv->notify_all();
+        if (p->notify_cv) {
+            std::lock_guard<std::mutex> lock2(*p->notify_mtx);
+            p->notify_cv->notify_all();
+        }
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+        // Recycle input packet (HPR)
+        qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+        return QCAP_RS_SUCCESSFUL;
+    }
 
     PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
     if (!pData) return QCAP_RS_ERROR_GENERAL;
@@ -3674,6 +3761,9 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
         }
     }
 
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
     return qr;
 }
 
@@ -3691,6 +3781,18 @@ QRESULT qcap2_video_decoder_pop(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t**
     *ppRCBuffer = p->output_queue.front();
     p->output_queue.pop();
     return QCAP_RS_SUCCESSFUL;
+}
+
+QRESULT qcap2_video_decoder_pop_input(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
+    if (!pThis || !ppRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_pop(p->input_recycled_queue, ppRCBuffer);
+}
+
+QRESULT qcap2_video_decoder_push_output(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t* pRCBuffer) {
+    if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
+    qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
+    return qcap2_rcbuffer_queue_push(p->output_recycled_queue, pRCBuffer);
 }
 
 #ifdef __cplusplus

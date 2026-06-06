@@ -76,21 +76,31 @@ Note: Not all codec implementations honor mid-stream parameter changes. The effe
 
 ---
 
-### 7. Push/Pop Data Flow
+### 7. Push/Pop Data Flow and Hybrid Recycling Models
+
+The video encoder employs two lifecycle queues to achieve zero-allocation and lock-free/low-latency recycling:
+
+1. **Input Queue (Push-Pop-Release / HPR)**:
+   - The user calls `qcap2_video_encoder_push()` to submit a raw video frame for encoding.
+   - The encoder processes it synchronously and then automatically pushes it to an internal `input_recycled_queue`.
+   - The user retrieves the empty/processed input frame via `qcap2_video_encoder_pop_input()` to reuse it for the next push.
+2. **Output Queue (Pop-Push-Release / PPR)**:
+   - The user calls `qcap2_video_encoder_pop()` to retrieve a compressed packet.
+   - Once the user is done reading the packet, they return the empty packet buffer to the encoder via `qcap2_video_encoder_push_output()`.
+   - Finally, they release the user-level reference via `qcap2_rcbuffer_release()`.
 
 ```
-Push (raw frame in)                    Pop (encoded packet out)
-┌─────────────────┐                    ┌──────────────────┐
-│ qcap2_av_frame_t│                    │qcap2_av_packet_t │
-│ (I420/NV12/BGR) │                    │ (H.264/H.265     │
-│ via rcbuffer     │──► Encoder ──────►│  compressed data)│
-│                 │    (libx264)       │ via rcbuffer      │
-└─────────────────┘                    └──────────────────┘
+Push (raw frame in)                   Pop (encoded packet out)
+┌─────────────────┐                   ┌──────────────────┐
+│ qcap2_av_frame_t│                   │qcap2_av_packet_t │
+│ (I420/NV12/BGR) │                   │ (H.264/H.265     │
+│ via rcbuffer     │──► Encoder ─────►│  compressed data)│
+│                 │    (libx264)      │ via rcbuffer     │
+└─────────────────┘                   └──────────────────┘
+   ▲                                     │
+   │ (pop_input)                         │ (push_output)
+   └─────────────── [Recycle] ◄──────────┘
 ```
-
-- **Input**: Raw video frames wrapped in `qcap2_rcbuffer_t` containing `qcap2_av_frame_t`
-- **Output**: Compressed packets wrapped in `qcap2_rcbuffer_t` containing `qcap2_av_packet_t`
-- **Packet ownership**: Each output `qcap2_rcbuffer_t` owns its packet data buffer via a custom `on_free_resource` callback using `qcap2_container_of()`
 
 ---
 
@@ -100,7 +110,7 @@ Push (raw frame in)                    Pop (encoded packet out)
 Creates a new video encoder instance with default configuration. Returns an opaque pointer.
 
 ### `qcap2_video_encoder_delete(qcap2_video_encoder_t* pThis)`
-Stops the encoder (if running), releases all owned resources (codec context, property copies, extra data, queued packets), and frees the instance.
+Stops the encoder (if running), releases all owned resources (codec context, property copies, extra data, queued packets, and internal queues), and frees the instance.
 
 ### `qcap2_video_encoder_set_video_property(pThis, pVideoEncoderProperty)`
 Copies all encoder properties from the source into the encoder's internal storage. Must be called before `start()`. Configures codec format, resolution, frame rate, rate control, profile, B-frames, aspect ratio, etc.
@@ -154,7 +164,7 @@ Requests that the next pushed frame be encoded as an IDR/keyframe. Lock-free (us
 Initializes the FFmpeg codec context and begins accepting frames. Fails if no video property has been set or if the codec cannot be initialized. Idempotent if already running.
 
 ### `qcap2_video_encoder_stop(pThis)`
-Flushes the encoder (sends a null frame to produce any remaining packets), then tears down the codec context and drains the output queue. Idempotent if already stopped.
+Flushes the encoder (sends a null frame to produce any remaining packets), drains the output queue, stops and drains the input and output recycled queues to prevent stale buffer reuse on restart, and tears down the codec context. Idempotent if already stopped.
 
 ### `qcap2_video_encoder_push(pThis, pRCBuffer)`
 Encodes a raw video frame:
@@ -166,6 +176,13 @@ Encodes a raw video frame:
 6. Calls `avcodec_send_frame()` followed by `avcodec_receive_packet()` in a drain loop
 7. Wraps each output `AVPacket` into a `qcap2_av_packet_t` with key-frame flag, PTS, DTS
 8. Enqueues encoded packets and notifies waiting consumers
+9. Enqueues the consumed raw input `pRCBuffer` to the internal `input_recycled_queue` for HPR recycling.
 
 ### `qcap2_video_encoder_pop(pThis, ppRCBuffer)`
 Blocks until an encoded packet is available or the encoder is stopped. Returns the oldest queued `qcap2_rcbuffer_t` containing a `qcap2_av_packet_t`.
+
+### `qcap2_video_encoder_pop_input(pThis, ppRCBuffer)`
+Dequeues the oldest processed raw input frame from the `input_recycled_queue` (HPR model). Non-blocking if a recycled frame is available.
+
+### `qcap2_video_encoder_push_output(pThis, pRCBuffer)`
+Enqueues an empty/used packet buffer back to the `output_recycled_queue` (PPR model) so that the encoder can reuse it on future compressions.

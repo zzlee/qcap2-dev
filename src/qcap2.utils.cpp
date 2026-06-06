@@ -1,3 +1,4 @@
+#include "qcap2.h"
 #include "qcap2.utils.h"
 #include "qcap2.buffer.h"
 #include <time.h>
@@ -16,16 +17,16 @@ int64_t qcap2_get_time() {
 
 void qcap2_get_build_config(qcap2_build_config_t* pBuildConfig) {
     if (!pBuildConfig) return;
-    pBuildConfig->major = 1;
-    pBuildConfig->minor = 0;
-    pBuildConfig->patch = 0;
-    pBuildConfig->qcap_major = 2;
-    pBuildConfig->qcap_minor = 0;
-    pBuildConfig->qcap_patch = 0;
+    pBuildConfig->major = QCAP2_VERSION_MAJOR;
+    pBuildConfig->minor = QCAP2_VERSION_MINOR;
+    pBuildConfig->patch = QCAP2_VERSION_PATCH;
+    pBuildConfig->qcap_major = QCAP_API_VERSION_MAJOR;
+    pBuildConfig->qcap_minor = QCAP_API_VERSION_MINOR;
+    pBuildConfig->qcap_patch = QCAP_API_VERSION_PATCH;
     pBuildConfig->build_date = __DATE__;
     pBuildConfig->build_time = __TIME__;
-    pBuildConfig->branch = "main";
-    pBuildConfig->commit = "unknown";
+    pBuildConfig->branch = QCAP2_BUILD_BRANCH;
+    pBuildConfig->commit = QCAP2_BUILD_COMMIT;
     pBuildConfig->mods = "";
 }
 

@@ -25,14 +25,16 @@ When `qcap2_video_scaler_set_filter_graph()` is called with a non-empty configur
 
 ---
 
-### 2. Zero-Allocation Reference-Counted Buffer Pool
-For high-performance pipelines, the scaler supports recycling pre-allocated buffer pools registered via `qcap2_video_scaler_set_buffers()`:
+### 2. Zero-Allocation Buffer Recycling (HPR & PPR)
+For high-performance video pipelines, the scaler supports dual-queue buffer recycling (HPR and PPR models) alongside a pre-allocated buffer pool to avoid heap allocations:
 
-- **Ownership Handoff Rule**: When the producer registers pool buffers:
-  1. The scaler increments their reference count via `qcap2_rcbuffer_add_ref()`.
-  2. The producer should immediately release its initial local references (`qcap2_rcbuffer_release()`). This hands over unique ownership to the scaler, bringing their idle use counts to exactly **1**.
-- **Idle Frame Recognition**: When a new frame is pushed, the scaler scans its registered buffer list. Any buffer with a `qcap2_rcbuffer_use_count(buf) == 1` is considered idle (as no other components are holding references). The scaler increments its count to **2**, scales pixel data directly into it, and pushes it to the output queue.
-- **Dynamic Fallback**: If no pre-allocated pool is provided or all pool buffers are currently in use by the consumer, the scaler automatically allocates a new frame dynamically, wrapping it in a `qcap2_rcbuffer_t` with a custom `on_free_resource` callback to prevent leaks.
+- **HPR (Host-Pipeline-Recycle) for Input Buffers**: When the user pushes a source frame via `qcap2_video_scaler_push()`, the scaler processes the frame and automatically enqueues the consumed input buffer into an internal `input_recycled_queue`. The user calls `qcap2_video_scaler_pop_input()` to retrieve it, refills it with new raw video data, and pushes it again.
+- **PPR (Pipeline-Push-Recycle) for Output Buffers**: When the user retrieves a scaled output frame via `qcap2_video_scaler_pop()`, they consume the video payload and then return the empty buffer shell back to the scaler's `output_recycled_queue` using `qcap2_video_scaler_push_output()`.
+- **Output Buffer Selection Priority**:
+  When scaling a new frame, the scaler decides which output buffer to write to using the following priority order:
+  1. **PPR Queue**: Pops an idle buffer shell from the `output_recycled_queue`.
+  2. **Buffer Pool**: Scans registered pool buffers (set via `qcap2_video_scaler_set_buffers()`) and reuses any buffer whose `qcap2_rcbuffer_use_count(buf) == 1` (meaning it is currently idle and not owned by another pipeline stage).
+  3. **Dynamic Fallback**: If no recycled or pool buffers are available, a new output frame is allocated dynamically and wrapped in a reference-counted buffer with a custom deleter.
 
 ---
 
@@ -72,3 +74,9 @@ Pushes a raw source frame to be scaled, cropped, converted, or filtered.
 
 ### `qcap2_video_scaler_pop(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer)`
 Pops a processed video frame from the output queue. Blocks the calling thread if empty until a frame is pushed or the scaler is stopped.
+
+### `qcap2_video_scaler_pop_input(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t** ppRCBuffer)`
+Pops a consumed input buffer from the scaler's internal `input_recycled_queue`. The user can reuse this buffer to hold subsequent raw input video frames.
+
+### `qcap2_video_scaler_push_output(qcap2_video_scaler_t* pThis, qcap2_rcbuffer_t* pRCBuffer)`
+Pushes a consumed output buffer back to the scaler's `output_recycled_queue`. The scaler will reuse this buffer shell for future scaled video frames.

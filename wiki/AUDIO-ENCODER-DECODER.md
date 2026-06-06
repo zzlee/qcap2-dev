@@ -17,10 +17,13 @@ The audio encoder encapsulates the process of taking uncompressed `qcap2_av_fram
 - **Initialization:** Created via `qcap2_audio_encoder_new()`. Properties must be set before calling `qcap2_audio_encoder_start()`.
 - **Property configuration:** Managed by `qcap2_audio_encoder_set_audio_property()`. Ensures variables like the channel layout, bitrate, and sampling frequencies map accurately to `AVCodecContext`.
 - **Execution:**
-  - `qcap2_audio_encoder_push()` accepts an input uncompressed rc-buffer, wraps it as an `AVFrame`, and feeds it into the encoder using `avcodec_send_frame()`.
-  - It sequentially calls `avcodec_receive_packet()` to drain generated compressed packets into internally-allocated `qcap2_rcbuffer_t` objects encapsulating `qcap2_av_packet_t`.
+  - `qcap2_audio_encoder_push()` accepts an input uncompressed rc-buffer, wraps it as an `AVFrame`, feeds it into the encoder using `avcodec_send_frame()`, and automatically enqueues the input buffer to `input_recycled_queue` for recycling.
+  - It sequentially calls `avcodec_receive_packet()` to drain generated compressed packets into `qcap2_rcbuffer_t` objects encapsulating `qcap2_av_packet_t`.
   - Synchronization (`mtx` and `cv`) protects the internal buffer queue.
   - Events set by `qcap2_audio_encoder_set_event()` notify consumers when packets are ready.
+- **Recycling (HPR/PPR):**
+  - **`qcap2_audio_encoder_pop_input()`**: Dequeues a processed raw input frame from the `input_recycled_queue` (HPR model) for reuse.
+  - **`qcap2_audio_encoder_push_output()`**: Returns an empty/used packet buffer to the `output_recycled_queue` (PPR model) to be reused for future output packets.
 
 ## `qcap2_audio_decoder_t`
 
@@ -29,9 +32,11 @@ The audio decoder is responsible for converting compressed `qcap2_av_packet_t` r
 - **Initialization:** Similar to the encoder, created with `qcap2_audio_decoder_new()`.
 - **Property configuration:** Expects configuration similar to the encoder to instantiate the correctly associated decoding context. Extra data is especially critical here for formats like AAC.
 - **Execution:**
-  - `qcap2_audio_decoder_push()` pulls compressed data off the input `qcap2_rcbuffer_t` and funnels it into `avcodec_send_packet()`.
-  - The decoded frames are retrieved using `avcodec_receive_frame()`, converted dynamically, and re-wrapped inside uncompressed `qcap2_av_frame_t` outputs.
-  - Generates dynamically scoped buffers via standard malloc and binds them to the `qcap2_rcbuffer_t` release sequence using a custom deleter strategy.
+  - `qcap2_audio_decoder_push()` pulls compressed data off the input `qcap2_rcbuffer_t`, funnels it into `avcodec_send_packet()`, and automatically enqueues the input packet to `input_recycled_queue` for recycling.
+  - The decoded frames are retrieved using `avcodec_receive_frame()`, converted dynamically, and re-wrapped inside output `qcap2_rcbuffer_t` objects encapsulating `qcap2_av_frame_t`.
+- **Recycling (HPR/PPR):**
+  - **`qcap2_audio_decoder_pop_input()`**: Dequeues a processed compressed packet from the `input_recycled_queue` (HPR model) for reuse.
+  - **`qcap2_audio_decoder_push_output()`**: Returns an empty/used decoded raw frame to the `output_recycled_queue` (PPR model) to be reused for future decoded frames.
 
 ## Implementation Details
 

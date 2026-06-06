@@ -40,6 +40,14 @@ static void _on_free_resource(PVOID pData) {
 
 `qcap2_container_of(ptr, type, member)` subtracts `offsetof(type, member)` from `ptr`. It only works if `ptr` is exactly the address of `member` inside the original `type` object. Do not replace `pData` with copied data, allocated wrapper data, or a normalized base pointer.
 
+> [!WARNING]
+> **Memory Corruption Risk**: You must always pass the address of the *embedded member* (e.g., `&pVideoFrame->av_frame`) to `qcap2_rcbuffer_new()`, **not** the address of the parent structure (e.g., `pVideoFrame`).
+> 
+> If you pass the parent structure address directly:
+> 1. Internal API consumers and handlers (like encoders, decoders, and resamplers) will directly cast the locked resource pointer to the expected structure type (e.g., `(qcap2_av_frame_t*)pData`).
+> 2. If the expected struct is not the very first member of your parent structure (i.e., its offset is greater than 0), the cast will be offset-misaligned. This will result in silent memory corruption, garbage parameter reads, or segmentation faults.
+> 3. Passing the parent structure pointer directly only works by coincidence if the member is at offset 0, which is extremely brittle to future modifications of your structure's field layout.
+
 ## Function semantics
 
 ### `qcap2_rcbuffer_new(PVOID pData, qcap2_on_free_resource_t pOnFreeResource)`

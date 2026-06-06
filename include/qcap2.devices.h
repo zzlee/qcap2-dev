@@ -7,43 +7,6 @@
 extern "C" {
 #endif /* __cplusplus */
 
-// qcap2_qdev_enum_t
-qcap2_qdev_enum_t* qcap2_qdev_enum_new();
-void qcap2_qdev_enum_delete(qcap2_qdev_enum_t* pThis);
-void qcap2_qdev_enum_set_type(qcap2_qdev_enum_t* pThis, int nType);
-void qcap2_qdev_enum_set_event(qcap2_qdev_enum_t* pThis, qcap2_event_t* pEvent);
-QRESULT qcap2_qdev_enum_start(qcap2_qdev_enum_t* pThis);
-QRESULT qcap2_qdev_enum_stop(qcap2_qdev_enum_t* pThis);
-QRESULT qcap2_qdev_enum_pop(qcap2_qdev_enum_t* pThis, qcap2_rcbuffer_t** ppQdevInfo); // qcap2_qdev_info_t
-
-// qcap2_qdev_info_t
-qcap2_qdev_info_t* qcap2_qdev_info_lock_from(qcap2_rcbuffer_t* pQdevInfo);
-int qcap2_qdev_info_get_type(qcap2_qdev_info_t* pThis);
-uint32_t qcap2_qdev_info_get_uid(qcap2_qdev_info_t* pThis);
-BOOL qcap2_qdev_info_get_plugged(qcap2_qdev_info_t* pThis);
-const char* qcap2_qdev_info_get_path(qcap2_qdev_info_t* pThis);
-int qcap2_qdev_info_get_vendor_id(qcap2_qdev_info_t* pThis);
-int qcap2_qdev_info_get_device_id(qcap2_qdev_info_t* pThis);
-
-// qcap2_qdev_t
-qcap2_qdev_t* qcap2_qdev_new();
-void qcap2_qdev_delete(qcap2_qdev_t* pThis);
-void qcap2_qdev_set_event(qcap2_qdev_t* pThis, qcap2_event_t* pEvent);
-void qcap2_qdev_set_poll_duration(qcap2_qdev_t* pThis, int nPollDuration);
-void qcap2_qdev_set_info(qcap2_qdev_t* pThis, qcap2_rcbuffer_t* pQdevInfo); // qcap2_qdev_info_t
-QRESULT qcap2_qdev_start(qcap2_qdev_t* pThis);
-QRESULT qcap2_qdev_stop(qcap2_qdev_t* pThis);
-QRESULT qcap2_qdev_get_video_count(qcap2_qdev_t* pThis, int* pCount);
-QRESULT qcap2_qdev_get_audio_count(qcap2_qdev_t* pThis, int* pCount);
-QRESULT qcap2_qdev_get_video_encoder_count(qcap2_qdev_t* pThis, int* pCount);
-QRESULT qcap2_qdev_get_audio_encoder_count(qcap2_qdev_t* pThis, int* pCount);
-QRESULT qcap2_qdev_get_video_input(qcap2_qdev_t* pThis, int nIndex, ULONG* pVideoInput);
-QRESULT qcap2_qdev_set_video_input(qcap2_qdev_t* pThis, int nIndex, ULONG nVideoInput);
-QRESULT qcap2_qdev_get_audio_input(qcap2_qdev_t* pThis, int nIndex, ULONG* pAudioInput);
-QRESULT qcap2_qdev_set_audio_input(qcap2_qdev_t* pThis, int nIndex, ULONG nAudioInput);
-QRESULT qcap2_qdev_config_video_source(qcap2_qdev_t* pThis, int nIndex, qcap2_video_source_t* pVideoSource);
-QRESULT qcap2_qdev_pop(qcap2_qdev_t* pThis, qcap2_rcbuffer_t** ppMediaInfo); // qcap2_media_info_t
-
 // qcap2_video_source_t
 qcap2_video_source_t* qcap2_video_source_new();
 void qcap2_video_source_delete(qcap2_video_source_t* pThis);
@@ -82,7 +45,7 @@ void qcap2_video_sink_set_src_ss_type(qcap2_video_sink_t* pThis, int nSrcSSType)
 void qcap2_video_sink_set_dst_ss_type(qcap2_video_sink_t* pThis, int nDstSSType); // refer to qcap2_stereoscopic_type_t
 QRESULT qcap2_video_sink_start(qcap2_video_sink_t* pThis);
 QRESULT qcap2_video_sink_stop(qcap2_video_sink_t* pThis);
-QRESULT qcap2_video_sink_pop(qcap2_video_source_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
+QRESULT qcap2_video_sink_pop(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t** ppRCBuffer);
 QRESULT qcap2_video_sink_push(qcap2_video_sink_t* pThis, qcap2_rcbuffer_t* pRCBuffer);
 
 // qcap2_audio_source_t
@@ -148,6 +111,12 @@ qcap2_audio_encoder_t* qcap2_demuxer_get_audio_encoder(qcap2_demuxer_t* pThis, i
 qcap2_program_info_t* qcap2_demuxer_get_program_info(qcap2_demuxer_t* pThis, int nIndex);
 QRESULT qcap2_demuxer_play(qcap2_demuxer_t* pThis);
 QRESULT qcap2_demuxer_update(qcap2_demuxer_t* pThis); // to sync status (progs, vsrc, asrc, venc, aenc)
+
+// RTSP-specific demuxer configuration (only valid when type is QCAP2_DEMUXER_TYPE_RTSP)
+void qcap2_demuxer_set_rtsp_timeout(qcap2_demuxer_t* pThis, int nTimeoutMs);
+void qcap2_demuxer_set_rtsp_reconnect(qcap2_demuxer_t* pThis, int nMaxAttempts, int nDelayMs);
+void qcap2_demuxer_set_rtsp_user_agent(qcap2_demuxer_t* pThis, const char* strUserAgent);
+void qcap2_demuxer_set_rtsp_keep_alive(qcap2_demuxer_t* pThis, int nIntervalMs);
 
 // qcap2_muxer_t
 qcap2_muxer_t* qcap2_muxer_new();

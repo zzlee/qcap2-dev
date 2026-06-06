@@ -108,6 +108,69 @@ void test_qcap2_event_t() {
     qcap2_event_delete(ev);
 }
 
+void test_qcap2_event_read_t() {
+    qcap2_event_t* ev = qcap2_event_new();
+    assert(ev != NULL);
+    assert(qcap2_event_start(ev) == QCAP_RS_SUCCESSFUL);
+
+    // Test 1: read without prior notify should return count == 0 (EAGAIN)
+    uint64_t count = 99;
+    assert(qcap2_event_read(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 0);
+
+    // Test 2: single notify then read should return count == 1
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    count = 0;
+    assert(qcap2_event_read(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 1);
+
+    // Test 3: multiple notifies accumulate into a single read
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    count = 0;
+    assert(qcap2_event_read(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 3);
+
+    // Test 4: after draining, next read returns 0 again
+    count = 99;
+    assert(qcap2_event_read(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 0);
+
+    // Test 5: NULL arguments
+    assert(qcap2_event_read(NULL, &count) == QCAP_RS_ERROR_GENERAL);
+    assert(qcap2_event_read(ev, NULL) == QCAP_RS_ERROR_GENERAL);
+
+    assert(qcap2_event_stop(ev) == QCAP_RS_SUCCESSFUL);
+    qcap2_event_delete(ev);
+}
+
+void test_qcap2_event_wait_count_t() {
+    qcap2_event_t* ev = qcap2_event_new();
+    assert(ev != NULL);
+    assert(qcap2_event_start(ev) == QCAP_RS_SUCCESSFUL);
+
+    // Test 1: Single notify, then wait_count
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    uint64_t count = 0;
+    assert(qcap2_event_wait_count(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 1);
+
+    // Test 2: Multiple notifies, then wait_count
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    assert(qcap2_event_notify(ev) == QCAP_RS_SUCCESSFUL);
+    count = 0;
+    assert(qcap2_event_wait_count(ev, &count) == QCAP_RS_SUCCESSFUL);
+    assert(count == 2);
+
+    // Test 3: NULL parameters
+    assert(qcap2_event_wait_count(NULL, &count) == QCAP_RS_ERROR_GENERAL);
+    assert(qcap2_event_wait_count(ev, NULL) == QCAP_RS_ERROR_GENERAL);
+
+    assert(qcap2_event_stop(ev) == QCAP_RS_SUCCESSFUL);
+    qcap2_event_delete(ev);
+}
+
 struct TestPipeContext {
     int fd;
     int* counter;
@@ -467,6 +530,7 @@ void test_qcap2_video_source_t() {
 
     // Push the buffer back to recycle it
     assert(qcap2_video_source_push(vsrc, popped) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(popped);
 
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
@@ -522,12 +586,13 @@ void test_qcap2_video_source_backends() {
     assert(custom_rcbuf != NULL);
 
     assert(qcap2_video_source_push(vsrc, custom_rcbuf) == QCAP_RS_SUCCESSFUL);
+    qcap2_rcbuffer_release(custom_rcbuf);
 
     qcap2_rcbuffer_t* user_popped = NULL;
     assert(qcap2_video_source_pop(vsrc, &user_popped) == QCAP_RS_SUCCESSFUL);
     assert(user_popped == custom_rcbuf);
 
-    qcap2_rcbuffer_release(custom_rcbuf);
+    qcap2_rcbuffer_release(user_popped);
     assert(qcap2_video_source_stop(vsrc) == QCAP_RS_SUCCESSFUL);
 
     // 4. Test V4L2 memory modes (MMAP, USERPTR, DMABUF) fail-safe start & cleanup
@@ -603,6 +668,8 @@ int main() {
     test_qcap2_benaphore_lock_t();
     test_qcap2_block_lock_t();
     test_qcap2_event_t();
+    test_qcap2_event_read_t();
+    test_qcap2_event_wait_count_t();
     test_qcap2_event_handlers_t();
     test_qcap2_rcbuffer_queue_t();
     test_qcap2_rcbuffer_queue_provider_consumer_scheme_t();

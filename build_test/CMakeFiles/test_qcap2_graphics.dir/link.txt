@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_qcap2_graphics.dir/tests/test_qcap2_graphics.cpp.o -o test_qcap2_graphics  -Wl,-rpath,"\$ORIGIN/lib" lib/libqcap2.graphics.so lib/libqcap2.utils.so lib/libqcap2.buffer.so -lfreetype -lharfbuzz 

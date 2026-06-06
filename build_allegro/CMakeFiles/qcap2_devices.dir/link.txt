@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -shared -Wl,-soname,libqcap2.devices.so -o lib/libqcap2.devices.so CMakeFiles/qcap2_devices.dir/src/qcap2.devices.cpp.o  -Wl,-rpath,"\$ORIGIN" lib/libqcap2.sync.so lib/libqcap2.formats.so -ldrm lib/libqcap2.buffer.so 

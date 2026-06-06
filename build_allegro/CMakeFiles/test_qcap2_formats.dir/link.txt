@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_qcap2_formats.dir/tests/test_qcap2_formats.cpp.o -o test_qcap2_formats  -Wl,-rpath,"\$ORIGIN/lib" lib/libqcap2.formats.so lib/libqcap2.buffer.so 

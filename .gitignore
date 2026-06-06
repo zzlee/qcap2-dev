@@ -1,65 +1,8 @@
-# Compiled Object files
+build*/
+build_*/
 *.o
-*.obj
-
-# Libraries
-*.lib
-*.a
 *.so
-*.dylib
-*.dll
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Debug files
-*.pdb
-*.ilk
-*.suo
-*.user
-*.ncb
-*.aps
-*.bsc
-*.sbr
-
-# Build directories
-build/
-bin/
-lib/
-obj/
-*.d
-
-# Temporary files
-*~
-.#*
-*.bak
-*.tmp
+*.a
 *.swp
-*.swo
-
-# IDE/Editor specific files
-.vscode/
-.idea/
-.project
-.cproject
-.settings/
-nbproject/
-
-# Operating System files
+*~
 .DS_Store
-Thumbs.db
-
-# Documentation files
-qcap_api.md
-
-# Gemini CLI temporary directory
-.gemini/tmp/
-
-# Test binaries
-test_qcap2_buffer
-test_qcap2_utils
-
-# Antigravity CLI workspace directory
-.antigravitycli/

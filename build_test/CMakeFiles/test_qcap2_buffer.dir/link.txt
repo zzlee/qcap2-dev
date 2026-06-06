@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_qcap2_buffer.dir/tests/test_qcap2_buffer.cpp.o -o test_qcap2_buffer  -Wl,-rpath,"\$ORIGIN/lib" lib/libqcap2.buffer.so 

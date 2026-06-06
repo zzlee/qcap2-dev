@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_qcap2_video_sink.dir/tests/test_qcap2_video_sink.cpp.o -o test_qcap2_video_sink  -Wl,-rpath,"\$ORIGIN/lib" lib/libqcap2.devices.so lib/libqcap2.formats.so lib/libqcap2.sync.so lib/libqcap2.buffer.so 

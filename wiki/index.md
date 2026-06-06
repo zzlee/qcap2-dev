@@ -5,6 +5,7 @@ This directory contains implementation notes and usage constraints for QCAP2 API
 ## Buffer APIs
 
 - [RCBUF.md](./RCBUF.md) — `qcap2_rcbuffer_t` lifetime, data pointer identity, embedded-member memory-layout rules, and `qcap2_container_of()` usage.
+- [RCBUF-EXTENSION-PLAN.md](./RCBUF-EXTENSION-PLAN.md) — Proposal and design for extending `rcbuf` to support hardware buffers (V4L2, CUDA, dmabuf, etc.).
 - [RCBUF-QUEUE.md](./RCBUF-QUEUE.md) — `qcap2_rcbuffer_queue_t` producer/consumer usage, event integration, queue lifecycle, and ownership handoff rules.
 - [AV-FRAME-BUFFER.md](./AV-FRAME-BUFFER.md) — `qcap2_av_frame_alloc_buffer()` raw video allocation rules based on `QCAP_COLORSPACE_TYPE_XXX` layouts.
 

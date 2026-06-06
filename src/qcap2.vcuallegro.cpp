@@ -29,6 +29,7 @@
 #ifdef QCAP2_HAVE_ALLEGRO
 
 #include "qcap2.processing_priv.h"
+#include "qcap.ext.core.h"
 
 #include <cstring>
 #include <cstdio>
@@ -58,9 +59,13 @@ QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p) {
     // Already initialized
     if (p->allegro_inited) return QCAP_RS_SUCCESSFUL;
 
-    // Guard against start without proper backend type
-    if (p->backend_type != QCAP_ENCODER_TYPE_ALLEGRO &&
-        p->backend_type != QCAP_ENCODER_TYPE_ALLEGRO2) {
+    // Guard: confirm the encoder property has an Allegro encoder type
+    ULONG encType = QCAP_ENCODER_TYPE_SOFTWARE;
+    if (p->enc_prop) {
+        qcap2_video_encoder_property_get_type(p->enc_prop, &encType);
+    }
+    if (encType != QCAP_ENCODER_TYPE_ALLEGRO &&
+        encType != QCAP_ENCODER_TYPE_ALLEGRO2) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
@@ -239,7 +244,11 @@ QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p) {
     if (p->allegro_inited) return QCAP_RS_SUCCESSFUL;
 
     // Guard against start without proper backend type
-    if (p->backend_type != QCAP_DECODER_TYPE_ALLEGRO) {
+    ULONG decType = QCAP_DECODER_TYPE_SOFTWARE;
+    if (p->dec_prop) {
+        qcap2_video_encoder_property_get_type(p->dec_prop, &decType);
+    }
+    if (decType != QCAP_DECODER_TYPE_ALLEGRO) {
         return QCAP_RS_ERROR_GENERAL;
     }
 

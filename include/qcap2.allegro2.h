@@ -7,11 +7,9 @@
 // This header provides Allegro VCU2 (next-generation Xilinx video codec unit)
 // specific configuration for the QCAP2 video encoder/decoder backends.
 //
-// These functions are only available when the encoder/decoder's backend_type
-// is set to QCAP_ENCODER_TYPE_ALLEGRO2.
-//
-// The backend_type is set via qcap2_video_encoder_set_backend_type() with
-// QCAP_ENCODER_TYPE_ALLEGRO2 from qcap.ext.core.h.
+// These functions are only available when the encoder's nEncoderType property
+// is set to QCAP_ENCODER_TYPE_ALLEGRO2 via
+// qcap2_video_encoder_set_video_property().
 //
 // They must be called BEFORE qcap2_video_encoder_start().
 

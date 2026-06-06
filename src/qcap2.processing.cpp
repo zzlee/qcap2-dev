@@ -2,6 +2,7 @@
 #include "qcap2.buffer.h"
 #include "qcap2.sync.h"
 #include "qcap2.formats.h"
+#include "qcap.ext.core.h"
 #include <mutex>
 #include <queue>
 #include <vector>
@@ -3109,23 +3110,6 @@ void qcap2_video_encoder_set_native_buffer(qcap2_video_encoder_t* pThis, bool bN
     }
 }
 
-void qcap2_video_encoder_set_backend_type(qcap2_video_encoder_t* pThis, int nBackendType) {
-    if (pThis) {
-        qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->backend_type = nBackendType;
-    }
-}
-
-int qcap2_video_encoder_get_backend_type(qcap2_video_encoder_t* pThis) {
-    if (pThis) {
-        qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        return p->backend_type;
-    }
-    return -1;
-}
-
 void qcap2_video_encoder_request_idr(qcap2_video_encoder_t* pThis) {
     if (pThis) {
         qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
@@ -3144,13 +3128,19 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
-        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
+    // Determine encoder type from the encoder property
+    ULONG encType = QCAP_ENCODER_TYPE_SOFTWARE;
+    if (p->enc_prop) {
+        qcap2_video_encoder_property_get_type(p->enc_prop, &encType);
+    }
+
+    if (encType == QCAP_ENCODER_TYPE_ALLEGRO ||
+        encType == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_start(p);
     }
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (encType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        encType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_start(p);
     }
 
@@ -3174,13 +3164,19 @@ QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis) {
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
-        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
+    // Determine encoder type from the encoder property
+    ULONG encType = QCAP_ENCODER_TYPE_SOFTWARE;
+    if (p->enc_prop) {
+        qcap2_video_encoder_property_get_type(p->enc_prop, &encType);
+    }
+
+    if (encType == QCAP_ENCODER_TYPE_ALLEGRO ||
+        encType == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_stop(p);
     }
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (encType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        encType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_stop(p);
     }
 
@@ -3212,13 +3208,19 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_encoder_priv_t* p = (qcap2_video_encoder_priv_t*)pThis;
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO ||
-        p->backend_type == QCAP_ENCODER_TYPE_ALLEGRO2) {
+    // Determine encoder type from the encoder property
+    ULONG encType = QCAP_ENCODER_TYPE_SOFTWARE;
+    if (p->enc_prop) {
+        qcap2_video_encoder_property_get_type(p->enc_prop, &encType);
+    }
+
+    if (encType == QCAP_ENCODER_TYPE_ALLEGRO ||
+        encType == QCAP_ENCODER_TYPE_ALLEGRO2) {
         return allegro_encoder_push(p, pRCBuffer);
     }
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (encType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        encType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_encoder_push(p, pRCBuffer);
     }
 
@@ -3787,23 +3789,6 @@ void qcap2_video_decoder_set_payload_type(qcap2_video_decoder_t* pThis, int nPay
     }
 }
 
-void qcap2_video_decoder_set_backend_type(qcap2_video_decoder_t* pThis, int nBackendType) {
-    if (pThis) {
-        qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        p->backend_type = nBackendType;
-    }
-}
-
-int qcap2_video_decoder_get_backend_type(qcap2_video_decoder_t* pThis) {
-    if (pThis) {
-        qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        return p->backend_type;
-    }
-    return -1;
-}
-
 static QRESULT v4l2_decoder_start(qcap2_video_decoder_priv_t* p);
 static QRESULT v4l2_decoder_stop(qcap2_video_decoder_priv_t* p);
 static QRESULT v4l2_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
@@ -3815,14 +3800,18 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
 
     if (p->running) return QCAP_RS_SUCCESSFUL;
 
-    // Dispatch to backend-specific start
-    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
+    // Determine decoder type from the decoder property
+    ULONG decType = QCAP_DECODER_TYPE_SOFTWARE;
+    if (p->dec_prop) {
+        qcap2_video_encoder_property_get_type(p->dec_prop, &decType);
+    }
+
+    if (decType == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_start(p);
     }
 
-    // V4L2 decoder backend (no dedicated QCAP_DECODER_TYPE)
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (decType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        decType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_start(p);
     }
 
@@ -3856,13 +3845,18 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
 
     if (!p->running) return QCAP_RS_SUCCESSFUL;
 
-    // Dispatch to backend-specific stop
-    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
+    // Determine decoder type from the decoder property
+    ULONG decType = QCAP_DECODER_TYPE_SOFTWARE;
+    if (p->dec_prop) {
+        qcap2_video_encoder_property_get_type(p->dec_prop, &decType);
+    }
+
+    if (decType == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_stop(p);
     }
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (decType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        decType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_stop(p);
     }
 
@@ -3903,13 +3897,18 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
     if (!pThis || !pRCBuffer) return QCAP_RS_ERROR_GENERAL;
     qcap2_video_decoder_priv_t* p = (qcap2_video_decoder_priv_t*)pThis;
 
-    // Dispatch to backend-specific push
-    if (p->backend_type == QCAP_DECODER_TYPE_ALLEGRO) {
+    // Determine decoder type from the decoder property
+    ULONG decType = QCAP_DECODER_TYPE_SOFTWARE;
+    if (p->dec_prop) {
+        qcap2_video_encoder_property_get_type(p->dec_prop, &decType);
+    }
+
+    if (decType == QCAP_DECODER_TYPE_ALLEGRO) {
         return allegro_decoder_push(p, pRCBuffer);
     }
 
-    if (p->backend_type == QCAP_ENCODER_TYPE_V4L2SRC ||
-        p->backend_type == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
+    if (decType == QCAP_ENCODER_TYPE_V4L2SRC ||
+        decType == QCAP_ENCODER_TYPE_V4L2NVCODEC) {
         return v4l2_decoder_push(p, pRCBuffer);
     }
 

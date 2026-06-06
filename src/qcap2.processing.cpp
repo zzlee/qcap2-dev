@@ -2423,7 +2423,7 @@ static enum AVCodecID qcap2_encoder_format_to_codec_id(ULONG nEncoderFormat) {
 
 // qcap2_video_encoder_priv_t moved to qcap2.processing_priv.h
 
-static bool init_encoder(qcap2_video_encoder_priv_t* p) {
+static bool ffmpeg_encoder_init(qcap2_video_encoder_priv_t* p) {
     if (!p->enc_prop) return false;
 
     ULONG nEncoderType = 0, nEncoderFormat = 0, nColorSpaceType = 0;
@@ -2615,7 +2615,7 @@ static bool init_encoder(qcap2_video_encoder_priv_t* p) {
     return true;
 }
 
-static bool init_encoder_sws(qcap2_video_encoder_priv_t* p, ULONG in_color, ULONG in_w, ULONG in_h) {
+static bool ffmpeg_encoder_sws_init(qcap2_video_encoder_priv_t* p, ULONG in_color, ULONG in_w, ULONG in_h) {
     if (!p->codec_ctx) return false;
 
     AVPixelFormat src_pix_fmt = qcap2_encoder_to_ffmpeg_pix_fmt(in_color);
@@ -2648,7 +2648,7 @@ static bool init_encoder_sws(qcap2_video_encoder_priv_t* p, ULONG in_color, ULON
     return true;
 }
 
-static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
+static QRESULT ffmpeg_encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return QCAP_RS_ERROR_OUT_OF_MEMORY;
 
@@ -2710,6 +2710,142 @@ static QRESULT encoder_receive_packets(qcap2_video_encoder_priv_t* p) {
 
     av_packet_free(&pkt);
     return QCAP_RS_SUCCESSFUL;
+}
+
+// ==============================================================================
+// FFmpeg backend encoder helper — wraps the frame submission to libavcodec
+// ==============================================================================
+static QRESULT ffmpeg_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
+    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
+    if (!pData) return QCAP_RS_ERROR_GENERAL;
+
+    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
+
+    // Get input frame properties
+    ULONG in_color = 0, in_w = 0, in_h = 0;
+    qcap2_av_frame_get_video_property(pFrame, &in_color, &in_w, &in_h);
+
+    uint8_t* in_ptrs[4] = { nullptr };
+    int in_strides[4] = { 0 };
+    qcap2_av_frame_get_buffer1(pFrame, in_ptrs, in_strides);
+
+    int64_t nPTS = 0;
+    qcap2_av_frame_get_pts(pFrame, &nPTS);
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (!p->running || !p->codec_ctx) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    // Initialize/reinitialize pixel format converter if input changes
+    if (p->cached_in_color != in_color || p->cached_in_w != in_w || p->cached_in_h != in_h) {
+        if (!ffmpeg_encoder_sws_init(p, in_color, in_w, in_h)) {
+            qcap2_rcbuffer_unlock_data(pRCBuffer);
+            return QCAP_RS_ERROR_GENERAL;
+        }
+    }
+
+    // Allocate AVFrame for the encoder
+    AVFrame* av_frame = av_frame_alloc();
+    if (!av_frame) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    av_frame->width = p->codec_ctx->width;
+    av_frame->height = p->codec_ctx->height;
+    av_frame->format = p->codec_ctx->pix_fmt;
+
+    int ret = av_frame_get_buffer(av_frame, p->frame_align > 0 ? p->frame_align : 32);
+    if (ret < 0) {
+        av_frame_free(&av_frame);
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    ret = av_frame_make_writable(av_frame);
+    if (ret < 0) {
+        av_frame_free(&av_frame);
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    // Handle potential U/V swap for YV12/YV24
+    uint8_t* src_ptrs[4];
+    int src_strides[4];
+    for (int i = 0; i < 4; ++i) {
+        src_ptrs[i] = in_ptrs[i];
+        src_strides[i] = in_strides[i];
+    }
+    if (in_color == QCAP_COLORSPACE_TYPE_YV12 || in_color == QCAP_COLORSPACE_TYPE_YV24) {
+        std::swap(src_ptrs[1], src_ptrs[2]);
+        std::swap(src_strides[1], src_strides[2]);
+    }
+
+    if (p->sws_ctx) {
+        // Pixel format conversion needed
+        sws_scale(p->sws_ctx, src_ptrs, src_strides, 0, in_h,
+                  av_frame->data, av_frame->linesize);
+    } else {
+        // Direct copy — same pixel format and resolution
+        AVPixelFormat pix_fmt = (AVPixelFormat)av_frame->format;
+        int num_planes = av_pix_fmt_count_planes(pix_fmt);
+        for (int i = 0; i < num_planes && i < 4; ++i) {
+            int plane_h = (i == 0) ? av_frame->height : av_frame->height;
+            // For 4:2:0 chroma planes, height is halved
+            if (i > 0 && (pix_fmt == AV_PIX_FMT_YUV420P || pix_fmt == AV_PIX_FMT_NV12 || pix_fmt == AV_PIX_FMT_P010LE)) {
+                plane_h = (av_frame->height + 1) / 2;
+            }
+            int line_bytes = std::min(src_strides[i], av_frame->linesize[i]);
+            if (line_bytes > 0 && src_ptrs[i]) {
+                for (int row = 0; row < plane_h; ++row) {
+                    memcpy(av_frame->data[i] + row * av_frame->linesize[i],
+                           src_ptrs[i] + row * src_strides[i],
+                           line_bytes);
+                }
+            }
+        }
+    }
+
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
+
+    // Set PTS
+    av_frame->pts = p->frame_counter++;
+
+    // Handle IDR request
+    if (p->request_idr.exchange(false)) {
+        av_frame->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
+        av_frame->flags |= AV_FRAME_FLAG_KEY;
+#else
+        av_frame->key_frame = 1;
+#endif
+    }
+
+    // Send frame to encoder
+    ret = avcodec_send_frame(p->codec_ctx, av_frame);
+    av_frame_free(&av_frame);
+
+    if (ret < 0) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    // Receive all available packets
+    QRESULT qr = ffmpeg_encoder_receive_packets(p);
+
+    // Notify waiting consumers
+    if (!p->output_queue.empty()) {
+        p->cv->notify_all();
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+    }
+
+    // Recycle raw input frame (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
+    return qr;
 }
 
 // ==============================================================================
@@ -3062,7 +3198,7 @@ QRESULT qcap2_video_encoder_start(qcap2_video_encoder_t* pThis) {
     }
 
     // Default FFmpeg path
-    if (!init_encoder(p)) {
+    if (!ffmpeg_encoder_init(p)) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
@@ -3105,7 +3241,7 @@ QRESULT qcap2_video_encoder_stop(qcap2_video_encoder_t* pThis) {
     // Flush the encoder
     if (p->codec_ctx) {
         avcodec_send_frame(p->codec_ctx, nullptr); // send flush signal
-        encoder_receive_packets(p);
+        ffmpeg_encoder_receive_packets(p);
     }
 
     p->running = false;
@@ -3128,136 +3264,7 @@ QRESULT qcap2_video_encoder_push(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t*
     }
 
     // Default FFmpeg path
-    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
-    if (!pData) return QCAP_RS_ERROR_GENERAL;
-
-    qcap2_av_frame_t* pFrame = (qcap2_av_frame_t*)pData;
-
-    // Get input frame properties
-    ULONG in_color = 0, in_w = 0, in_h = 0;
-    qcap2_av_frame_get_video_property(pFrame, &in_color, &in_w, &in_h);
-
-    uint8_t* in_ptrs[4] = { nullptr };
-    int in_strides[4] = { 0 };
-    qcap2_av_frame_get_buffer1(pFrame, in_ptrs, in_strides);
-
-    int64_t nPTS = 0;
-    qcap2_av_frame_get_pts(pFrame, &nPTS);
-
-    std::lock_guard<std::mutex> lock(*(p->mtx));
-    if (!p->running || !p->codec_ctx) {
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_GENERAL;
-    }
-
-    // Initialize/reinitialize pixel format converter if input changes
-    if (p->cached_in_color != in_color || p->cached_in_w != in_w || p->cached_in_h != in_h) {
-        if (!init_encoder_sws(p, in_color, in_w, in_h)) {
-            qcap2_rcbuffer_unlock_data(pRCBuffer);
-            return QCAP_RS_ERROR_GENERAL;
-        }
-    }
-
-    // Allocate AVFrame for the encoder
-    AVFrame* av_frame = av_frame_alloc();
-    if (!av_frame) {
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_OUT_OF_MEMORY;
-    }
-
-    av_frame->width = p->codec_ctx->width;
-    av_frame->height = p->codec_ctx->height;
-    av_frame->format = p->codec_ctx->pix_fmt;
-
-    int ret = av_frame_get_buffer(av_frame, p->frame_align > 0 ? p->frame_align : 32);
-    if (ret < 0) {
-        av_frame_free(&av_frame);
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_OUT_OF_MEMORY;
-    }
-
-    ret = av_frame_make_writable(av_frame);
-    if (ret < 0) {
-        av_frame_free(&av_frame);
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_GENERAL;
-    }
-
-    // Handle potential U/V swap for YV12/YV24
-    uint8_t* src_ptrs[4];
-    int src_strides[4];
-    for (int i = 0; i < 4; ++i) {
-        src_ptrs[i] = in_ptrs[i];
-        src_strides[i] = in_strides[i];
-    }
-    if (in_color == QCAP_COLORSPACE_TYPE_YV12 || in_color == QCAP_COLORSPACE_TYPE_YV24) {
-        std::swap(src_ptrs[1], src_ptrs[2]);
-        std::swap(src_strides[1], src_strides[2]);
-    }
-
-    if (p->sws_ctx) {
-        // Pixel format conversion needed
-        sws_scale(p->sws_ctx, src_ptrs, src_strides, 0, in_h,
-                  av_frame->data, av_frame->linesize);
-    } else {
-        // Direct copy — same pixel format and resolution
-        AVPixelFormat pix_fmt = (AVPixelFormat)av_frame->format;
-        int num_planes = av_pix_fmt_count_planes(pix_fmt);
-        for (int i = 0; i < num_planes && i < 4; ++i) {
-            int plane_h = (i == 0) ? av_frame->height : av_frame->height;
-            // For 4:2:0 chroma planes, height is halved
-            if (i > 0 && (pix_fmt == AV_PIX_FMT_YUV420P || pix_fmt == AV_PIX_FMT_NV12 || pix_fmt == AV_PIX_FMT_P010LE)) {
-                plane_h = (av_frame->height + 1) / 2;
-            }
-            int line_bytes = std::min(src_strides[i], av_frame->linesize[i]);
-            if (line_bytes > 0 && src_ptrs[i]) {
-                for (int row = 0; row < plane_h; ++row) {
-                    memcpy(av_frame->data[i] + row * av_frame->linesize[i],
-                           src_ptrs[i] + row * src_strides[i],
-                           line_bytes);
-                }
-            }
-        }
-    }
-
-    qcap2_rcbuffer_unlock_data(pRCBuffer);
-
-    // Set PTS
-    av_frame->pts = p->frame_counter++;
-
-    // Handle IDR request
-    if (p->request_idr.exchange(false)) {
-        av_frame->pict_type = AV_PICTURE_TYPE_I;
-#ifdef AV_FRAME_FLAG_KEY
-        av_frame->flags |= AV_FRAME_FLAG_KEY;
-#else
-        av_frame->key_frame = 1;
-#endif
-    }
-
-    // Send frame to encoder
-    ret = avcodec_send_frame(p->codec_ctx, av_frame);
-    av_frame_free(&av_frame);
-
-    if (ret < 0) {
-        return QCAP_RS_ERROR_GENERAL;
-    }
-
-    // Receive all available packets
-    QRESULT qr = encoder_receive_packets(p);
-
-    // Notify waiting consumers
-    if (!p->output_queue.empty()) {
-        p->cv->notify_all();
-        if (p->event) {
-            qcap2_event_notify(p->event);
-        }
-    }
-
-    // Recycle raw input frame (HPR)
-    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
-
-    return qr;
+    return ffmpeg_encoder_push(p, pRCBuffer);
 }
 
 QRESULT qcap2_video_encoder_pop(qcap2_video_encoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {
@@ -3316,7 +3323,7 @@ static enum AVCodecID qcap2_decoder_format_to_codec_id(ULONG nEncoderFormat) {
 
 // qcap2_video_decoder_priv_t moved to qcap2.processing_priv.h
 
-static bool init_decoder(qcap2_video_decoder_priv_t* p) {
+static bool ffmpeg_decoder_init(qcap2_video_decoder_priv_t* p) {
     if (!p->dec_prop) return false;
 
     ULONG nEncoderType = 0, nEncoderFormat = 0, nColorSpaceType = 0;
@@ -3377,7 +3384,7 @@ static bool init_decoder(qcap2_video_decoder_priv_t* p) {
     return true;
 }
 
-static bool init_decoder_sws(qcap2_video_decoder_priv_t* p, AVPixelFormat src_pix_fmt, int src_w, int src_h) {
+static bool ffmpeg_decoder_sws_init(qcap2_video_decoder_priv_t* p, AVPixelFormat src_pix_fmt, int src_w, int src_h) {
     if (!p->codec_ctx) return false;
 
     AVPixelFormat target_pix_fmt = qcap2_encoder_to_ffmpeg_pix_fmt(p->target_color);
@@ -3413,7 +3420,7 @@ static bool init_decoder_sws(qcap2_video_decoder_priv_t* p, AVPixelFormat src_pi
     return true;
 }
 
-static qcap2_rcbuffer_t* get_decoder_output_buffer(qcap2_video_decoder_priv_t* p, int dst_w, int dst_h) {
+static qcap2_rcbuffer_t* ffmpeg_decoder_get_output_buffer(qcap2_video_decoder_priv_t* p, int dst_w, int dst_h) {
     qcap2_rcbuffer_t* buf = nullptr;
     if (qcap2_rcbuffer_queue_get_buffer_count(p->output_recycled_queue) > 0) {
         qcap2_rcbuffer_queue_pop(p->output_recycled_queue, &buf);
@@ -3437,7 +3444,7 @@ static qcap2_rcbuffer_t* get_decoder_output_buffer(qcap2_video_decoder_priv_t* p
     return rc;
 }
 
-static QRESULT decoder_receive_frames(qcap2_video_decoder_priv_t* p) {
+static QRESULT ffmpeg_decoder_receive_frames(qcap2_video_decoder_priv_t* p) {
     AVFrame* decoded_frame = av_frame_alloc();
     if (!decoded_frame) return QCAP_RS_ERROR_OUT_OF_MEMORY;
 
@@ -3455,7 +3462,7 @@ static QRESULT decoder_receive_frames(qcap2_video_decoder_priv_t* p) {
         if (p->sws_src_color != (ULONG)decoded_frame->format ||
             p->sws_src_w != (ULONG)decoded_frame->width ||
             p->sws_src_h != (ULONG)decoded_frame->height) {
-            if (!init_decoder_sws(p, (AVPixelFormat)decoded_frame->format, decoded_frame->width, decoded_frame->height)) {
+            if (!ffmpeg_decoder_sws_init(p, (AVPixelFormat)decoded_frame->format, decoded_frame->width, decoded_frame->height)) {
                 av_frame_free(&decoded_frame);
                 return QCAP_RS_ERROR_GENERAL;
             }
@@ -3464,7 +3471,7 @@ static QRESULT decoder_receive_frames(qcap2_video_decoder_priv_t* p) {
         int dst_w = (p->target_width > 0) ? (int)p->target_width : decoded_frame->width;
         int dst_h = (p->target_height > 0) ? (int)p->target_height : decoded_frame->height;
 
-        qcap2_rcbuffer_t* out_rc = get_decoder_output_buffer(p, dst_w, dst_h);
+        qcap2_rcbuffer_t* out_rc = ffmpeg_decoder_get_output_buffer(p, dst_w, dst_h);
         if (!out_rc) {
             av_frame_free(&decoded_frame);
             return QCAP_RS_ERROR_OUT_OF_MEMORY;
@@ -3534,6 +3541,82 @@ static QRESULT decoder_receive_frames(qcap2_video_decoder_priv_t* p) {
 
     av_frame_free(&decoded_frame);
     return QCAP_RS_SUCCESSFUL;
+}
+
+// ==============================================================================
+// FFmpeg decoder push helpers
+// ==============================================================================
+static QRESULT ffmpeg_decoder_push_bypass(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (!p->running) return QCAP_RS_ERROR_GENERAL;
+    qcap2_rcbuffer_add_ref(pRCBuffer);
+    p->input_queue.push(pRCBuffer);
+    p->cv->notify_all();
+    if (p->notify_cv) {
+        std::lock_guard<std::mutex> lock2(*p->notify_mtx);
+        p->notify_cv->notify_all();
+    }
+    if (p->event) {
+        qcap2_event_notify(p->event);
+    }
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+    return QCAP_RS_SUCCESSFUL;
+}
+
+static QRESULT ffmpeg_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer) {
+    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
+    if (!pData) return QCAP_RS_ERROR_GENERAL;
+
+    qcap2_av_packet_t* pPacket = (qcap2_av_packet_t*)pData;
+
+    uint8_t* pBuf = nullptr;
+    int nSize = 0;
+    qcap2_av_packet_get_buffer(pPacket, &pBuf, &nSize);
+
+    int64_t nPTS = 0, nDTS = 0;
+    qcap2_av_packet_get_pts(pPacket, &nPTS);
+    qcap2_av_packet_get_dts(pPacket, &nDTS);
+
+    std::lock_guard<std::mutex> lock(*(p->mtx));
+    if (!p->running || !p->codec_ctx) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    AVPacket* av_pkt = av_packet_alloc();
+    if (!av_pkt) {
+        qcap2_rcbuffer_unlock_data(pRCBuffer);
+        return QCAP_RS_ERROR_OUT_OF_MEMORY;
+    }
+
+    av_pkt->data = pBuf;
+    av_pkt->size = nSize;
+    av_pkt->pts = nPTS;
+    av_pkt->dts = nDTS;
+
+    int ret = avcodec_send_packet(p->codec_ctx, av_pkt);
+    av_packet_free(&av_pkt);
+
+    qcap2_rcbuffer_unlock_data(pRCBuffer);
+
+    if (ret < 0) {
+        return QCAP_RS_ERROR_GENERAL;
+    }
+
+    QRESULT qr = ffmpeg_decoder_receive_frames(p);
+
+    if (!p->output_queue.empty()) {
+        p->cv->notify_all();
+        if (p->event) {
+            qcap2_event_notify(p->event);
+        }
+    }
+
+    // Recycle input packet (HPR)
+    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
+
+    return qr;
 }
 
 #ifdef __cplusplus
@@ -3795,7 +3878,7 @@ QRESULT qcap2_video_decoder_start(qcap2_video_decoder_t* pThis) {
         return QCAP_RS_SUCCESSFUL;
     }
 
-    if (!init_decoder(p)) {
+    if (!ffmpeg_decoder_init(p)) {
         return QCAP_RS_ERROR_GENERAL;
     }
 
@@ -3852,7 +3935,7 @@ QRESULT qcap2_video_decoder_stop(qcap2_video_decoder_t* pThis) {
     // Flush the decoder
     if (p->codec_ctx) {
         avcodec_send_packet(p->codec_ctx, nullptr); // send flush signal
-        decoder_receive_frames(p);
+        ffmpeg_decoder_receive_frames(p);
     }
 
     p->running = false;
@@ -3876,75 +3959,10 @@ QRESULT qcap2_video_decoder_push(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t*
     }
 
     if (p->bypass_decoding) {
-        std::lock_guard<std::mutex> lock(*(p->mtx));
-        if (!p->running) return QCAP_RS_ERROR_GENERAL;
-        qcap2_rcbuffer_add_ref(pRCBuffer);
-        p->input_queue.push(pRCBuffer);
-        p->cv->notify_all();
-        if (p->notify_cv) {
-            std::lock_guard<std::mutex> lock2(*p->notify_mtx);
-            p->notify_cv->notify_all();
-        }
-        if (p->event) {
-            qcap2_event_notify(p->event);
-        }
-        // Recycle input packet (HPR)
-        qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
-        return QCAP_RS_SUCCESSFUL;
+        return ffmpeg_decoder_push_bypass(p, pRCBuffer);
     }
 
-    PVOID pData = qcap2_rcbuffer_lock_data(pRCBuffer);
-    if (!pData) return QCAP_RS_ERROR_GENERAL;
-
-    qcap2_av_packet_t* pPacket = (qcap2_av_packet_t*)pData;
-
-    uint8_t* pBuf = nullptr;
-    int nSize = 0;
-    qcap2_av_packet_get_buffer(pPacket, &pBuf, &nSize);
-
-    int64_t nPTS = 0, nDTS = 0;
-    qcap2_av_packet_get_pts(pPacket, &nPTS);
-    qcap2_av_packet_get_dts(pPacket, &nDTS);
-
-    std::lock_guard<std::mutex> lock(*(p->mtx));
-    if (!p->running || !p->codec_ctx) {
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_GENERAL;
-    }
-
-    AVPacket* av_pkt = av_packet_alloc();
-    if (!av_pkt) {
-        qcap2_rcbuffer_unlock_data(pRCBuffer);
-        return QCAP_RS_ERROR_OUT_OF_MEMORY;
-    }
-
-    av_pkt->data = pBuf;
-    av_pkt->size = nSize;
-    av_pkt->pts = nPTS;
-    av_pkt->dts = nDTS;
-
-    int ret = avcodec_send_packet(p->codec_ctx, av_pkt);
-    av_packet_free(&av_pkt);
-
-    qcap2_rcbuffer_unlock_data(pRCBuffer);
-
-    if (ret < 0) {
-        return QCAP_RS_ERROR_GENERAL;
-    }
-
-    QRESULT qr = decoder_receive_frames(p);
-
-    if (!p->output_queue.empty()) {
-        p->cv->notify_all();
-        if (p->event) {
-            qcap2_event_notify(p->event);
-        }
-    }
-
-    // Recycle input packet (HPR)
-    qcap2_rcbuffer_queue_push(p->input_recycled_queue, pRCBuffer);
-
-    return qr;
+    return ffmpeg_decoder_push(p, pRCBuffer);
 }
 
 QRESULT qcap2_video_decoder_pop(qcap2_video_decoder_t* pThis, qcap2_rcbuffer_t** ppRCBuffer) {

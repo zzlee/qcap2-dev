@@ -1,0 +1,16 @@
+test_qcap2_buffer 1 0.00238148
+test_qcap2_formats 1 0.00163535
+test_qcap2_utils 1 0.00250781
+test_qcap2_sync 1 0.65628
+test_qcap2_audio_sink 1 0.00222304
+test_qcap2_video_sink 1 0.0588446
+test_qcap2_demuxer 1 1.01671
+test_qcap2_demuxer_rtsp 1 0.976713
+test_qcap2_demuxer_mock 1 0.932646
+test_qcap2_muxer 1 0.167127
+test_qcap2_muxer_rtsp 1 0.128656
+test_qcap2_demux_mux 1 0.297304
+test_qcap2_sdp 1 10.1988
+test_qcap2_processing 1 0.0714819
+test_qcap2_graphics 1 0.0409602
+---

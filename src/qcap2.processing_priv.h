@@ -452,13 +452,21 @@ typedef struct qcap2_video_decoder_priv_t {
 
 // Allegro VCU backend function declarations
 // Implemented in qcap2.vcuallegro.cpp (when QCAP2_HAVE_ALLEGRO is defined)
-// or as fallback stubs in qcap2.processing.cpp (when QCAP2_HAVE_ALLEGRO is not defined)
-extern QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p);
-extern QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p);
-extern QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
+// or as fallback stubs in qcap2.processing.cpp (when QCAP2_HAVE_ALLEGRO is not defined).
+// These must have C linkage to match the call sites in qcap2.processing.cpp,
+// which are compiled inside the extern "C" block from qcap2.processing.h.
+#ifdef __cplusplus
+extern "C" {
+#endif
+QRESULT allegro_encoder_start(qcap2_video_encoder_priv_t* p);
+QRESULT allegro_encoder_stop(qcap2_video_encoder_priv_t* p);
+QRESULT allegro_encoder_push(qcap2_video_encoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
 
-extern QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p);
-extern QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p);
-extern QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
+QRESULT allegro_decoder_start(qcap2_video_decoder_priv_t* p);
+QRESULT allegro_decoder_stop(qcap2_video_decoder_priv_t* p);
+QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pRCBuffer);
+#ifdef __cplusplus
+}
+#endif
 
 #endif // QCAP2_PROCESSING_PRIV_H

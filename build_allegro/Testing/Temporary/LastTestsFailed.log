@@ -1,0 +1,9 @@
+7:test_qcap2_demuxer
+8:test_qcap2_demuxer_rtsp
+9:test_qcap2_demuxer_mock
+10:test_qcap2_muxer
+11:test_qcap2_muxer_rtsp
+12:test_qcap2_demux_mux
+13:test_qcap2_sdp
+14:test_qcap2_processing
+15:test_qcap2_graphics

@@ -33,6 +33,13 @@
 #include <cstring>
 #include <cstdio>
 
+// The Allegro backend functions must have C linkage to match the declarations
+// seen by qcap2.processing.cpp (which includes qcap2.processing_priv.h from
+// within the extern "C" block started by qcap2.processing.h).
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ==============================================================================
 // Forward declarations for Allegro VCU opaque types
 //
@@ -391,5 +398,9 @@ QRESULT allegro_decoder_push(qcap2_video_decoder_priv_t* p, qcap2_rcbuffer_t* pR
     (void)pRCBuffer;
     return QCAP_RS_ERROR_NON_SUPPORT;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // QCAP2_HAVE_ALLEGRO

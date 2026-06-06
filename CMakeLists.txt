@@ -8,12 +8,27 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Compile options
 add_compile_options(-Wall -Wextra -g)
 
+# Custom CMake find-module path (for FindAllegroVCU.cmake et al.)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 # Optional Xilinx Allegro VCU hardware backend
 option(QCAP2_HAVE_ALLEGRO "Enable Xilinx Allegro VCU hardware encoder/decoder backend" OFF)
-if(QCAP2_HAVE_ALLEGRO)
-    message(STATUS "Xilinx Allegro VCU backend ENABLED")
+
+# Auto-detect Allegro VCU (vcu-ctrl-sw) SDK
+find_package(AllegroVCU QUIET)
+
+if(AllegroVCU_FOUND)
+    # SDK found on disk: enable the backend regardless of the option default
+    if(NOT QCAP2_HAVE_ALLEGRO)
+        set(QCAP2_HAVE_ALLEGRO ON CACHE BOOL "Enable Xilinx Allegro VCU hardware encoder/decoder backend" FORCE)
+    endif()
+    message(STATUS "Xilinx Allegro VCU backend ENABLED (vcu-ctrl-sw found)")
 else()
-    message(STATUS "Xilinx Allegro VCU backend DISABLED (using fallback stubs)")
+    if(QCAP2_HAVE_ALLEGRO)
+        message(WARNING "QCAP2_HAVE_ALLEGRO is ON but Allegro VCU SDK was NOT found. Build will fail if headers are required.")
+    else()
+        message(STATUS "Allegro VCU (vcu-ctrl-sw) NOT found. Skipping Allegro backend.")
+    endif()
 endif()
 
 # ==============================================================================
@@ -176,10 +191,14 @@ if(SWRESAMPLE_LIB AND SWSCALE_LIB AND AVFILTER_LIB AND AVUTIL_LIB AND AVCODEC_LI
         ${AVUTIL_LIB}
     )
 
-    # Conditionally include Allegro VCU backend source
+    # Conditionally include Allegro VCU backend source and link libraries
     if(QCAP2_HAVE_ALLEGRO)
         target_sources(qcap2_processing PRIVATE src/qcap2.vcuallegro.cpp)
         target_compile_definitions(qcap2_processing PRIVATE QCAP2_HAVE_ALLEGRO)
+        if(AllegroVCU_FOUND)
+            target_include_directories(qcap2_processing PRIVATE ${AllegroVCU_INCLUDE_DIR})
+            target_link_libraries(qcap2_processing PRIVATE ${AllegroVCU_LIBRARIES})
+        endif()
     endif()
 else()
     message(WARNING "FFmpeg swresample/swscale/avfilter/avcodec/avutil NOT found. Skipping libqcap2.processing.so and test_qcap2_processing.")

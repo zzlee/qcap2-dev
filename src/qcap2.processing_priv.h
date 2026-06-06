@@ -89,6 +89,9 @@ typedef struct qcap2_video_encoder_priv_t {
     qcap2_rcbuffer_queue_t* input_recycled_queue;
     qcap2_rcbuffer_queue_t* output_recycled_queue;
 
+    // Backend selection
+    int backend_type;
+
     // Encoder property (owned reference)
     qcap2_video_encoder_property_t* enc_prop;
 
@@ -128,6 +131,7 @@ typedef struct qcap2_video_encoder_priv_t {
     qcap2_video_encoder_priv_t() {
         mtx = new std::mutex();
         cv = new std::condition_variable();
+        backend_type = QCAP2_VIDEO_ENCODER_BACKEND_TYPE_DEFAULT;
         enc_prop = nullptr;
         dyn_prop = nullptr;
         extra_data = nullptr;
@@ -287,6 +291,9 @@ typedef struct qcap2_video_decoder_priv_t {
     qcap2_rcbuffer_queue_t* input_recycled_queue;
     qcap2_rcbuffer_queue_t* output_recycled_queue;
 
+    // Backend selection
+    int backend_type;
+
     // Decoder property (owned copy of encoder properties defining output/stream properties)
     qcap2_video_encoder_property_t* dec_prop;
 
@@ -334,6 +341,7 @@ typedef struct qcap2_video_decoder_priv_t {
     qcap2_video_decoder_priv_t() {
         mtx = new std::mutex();
         cv = new std::condition_variable();
+        backend_type = QCAP2_VIDEO_DECODER_BACKEND_TYPE_DEFAULT;
         dec_prop = nullptr;
         extra_data = nullptr;
         extra_data_size = 0;

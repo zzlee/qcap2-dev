@@ -54,6 +54,8 @@ QRESULT qcap2_audio_resampler_push_output(qcap2_audio_resampler_t* pThis, qcap2_
 // qcap2_video_encoder_t
 qcap2_video_encoder_t* qcap2_video_encoder_new();
 void qcap2_video_encoder_delete(qcap2_video_encoder_t* pThis);
+void qcap2_video_encoder_set_backend_type(qcap2_video_encoder_t* pThis, int nBackendType);
+int qcap2_video_encoder_get_backend_type(qcap2_video_encoder_t* pThis);
 void qcap2_video_encoder_set_video_property(qcap2_video_encoder_t* pThis, qcap2_video_encoder_property_t* pVideoEncoderProperty);
 void qcap2_video_encoder_get_video_property(qcap2_video_encoder_t* pThis, qcap2_video_encoder_property_t* pVideoEncoderProperty);
 void qcap2_video_encoder_set_dynamic_video_property(qcap2_video_encoder_t* pThis, qcap2_video_encoder_dynamic_property_t* pVideoEncoderDynamicProperty);
@@ -80,6 +82,8 @@ QRESULT qcap2_video_encoder_push_output(qcap2_video_encoder_t* pThis, qcap2_rcbu
 // qcap2_video_decoder_t
 qcap2_video_decoder_t* qcap2_video_decoder_new();
 void qcap2_video_decoder_delete(qcap2_video_decoder_t* pThis);
+void qcap2_video_decoder_set_backend_type(qcap2_video_decoder_t* pThis, int nBackendType);
+int qcap2_video_decoder_get_backend_type(qcap2_video_decoder_t* pThis);
 void qcap2_video_decoder_set_video_property(qcap2_video_decoder_t* pThis, qcap2_video_encoder_property_t* pVideoEncoderProperty);
 void qcap2_video_decoder_get_video_property(qcap2_video_decoder_t* pThis, qcap2_video_encoder_property_t* pVideoEncoderProperty);
 void qcap2_video_decoder_get_extra_data(qcap2_video_decoder_t* pThis, uint8_t** ppExtraData, int* pExtraDataSize);

@@ -1,6 +1,7 @@
 #include "qcap2.devices_priv.h"
 #include "qcap2.user.h"
 #include "qcap2.buffer.h"
+#include "qcap2.buffer.ffmpeg.h"
 #include "qcap2.processing_priv.h"
 #include "qcap.ext.core.h"
 #include <vector>
@@ -225,27 +226,14 @@ static void demuxer_read_thread(qcap2_demuxer_priv_t* priv) {
 
         // Prepare av_packet rcbuf for encoder
         qcap2_rcbuffer_t* enc_rcbuf = nullptr;
-        qcap2_av_packet_t* av_pkt = new qcap2_av_packet_t;
-        qcap2_av_packet_init(av_pkt);
-        if (qcap2_av_packet_alloc_buffer(av_pkt, pkt->size)) {
-            uint8_t* pBuf = nullptr;
-            int nSize = 0;
-            qcap2_av_packet_get_buffer(av_pkt, &pBuf, &nSize);
-            if (pBuf) {
-                memcpy(pBuf, pkt->data, pkt->size);
+        AVPacket* target_pkt = av_packet_alloc();
+        if (target_pkt) {
+            if (av_packet_ref(target_pkt, pkt) >= 0) {
+                double sample_time = pkt->pts * av_q2d(priv->format_context->streams[pkt->stream_index]->time_base);
+                enc_rcbuf = new qcap2_avpacket_buffer(target_pkt, sample_time);
+            } else {
+                av_packet_free(&target_pkt);
             }
-            qcap2_av_packet_set_pts(av_pkt, pkt->pts);
-            qcap2_av_packet_set_dts(av_pkt, pkt->dts);
-            qcap2_av_packet_set_property(av_pkt, pkt->stream_index, (pkt->flags & AV_PKT_FLAG_KEY) ? TRUE : FALSE);
-            qcap2_av_packet_set_sample_time(av_pkt, pkt->pts * av_q2d(priv->format_context->streams[pkt->stream_index]->time_base));
-            
-            enc_rcbuf = qcap2_rcbuffer_new(av_pkt, [](PVOID pData) {
-                qcap2_av_packet_t* p = (qcap2_av_packet_t*)pData;
-                if (p) {
-                    qcap2_av_packet_free_buffer(p);
-                    delete p;
-                }
-            });
         }
 
         // Try video encoders
@@ -689,27 +677,14 @@ static void demuxer_rtsp_read_thread(qcap2_demuxer_priv_t* priv) {
 
         // Prepare av_packet rcbuf for encoder
         qcap2_rcbuffer_t* enc_rcbuf = nullptr;
-        qcap2_av_packet_t* av_pkt = new qcap2_av_packet_t;
-        qcap2_av_packet_init(av_pkt);
-        if (qcap2_av_packet_alloc_buffer(av_pkt, pkt->size)) {
-            uint8_t* pBuf = nullptr;
-            int nSize = 0;
-            qcap2_av_packet_get_buffer(av_pkt, &pBuf, &nSize);
-            if (pBuf) {
-                memcpy(pBuf, pkt->data, pkt->size);
+        AVPacket* target_pkt = av_packet_alloc();
+        if (target_pkt) {
+            if (av_packet_ref(target_pkt, pkt) >= 0) {
+                double sample_time = pkt->pts * av_q2d(priv->format_context->streams[pkt->stream_index]->time_base);
+                enc_rcbuf = new qcap2_avpacket_buffer(target_pkt, sample_time);
+            } else {
+                av_packet_free(&target_pkt);
             }
-            qcap2_av_packet_set_pts(av_pkt, pkt->pts);
-            qcap2_av_packet_set_dts(av_pkt, pkt->dts);
-            qcap2_av_packet_set_property(av_pkt, pkt->stream_index, (pkt->flags & AV_PKT_FLAG_KEY) ? TRUE : FALSE);
-            qcap2_av_packet_set_sample_time(av_pkt, pkt->pts * av_q2d(priv->format_context->streams[pkt->stream_index]->time_base));
-            
-            enc_rcbuf = qcap2_rcbuffer_new(av_pkt, [](PVOID pData) {
-                qcap2_av_packet_t* p = (qcap2_av_packet_t*)pData;
-                if (p) {
-                    qcap2_av_packet_free_buffer(p);
-                    delete p;
-                }
-            });
         }
 
         // Try video encoders

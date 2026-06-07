@@ -21,6 +21,37 @@ PVOID qcap2_rcbuffer_get_data(qcap2_rcbuffer_t* pRCBuffer); // risky accessor
 int32_t qcap2_rcbuffer_use_count(qcap2_rcbuffer_t* pRCBuffer);
 int32_t qcap2_rcbuffer_res_count(qcap2_rcbuffer_t* pRCBuffer);
 
+// --- Extended Buffer Extensibility APIs ---
+typedef enum {
+    QCAP2_BUFFER_TYPE_SYSTEM = 0,
+    QCAP2_BUFFER_TYPE_DMABUF,
+    QCAP2_BUFFER_TYPE_V4L2,
+    QCAP2_BUFFER_TYPE_CUDA,
+    QCAP2_BUFFER_TYPE_NVBUF,
+    QCAP2_BUFFER_TYPE_AVFRAME,
+    QCAP2_BUFFER_TYPE_AVPACKET,
+    QCAP2_BUFFER_TYPE_CUSTOM
+} qcap2_buffer_type_t;
+
+qcap2_buffer_type_t qcap2_rcbuffer_get_type(qcap2_rcbuffer_t* pRCBuffer);
+PVOID qcap2_rcbuffer_get_native_handle(qcap2_rcbuffer_t* pRCBuffer);
+
+QRESULT qcap2_rcbuffer_get_pts(qcap2_rcbuffer_t* pRCBuffer, int64_t* pts);
+QRESULT qcap2_rcbuffer_set_pts(qcap2_rcbuffer_t* pRCBuffer, int64_t pts);
+QRESULT qcap2_rcbuffer_get_dts(qcap2_rcbuffer_t* pRCBuffer, int64_t* dts);
+QRESULT qcap2_rcbuffer_set_dts(qcap2_rcbuffer_t* pRCBuffer, int64_t dts);
+QRESULT qcap2_rcbuffer_get_stream_index(qcap2_rcbuffer_t* pRCBuffer, int* idx);
+QRESULT qcap2_rcbuffer_set_stream_index(qcap2_rcbuffer_t* pRCBuffer, int idx);
+QRESULT qcap2_rcbuffer_is_keyframe(qcap2_rcbuffer_t* pRCBuffer, BOOL* key);
+QRESULT qcap2_rcbuffer_set_keyframe(qcap2_rcbuffer_t* pRCBuffer, BOOL key);
+
+QRESULT qcap2_rcbuffer_get_data_ptr(qcap2_rcbuffer_t* pRCBuffer, uint8_t** data, int* size);
+QRESULT qcap2_rcbuffer_get_video_property(qcap2_rcbuffer_t* pRCBuffer, ULONG* colorspace, ULONG* width, ULONG* height);
+QRESULT qcap2_rcbuffer_get_plane(qcap2_rcbuffer_t* pRCBuffer, int plane, uint8_t** data, int* stride);
+
+QRESULT qcap2_rcbuffer_map_system_memory(qcap2_rcbuffer_t* pRCBuffer, PVOID* ppDataOut);
+QRESULT qcap2_rcbuffer_unmap_system_memory(qcap2_rcbuffer_t* pRCBuffer);
+
 
 // qcap2_av_frame_t
 void qcap2_av_frame_init(qcap2_av_frame_t* pFrame);
